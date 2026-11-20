@@ -362,6 +362,49 @@ jobs:
             --expected-release-series 6.18 \
             --descriptor kernel/mainline-6.18/artifacts/accepted-4k.env
 
+      - name: Stage the boot base archive
+        run: |
+          cd kernarium
+          # The runtime tree embeds the accepted guest boot base archive
+          # (tools/rootfs/boot-ramdisk/accepted-aarch64.env) and refuses
+          # a missing or mismatched one (run 44686423966 died here).
+          # Upstream publishes it in a starter release, which does not
+          # exist for this pinned commit, so TermX ships its own base,
+          # built on Linux with upstream's producer
+          # (build-boot-base.sh: Buildroot 2026.05.3 + BusyBox 1.38.0,
+          # the same pinned inputs as
+          # tools/rootfs/starter/build-all.sh --product boot-base-aarch64).
+          # Accept it the same way as the kernel bundle: rewrite the
+          # descriptor in this run's ephemeral checkout from the
+          # archive's own size and SHA-256, then verify the pair with
+          # upstream's verify_base.py.
+          RELEASE=termx-20261120-boot-base-r1
+          DEST=".build/rootfs/$RELEASE"
+          mkdir -p "$DEST"
+          cp "$GITHUB_WORKSPACE/boot-base/uml-boot-base-aarch64.cpio.gz" \
+            "$DEST/uml-boot-base-aarch64.cpio.gz"
+          python3 - "$DEST/uml-boot-base-aarch64.cpio.gz" <<'EOF'
+          import hashlib, pathlib, sys
+          archive = pathlib.Path(sys.argv[1])
+          data = archive.read_bytes()
+          desc = pathlib.Path("tools/rootfs/boot-ramdisk/accepted-aarch64.env")
+          lines = [
+              "# SPDX-License-Identifier: GPL-2.0-or-later",
+              "UML_BOOT_BASE_SCHEMA=1",
+              "UML_BOOT_BASE_RELEASE='termx-20261120-boot-base-r1'",
+              "UML_BOOT_BASE_FILE='uml-boot-base-aarch64.cpio.gz'",
+              "UML_BOOT_BASE_ARCHITECTURE='aarch64'",
+              f"UML_BOOT_BASE_SIZE={len(data)}",
+              f"UML_BOOT_BASE_SHA256='{hashlib.sha256(data).hexdigest()}'",
+          ]
+          desc.write_text("\n".join(lines) + "\n")
+          print("accepted boot base:", len(data), "bytes, sha256",
+                hashlib.sha256(data).hexdigest())
+          EOF
+          python3 tools/rootfs/boot-ramdisk/verify_base.py \
+            --descriptor tools/rootfs/boot-ramdisk/accepted-aarch64.env \
+            --archive "$DEST/uml-boot-base-aarch64.cpio.gz"
+
       - name: Build Kernarium runtime tree
         run: |
           cd kernarium

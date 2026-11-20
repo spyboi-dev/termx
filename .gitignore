@@ -4,6 +4,10 @@ termx/build/
 vendor/
 upstream/
 upstream-newterm/
+# Boot-base producer work/output/logs (the built archive lives in boot-base/)
+bootbase-work/
+bootbase-out/
+bootbase-build*.log
 # The Android runtime framework is reference-only bulk (43 MB);
 # the Android sources in attic-android/ are tracked.
 termx/attic-android/*.framework
