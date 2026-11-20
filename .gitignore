@@ -1,0 +1,12 @@
+# Build outputs
+termx/build/
+# Large local-only trees (never pushed)
+vendor/
+upstream/
+upstream-newterm/
+# The Android runtime framework is reference-only bulk (43 MB);
+# the Android sources in attic-android/ are tracked.
+termx/attic-android/*.framework
+*.ipa
+*.dSYM
+.DS_Store

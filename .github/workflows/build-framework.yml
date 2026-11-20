@@ -1,0 +1,301 @@
+# Build the Kernarium Linux runtime framework for iOS arm64 and upload
+# it as an artifact. TermX links it on a Linux VM afterwards; the
+# framework itself cannot be built there (upstream CMake refuses
+# non-Apple hosts).
+#
+# Pipeline (adapted from spyboi-dev/opencode-inbuilt's
+# .github/workflows/build-kernarium.yml on its kernarium-engine branch,
+# same pinned Kernarium commit, same order):
+#   1. Clone Kernarium at the pinned commit fbe12ee (no vendoring).
+#   2. Build the upstream artifacts the runtime needs, in order:
+#      - dependency prefixes: apple-gpu-vulkan-experiment (Mesa/Zink/
+#        KosmicKrisp/libepoxy/virglrenderer), ios-network (GLib/libslirp),
+#        kernel-host-tools (pahole + static libelf for the kernel's BTF)
+#      - the mainline 6.18 arm64 kernel bundle, built from the pinned
+#        source and published to .build/kernel/artifacts
+#      - the Kernarium runtime tree (cmake --preset kernarium-ios-device),
+#        which produces KRuntime_6_18_4K.framework
+#   3. Upload the device-slice KRuntime_6_18_4K.framework as an artifact.
+#
+# Deliberate deviation from upstream's packaging script
+# (Kernarium/scripts/package-ios-frameworks.sh): it is NOT run here.
+# It is a consumer of prebuilt artifacts that also demands the Android
+# runtime tree (and its kernel) although TermX ships only the Linux
+# runtime, and its checks (privacy manifests, dSYM stripping, no
+# software renderer) are App Store concerns, not sideload ones. The
+# Linux runtime framework is taken straight from the runtime-tree
+# build output -- exactly the slice the packaging script itself
+# consumes as its input. The Android runtime is never built.
+#
+# Runner limits (macos-26 standard: 3 vCPU, 7 GB RAM, 14 GB disk):
+# the GPU prefix build (full Mesa) and the kernel build are the long
+# poles; every heavy step runs at --jobs 3, unneeded Xcode versions
+# and simulator runtimes are removed up front, and the built prefixes
+# + kernel bundle are cached (actions/cache) so a retry reuses them.
+# Bump the cache key suffix (v1 -> v2 ...) when the workflow or the
+# pinned commit changes in a way that must invalidate the cache.
+#
+# Triggered manually, or on pushes to main that touch this workflow.
+name: Build Kernarium Linux framework
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-framework.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    env:
+      # Apple's clang reads this when no -miphoneos-version-min flag
+      # is given; the framework packaging relies on it.
+      IPHONEOS_DEPLOYMENT_TARGET: '27.0'
+      # Prepared dependency sources live on the case-sensitive volume
+      # (some upstream trees have case-colliding paths); every
+      # dependency build script reads this variable.
+      UML_DEPENDENCY_SOURCE_ROOT: /Volumes/KernCase/deps-sources
+    steps:
+      - name: Check out app
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$XCODE" ]; then echo "no Xcode 26 found:"; ls /Applications | grep -i xcode || true; exit 1; fi
+          echo "Using $XCODE"
+          echo "XCODE=$XCODE" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: Free disk space
+        run: |
+          df -h /
+          echo "--- Xcode versions ---"
+          ls -d /Applications/Xcode_*.app 2>/dev/null || true
+          # Keep only the selected Xcode; other versions are ~15 GB each.
+          for x in /Applications/Xcode_*.app; do
+            if [ "$x" != "$XCODE" ]; then echo "removing $x"; sudo rm -rf "$x"; fi
+          done
+          # Simulator runtimes are not used by a device-only build.
+          if [ -d /Library/Developer/CoreSimulator/Profiles/Runtimes ]; then
+            sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+          fi
+          df -h /
+
+      - name: Install host tools
+        run: |
+          # Git identity for patch-series replay (local CI operations only).
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          # Check each host tool; install only what's missing.
+          # NOTE: macOS ships /usr/bin/bison (2.3, too old for Mesa),
+          # /usr/bin/libtool (Apple's, not GNU's) and no gmake, so the
+          # checks below look for the Homebrew names, not the system ones.
+          NEED=""
+          check() {
+            if command -v "$1" >/dev/null 2>&1; then echo "have $1"; else echo "missing $1 -> brew $2"; NEED="$NEED $2"; fi
+          }
+          check cmake cmake
+          check ninja ninja
+          check meson meson
+          check pkg-config pkg-config
+          check gmake make
+          check bison bison
+          check flex flex
+          check rsync rsync
+          check autoconf autoconf
+          check automake automake
+          check glibtoolize libtool
+          check gettext gettext
+          check gperf gperf
+          check groff groff
+          if [ -n "$NEED" ]; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install $(echo "$NEED" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+          fi
+          # bison, flex, make, libtool and gettext are keg-only: their
+          # binaries live under $(brew --prefix <formula>)/bin and are
+          # NOT linked into /opt/homebrew/bin, so put those dirs first
+          # on PATH for every later step. (Homebrew LLVM is deliberately
+          # NOT added: the app/runtime builds use xcrun clang, and the
+          # kernel steps get the LLVM bin dir explicitly.)
+          for f in bison flex make libtool gettext; do
+            echo "$(brew --prefix "$f")/bin" >> "$GITHUB_PATH"
+          done
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$(brew --prefix make)/bin:$(brew --prefix libtool)/bin:$(brew --prefix gettext)/bin:$PATH"
+          # autoreconf looks for `libtoolize`; Homebrew installs it as
+          # `glibtoolize`. A symlink makes the elfutils/libffi builds work.
+          if ! command -v libtoolize >/dev/null 2>&1; then
+            sudo ln -sf "$(brew --prefix libtool)/bin/glibtoolize" /usr/local/bin/libtoolize
+          fi
+          echo "bison: $(command -v bison) $(bison --version | head -1)"
+          echo "flex: $(command -v flex) $(flex --version)"
+          echo "gmake: $(command -v gmake) $(gmake --version | head -1)"
+          echo "libtoolize: $(command -v libtoolize)"
+          # The kernel links ELF with ld.lld and publishes with
+          # llvm-objcopy; both come from Homebrew LLVM.
+          if command -v ld.lld >/dev/null 2>&1; then
+            LLVM_BIN="$(dirname "$(command -v ld.lld)")"
+          else
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm
+            LLVM_BIN="$(brew --prefix llvm)/bin"
+          fi
+          echo "LLVM tools: $LLVM_BIN"
+          echo "LLVM_BIN=$LLVM_BIN" >> "$GITHUB_ENV"
+          # Python 3.11+ and the modules the GPU build needs.
+          if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+            echo "python3 is older than 3.11; installing python@3.12"
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install python@3.12
+            echo "$(brew --prefix python@3.12)/bin" >> "$GITHUB_PATH"
+            export PATH="$(brew --prefix python@3.12)/bin:$PATH"
+          fi
+          python3 --version
+          python3 -c 'import sys; assert sys.version_info >= (3, 11)' || { echo "python3 is older than 3.11"; exit 1; }
+          python3 -c 'import mako, packaging, yaml' 2>/dev/null || \
+            python3 -m pip install --user mako packaging pyyaml || \
+            python3 -m pip install --break-system-packages mako packaging pyyaml
+
+      - name: Clone Kernarium (pinned commit)
+        run: |
+          git init kernarium
+          cd kernarium
+          git remote add origin https://github.com/imxieyi/Kernarium.git
+          git fetch --depth 1 origin fbe12ee72d195f0241c4fc24090a98b259026604
+          git checkout FETCH_HEAD
+          test "$(git rev-parse HEAD)" = fbe12ee72d195f0241c4fc24090a98b259026604
+
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            kernarium/.build/dependency-cache
+            kernarium/.build/kernel-cache
+            kernarium/.build/dependencies
+            kernarium/.build/kernel/artifacts
+          key: kernarium-deps-fbe12ee-v1
+          restore-keys: |
+            kernarium-deps-fbe12ee-
+
+      - name: Create case-sensitive volume
+        run: |
+          # The Linux kernel source (and some dependency sources) has
+          # paths that differ only by case; the runner's volume is
+          # case-insensitive, so they live on a case-sensitive image.
+          IMG="$RUNNER_TEMP/KernCase.sparseimage"
+          rm -f "$IMG"
+          hdiutil create -size 20g -fs "Case-sensitive APFS" -volname KernCase -type SPARSE "$IMG"
+          hdiutil attach "$IMG" -mountpoint /Volumes/KernCase
+          mkdir -p /Volumes/KernCase/deps-sources /Volumes/KernCase/linux /Volumes/KernCase/kernel-build
+          # Prove the volume is case-sensitive.
+          mkdir -p /Volumes/KernCase/.casetest
+          touch /Volumes/KernCase/.casetest/a /Volumes/KernCase/.casetest/A
+          [ "$(ls /Volumes/KernCase/.casetest | wc -l | tr -d ' ')" -eq 2 ] || { echo "volume is not case-sensitive"; exit 1; }
+          rm -rf /Volumes/KernCase/.casetest
+          # Kernel source location (git-ignored config in the checkout).
+          printf '%s\n' 'UML_KERNEL_SOURCE_DIR=/Volumes/KernCase/linux' > kernarium/kernel/mainline-6.18/source-location.conf
+          df -h /
+
+      - name: Prepare dependencies
+        run: |
+          cd kernarium
+          # prepare.sh fetches pinned sources from several upstreams;
+          # a transient upstream failure (Savannah returned HTTP 502
+          # for gawk on run 44669547801) must not fail the whole build,
+          # so each product is retried up to 3 times.
+          retry() {
+            local n=0
+            until "$@"; do
+              n=$((n+1))
+              if [ "$n" -ge 3 ]; then echo "giving up after 3 attempts: $*"; return 1; fi
+              echo "attempt $n failed, retrying in 30s: $*"
+              sleep 30
+            done
+          }
+          retry ./dependencies/prepare.sh --product apple-gpu-vulkan-experiment --root "$UML_DEPENDENCY_SOURCE_ROOT"
+          retry ./dependencies/prepare.sh --product ios-network --root "$UML_DEPENDENCY_SOURCE_ROOT"
+          retry ./dependencies/prepare.sh --product kernel-host-tools --root "$UML_DEPENDENCY_SOURCE_ROOT"
+          retry ./dependencies/prepare.sh --archive-manifest dependencies/kernel-host-tools/archives.tsv
+
+      - name: Build kernel host tools
+        run: |
+          cd kernarium
+          # A cached prefix that no longer verifies is deleted and
+          # rebuilt instead of failing the job.
+          ./dependencies/build-kernel-host-tools.sh --verify-only || rm -rf .build/dependencies/kernel-host-tools
+          ./dependencies/build-kernel-host-tools.sh --jobs 3
+
+      - name: Build Apple GPU prefix (iOS device)
+        run: |
+          cd kernarium
+          ./dependencies/build-apple-gpu.sh --platform ios --verify-only || rm -rf .build/dependencies/apple-gpu-vulkan-experiment/ios-device-arm64
+          ./dependencies/build-apple-gpu.sh --platform ios --jobs 3
+          df -h /
+
+      - name: Build iOS network prefix
+        run: |
+          cd kernarium
+          ./dependencies/build-ios-network.sh --platform ios --verify-only || rm -rf .build/dependencies/ios-device-arm64/network
+          ./dependencies/build-ios-network.sh --platform ios --jobs 3
+
+      - name: Build Linux kernel bundle (arm64, 4K)
+        run: |
+          cd kernarium
+          BUNDLE=.build/kernel/artifacts/mainline-6.18-arm64-4k-20261119-6.18.60-ca1
+          if [ -d "$BUNDLE" ] && python3 kernel/common/artifacts/verify-kernel-artifact.py \
+              --artifact "$BUNDLE" --common-root kernel/common \
+              --abi-metadata kernel/common/abi/identity.env --compatible \
+              --expected-family mainline-6.18 --expected-slice arm64 \
+              --expected-release-series 6.18 \
+              --descriptor kernel/mainline-6.18/artifacts/accepted-4k.env; then
+            echo "reusing verified kernel bundle: $BUNDLE"
+            exit 0
+          fi
+          echo "kernel bundle missing or invalid; rebuilding from source"
+          rm -rf "$BUNDLE"
+          ./kernel/mainline-6.18/scripts/prepare-source.sh --slice arm64
+          export PATH="$LLVM_BIN:$PATH"
+          export UML_KERNEL_CC="$LLVM_BIN/clang"
+          export UML_KERNEL_HOST_CC="$LLVM_BIN/clang"
+          ./kernel/mainline-6.18/build/build-kernel.sh --slice arm64 --build /Volumes/KernCase/kernel-build --jobs 3
+          python3 kernel/mainline-6.18/build/publish-artifact.py \
+            --source /Volumes/KernCase/linux \
+            --build /Volumes/KernCase/kernel-build \
+            --slice arm64 --product linux \
+            --output-root "$PWD/.build/kernel/artifacts" \
+            --release-id 20261119-6.18.60-ca1 \
+            --objcopy "$LLVM_BIN/llvm-objcopy"
+          test -f "$BUNDLE/kernel/vmlinux"
+          df -h /
+
+      - name: Build Kernarium runtime tree
+        run: |
+          cd kernarium
+          cmake --preset kernarium-ios-device
+          cmake --build --preset kernarium-ios-device --parallel 3
+          test -d .build/kernarium-runtime-ios-device/Kernarium/Runtime/KRuntime_6_18_4K.framework
+          df -h /
+
+      - name: Verify the Linux framework
+        run: |
+          FW=kernarium/.build/kernarium-runtime-ios-device/Kernarium/Runtime/KRuntime_6_18_4K.framework
+          test -d "$FW"
+          ls -lh "$FW"
+          lipo -info "$FW/KRuntime_6_18_4K"
+          # The kernel rides inside the framework binary.
+          llvm-objdump -macho -sections "$FW/KRuntime_6_18_4K" | grep -q __uml_elf \
+            || { echo "no __uml_elf section: kernel missing from framework"; exit 1; }
+          # The entry point TermX calls.
+          nm -gU "$FW/KRuntime_6_18_4K" | grep -q ' _kernarium_runtime_get_api_v28' \
+            || { echo "runtime API symbol missing"; exit 1; }
+          /usr/libexec/PlistBuddy -c "Print MinimumOSVersion" "$FW/Info.plist"
+          echo "KRuntime_6_18_4K.framework verified"
+
+      - name: Upload Linux framework
+        uses: actions/upload-artifact@v4
+        with:
+          name: KRuntime_6_18_4K
+          path: kernarium/.build/kernarium-runtime-ios-device/Kernarium/Runtime/KRuntime_6_18_4K.framework
