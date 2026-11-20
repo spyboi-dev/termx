@@ -273,7 +273,12 @@ jobs:
       - name: Build Linux kernel bundle (arm64, 4K)
         run: |
           cd kernarium
-          BUNDLE=.build/kernel/artifacts/mainline-6.18-arm64-4k-20261119-6.18.60-ca1
+          # verify-kernel-artifact.py requires an absolute --artifact
+          # path ("artifact root must be an absolute local path" killed
+          # run 44682700752 in the accept step, and silently failed
+          # this reuse check on every earlier run, so the kernel was
+          # rebuilt from source each time instead of reusing the cache).
+          BUNDLE="$PWD/.build/kernel/artifacts/mainline-6.18-arm64-4k-20261119-6.18.60-ca1"
           # Compatibility-only reuse check: NO --descriptor here. The
           # descriptor in a fresh checkout records the release string
           # upstream accepted (6.18.60-g0f1aac6de72d), but a bundle built
@@ -328,7 +333,7 @@ jobs:
           # then re-verifies the pair with --descriptor. The
           # descriptor lives only in this run's ephemeral checkout;
           # nothing in the repo or upstream is modified.
-          BUNDLE=.build/kernel/artifacts/mainline-6.18-arm64-4k-20261119-6.18.60-ca1
+          BUNDLE="$PWD/.build/kernel/artifacts/mainline-6.18-arm64-4k-20261119-6.18.60-ca1"
           python3 - "$BUNDLE" <<'EOF'
           import json, pathlib, sys
           bundle = pathlib.Path(sys.argv[1])
