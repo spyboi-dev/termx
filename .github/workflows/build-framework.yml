@@ -52,13 +52,18 @@ jobs:
   build:
     runs-on: macos-26
     env:
-      # Apple's clang reads this when no -miphoneos-version-min flag
-      # is given; the framework packaging relies on it.
-      IPHONEOS_DEPLOYMENT_TARGET: '27.0'
       # Prepared dependency sources live on the case-sensitive volume
       # (some upstream trees have case-colliding paths); every
       # dependency build script reads this variable.
       UML_DEPENDENCY_SOURCE_ROOT: /Volumes/KernCase/deps-sources
+    # NOTE: do NOT set IPHONEOS_DEPLOYMENT_TARGET at job level. Apple's
+    # clang reads it and then targets iOS by default, so the HOST tools
+    # build (gawk configure) compiles its test program for iOS and
+    # fails with "cannot run C compiled programs" -- exactly what
+    # killed run 44671186140 (and the same step in opencode-inbuilt
+    # run 44670686952). The runtime-tree toolchain (cmake/toolchains/
+    # Apple.cmake) sets CMAKE_OSX_SYSROOT and CMAKE_OSX_DEPLOYMENT_TARGET
+    # itself from the preset, so no step needs the env var.
     steps:
       - name: Check out app
         uses: actions/checkout@v4
