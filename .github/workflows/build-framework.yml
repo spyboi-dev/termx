@@ -73,12 +73,23 @@ jobs:
       - name: Check out app
         uses: actions/checkout@v4
 
-      - name: Select Xcode 26
+      - name: Select Xcode 27
         run: |
-          XCODE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
-          if [ -z "$XCODE" ]; then echo "no Xcode 26 found:"; ls /Applications | grep -i xcode || true; exit 1; fi
-          # Resolve the real path: Xcode_26.6.0.app and Xcode_26.6.app
-          # are the same install, one a symlink to the other. Without
+          # The pinned Kernarium commit's audio code needs the iOS 27 SDK:
+          # apple_microphone_input.mm uses AVAudioSession's iOS 27
+          # lifecycle notifications (DidBecomeInactive,
+          # ResumptionRecommendation) and AVAudioNode's iOS 27 tap with
+          # an error: parameter. Xcode 26.6 ships only iPhoneOS26.5.sdk,
+          # which lacks all three, so run 44703164346 died at [235/290]
+          # on that file. The macos-26 runner image also carries Xcode
+          # 27 (27.0/27.1/27.2 alongside the default 26.6); pick the
+          # newest Xcode 27, and fail loudly listing what is installed
+          # if none is present.
+          XCODE="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$XCODE" ]; then echo "no Xcode 27 found:"; ls /Applications | grep -i xcode || true; exit 1; fi
+          # Resolve the real path: Xcode's versioned bundles come in
+          # pairs that are the same install, one a symlink to the other
+          # (26.6.0.app and 26.6.app were; 27.x pairs the same way). Without
           # this, the Free-disk step below compares the unresolved
           # name, deletes the twin, and destroys the selected Xcode
           # (run 44672557923 died at the GPU prefix with
