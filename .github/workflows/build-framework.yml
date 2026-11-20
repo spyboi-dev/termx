@@ -32,7 +32,7 @@
 # build output -- exactly the slice the packaging script itself
 # consumes as its input. The Android runtime is never built.
 #
-# Runner limits (macos-26 standard: 3 vCPU, 7 GB RAM, 14 GB disk):
+# Runner limits (xcode-27 standard: 3 vCPU, 7 GB RAM, 14 GB disk):
 # the GPU prefix build (full Mesa) and the kernel build are the long
 # poles; every heavy step runs at --jobs 3, unneeded Xcode versions
 # and simulator runtimes are removed up front, and the built prefixes
@@ -55,7 +55,12 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-26
+    # xcode-27, not macos-26: the standard macos-26 image carries only
+    # Xcode 26.0-26.6 (run 44708774155 proved it: no Xcode_27*.app at
+    # all), and the pinned Kernarium code needs the iOS 27 SDK (see the
+    # Select step). The xcode-27 preview image is GitHub-hosted and
+    # free for this public repo.
+    runs-on: xcode-27
     env:
       # Prepared dependency sources live on the case-sensitive volume
       # (some upstream trees have case-colliding paths); every
@@ -81,12 +86,23 @@ jobs:
           # ResumptionRecommendation) and AVAudioNode's iOS 27 tap with
           # an error: parameter. Xcode 26.6 ships only iPhoneOS26.5.sdk,
           # which lacks all three, so run 44703164346 died at [235/290]
-          # on that file. The macos-26 runner image also carries Xcode
-          # 27 (27.0/27.1/27.2 alongside the default 26.6); pick the
-          # newest Xcode 27, and fail loudly listing what is installed
-          # if none is present.
+          # on that file. The job runs on the xcode-27 image, whose
+          # toolchain ships the iOS 27 SDK; pick the newest Xcode 27, and fail loudly listing what is installed
+          # if none is present. On the xcode-27 image the default
+          # Xcode.app is itself 27, so fall back to it and verify the
+          # version if no versioned 27 bundle exists.
           XCODE="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)"
-          if [ -z "$XCODE" ]; then echo "no Xcode 27 found:"; ls /Applications | grep -i xcode || true; exit 1; fi
+          if [ -z "$XCODE" ]; then
+            if [ -d /Applications/Xcode.app ]; then
+              XCODE=/Applications/Xcode.app
+              case "$(xcodebuild -version 2>/dev/null | head -1)" in
+                "Xcode 27"*) ;;
+                *) echo "default Xcode is not 27:"; xcodebuild -version; ls /Applications | grep -i xcode || true; exit 1 ;;
+              esac
+            else
+              echo "no Xcode 27 found:"; ls /Applications | grep -i xcode || true; exit 1
+            fi
+          fi
           # Resolve the real path: Xcode's versioned bundles come in
           # pairs that are the same install, one a symlink to the other
           # (26.6.0.app and 26.6.app were; 27.x pairs the same way). Without
