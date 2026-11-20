@@ -87,11 +87,18 @@ jobs:
           # an error: parameter. Xcode 26.6 ships only iPhoneOS26.5.sdk,
           # which lacks all three, so run 44703164346 died at [235/290]
           # on that file. The job runs on the xcode-27 image, whose
-          # toolchain ships the iOS 27 SDK; pick the newest Xcode 27, and fail loudly listing what is installed
-          # if none is present. On the xcode-27 image the default
-          # Xcode.app is itself 27, so fall back to it and verify the
-          # version if no versioned 27 bundle exists.
-          XCODE="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)"
+          # toolchain ships the iOS 27 SDK; pick the newest stable
+          # Xcode 27, and fail loudly listing what is installed if
+          # none is present. Prefer stable: the image's newest 27
+          # bundle is a beta (27.3_beta), which ships without the
+          # Metal Toolchain, so run 44719664275 died in the GPU prefix
+          # at [419/569] compiling Metal shaders ("cannot execute tool
+          # 'metal' ... xcodebuild -downloadComponent MetalToolchain").
+          # The stable 27.2 built the whole runtime tree in run
+          # 44708904462. On the xcode-27 image the default Xcode.app
+          # is itself 27, so fall back to it and verify the version
+          # if no versioned 27 bundle exists.
+          XCODE="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | grep -vi beta | grep -vi rc | sort -V | tail -1)"
           if [ -z "$XCODE" ]; then
             if [ -d /Applications/Xcode.app ]; then
               XCODE=/Applications/Xcode.app
@@ -227,7 +234,13 @@ jobs:
             kernarium/.build/kernel-cache
             kernarium/.build/dependencies
             kernarium/.build/kernel/artifacts
-          key: kernarium-deps-fbe12ee-v1
+          # v2: the v1 entry is stale and actions/cache never updates
+          # an entry once its exact key exists, so it still lacks the
+          # GPU prefix (run 44719664275's verify-only found the prefix
+          # missing and rebuilt it) even though later runs built it.
+          # Bump the key whenever the workflow or the pinned commit
+          # changes in a way that must invalidate the cache.
+          key: kernarium-deps-fbe12ee-v2
           restore-keys: |
             kernarium-deps-fbe12ee-
 
