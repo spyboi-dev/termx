@@ -202,7 +202,12 @@ jobs:
           rm -f "$IMG"
           hdiutil create -size 20g -fs "Case-sensitive APFS" -volname KernCase -type SPARSE "$IMG"
           hdiutil attach "$IMG" -mountpoint /Volumes/KernCase
-          mkdir -p /Volumes/KernCase/deps-sources /Volumes/KernCase/linux /Volumes/KernCase/kernel-build
+          mkdir -p /Volumes/KernCase/deps-sources /Volumes/KernCase/kernel-build
+          # NOTE: do NOT create /Volumes/KernCase/linux here.
+          # prepare-source.sh materializes the kernel checkout there
+          # and materialize-git.sh refuses if the destination already
+          # exists ("destination already exists: /Volumes/KernCase/linux"
+          # killed run 44673753042 in the kernel bundle step).
           # Prove the volume is case-sensitive.
           mkdir -p /Volumes/KernCase/.casetest
           touch /Volumes/KernCase/.casetest/a /Volumes/KernCase/.casetest/A
