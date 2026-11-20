@@ -446,12 +446,10 @@ jobs:
           test -d "$FW"
           ls -lh "$FW"
           lipo -info "$FW/KRuntime_6_18_4K"
-          # The kernel rides inside the framework binary. llvm-objdump
-          # lives in the Homebrew llvm bin dir, which is not on PATH
-          # (only the lld dir was added); use $LLVM_BIN explicitly.
-          # Bare llvm-objdump killed run 44708904462 here even though
-          # the framework had built fine (51M arm64 binary).
-          "$LLVM_BIN/llvm-objdump" -macho -sections "$FW/KRuntime_6_18_4K" | grep -q __uml_elf \
+          # The kernel rides inside the framework binary. Use Xcode's
+          # own otool: llvm-objdump parses '-sections' as a bundle of
+          # single-letter flags and dies on '-c' (run 44714506364).
+          otool -l "$FW/KRuntime_6_18_4K" | grep -q __uml_elf \
             || { echo "no __uml_elf section: kernel missing from framework"; exit 1; }
           # The entry point TermX calls.
           nm -gU "$FW/KRuntime_6_18_4K" | grep -q ' _kernarium_runtime_get_api_v28' \
