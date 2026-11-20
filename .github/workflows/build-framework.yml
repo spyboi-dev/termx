@@ -72,6 +72,14 @@ jobs:
         run: |
           XCODE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
           if [ -z "$XCODE" ]; then echo "no Xcode 26 found:"; ls /Applications | grep -i xcode || true; exit 1; fi
+          # Resolve the real path: Xcode_26.6.0.app and Xcode_26.6.app
+          # are the same install, one a symlink to the other. Without
+          # this, the Free-disk step below compares the unresolved
+          # name, deletes the twin, and destroys the selected Xcode
+          # (run 44672557923 died at the GPU prefix with
+          # 'xcrun: error: SDK "iphoneos" cannot be located').
+          # python3 realpath because BSD readlink has no -f.
+          XCODE="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$XCODE")"
           echo "Using $XCODE"
           echo "XCODE=$XCODE" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XCODE/Contents/Developer"
