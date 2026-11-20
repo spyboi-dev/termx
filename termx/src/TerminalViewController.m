@@ -14,6 +14,8 @@
 #import "TerminalViewController.h"
 
 #import "KernEngine.h"
+#import "TXLogViewController.h"
+#import "TXStartupViewController.h"
 #import "vt.h"
 #import <MetalKit/MetalKit.h>
 
@@ -60,6 +62,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UILabel *_status;
     UIButton *_mainButton;
     UIButton *_stopButton;
+    UIButton *_logButton;
     UIButton *_ctrlButton;
     UIButton *_moreButton;
     UIButton *_fnButton;
@@ -100,8 +103,10 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
     _mainButton = [self barButton:@"Install" action:@selector(onMain)];
     _stopButton = [self barButton:@"Stop" action:@selector(onStop)];
+    _logButton = [self barButton:@"Log" action:@selector(onLog)];
     [bar addSubview:_mainButton];
     [bar addSubview:_stopButton];
+    [bar addSubview:_logButton];
 
     // The terminal itself: NewTerm's defaults — black, #f2f2f2 text,
     // system monospace. Lines never wrap: the text container is wider
@@ -232,7 +237,9 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         [bar.heightAnchor constraintEqualToConstant:44],
         [_status.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor],
         [_status.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor],
-        [_status.trailingAnchor constraintEqualToAnchor:_mainButton.leadingAnchor constant:-8],
+        [_status.trailingAnchor constraintEqualToAnchor:_logButton.leadingAnchor constant:-8],
+        [_logButton.trailingAnchor constraintEqualToAnchor:_mainButton.leadingAnchor constant:-6],
+        [_logButton.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor],
         [_mainButton.trailingAnchor constraintEqualToAnchor:_stopButton.leadingAnchor constant:-6],
         [_mainButton.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor],
         [_stopButton.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor],
@@ -314,15 +321,59 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
 #pragma mark - Actions
 
+// On launch with the guest installed, go straight to the startup
+// screen and boot: the user asked for a startup screen, and there
+// is nothing else to do first. The guard is the state: once the
+// boot starts the state leaves Ready, so a return from the modal
+// (or a later Stop) never re-triggers this.
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    if (_engine.state == TermXStateReady && !self.presentedViewController) {
+        [self showStartupThen:^{
+            [self->_engine bootOnView:self->_guestView];
+        }];
+    }
+}
+
+// Present the startup screen, then run the work (boot or install)
+// once it is on screen, so the progress is visible from the first
+// byte. If a modal is already up, just run the work.
+- (void)showStartupThen:(void (^)(void))work {
+    if (self.presentedViewController) {
+        if (work) work();
+        return;
+    }
+    TXStartupViewController *startup = [[TXStartupViewController alloc] init];
+    startup.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:startup animated:YES completion:^{
+        if (work) work();
+    }];
+}
+
 - (void)onMain {
     if (_engine.state == TermXStateReady || _engine.state == TermXStateStopped) {
-        [_engine bootOnView:_guestView];
+        [self showStartupThen:^{
+            [self->_engine bootOnView:self->_guestView];
+        }];
         return;
     }
     if (_engine.state == TermXStateIdle || _engine.state == TermXStateFailed) {
-        [_engine installGuestWithCompletion:nil];
+        [self showStartupThen:^{
+            [self->_engine installGuestWithCompletion:nil];
+        }];
         return;
     }
+}
+
+- (void)onLog {
+    TXLogViewController *logVC = [[TXLogViewController alloc] init];
+    logVC.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(logDoneTapped)];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:logVC];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)logDoneTapped {
+    [self dismissViewControllerAnimated:YES completion:nil];
 }
 
 - (void)onStop {

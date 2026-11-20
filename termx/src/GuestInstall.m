@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "GuestInstall.h"
+#import "TXLog.h"
 #import <CommonCrypto/CommonDigest.h>
 #import <zlib.h>
 
@@ -91,10 +92,11 @@ static BOOL FileHasHash(NSString* path, NSString* expected) {
 }
 
 + (void)installGuestTo:(NSString*)rootfsPath
-              progress:(void (^)(double, NSString*))progress
+              progress:(void (^)(double, NSString*, int64_t, int64_t))progress
             completion:(void (^)(BOOL, NSString*))completion {
     NSString* error = nil;
     if ([self guestInstalledAt:rootfsPath error:&error]) {
+        TXLogEngine(@"Install skipped: guest image already verified");
         if (completion) completion(YES, nil);
         return;
     }
@@ -109,42 +111,49 @@ static BOOL FileHasHash(NSString* path, NSString* expected) {
     NSURL* url = [NSURL URLWithString:kRootfsURL];
     NSURLSession* session = [NSURLSession sharedSession];
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (progress) progress(0.0, @"Downloading Debian image…");
+        if (progress) progress(0.0, @"Downloading Debian image…", 0, 0);
     });
+    TXLogEngine(@"Downloading guest image from %@", kRootfsURL);
     NSURLSessionDownloadTask* task =
         [session downloadTaskWithURL:url completionHandler:^(NSURL* location, NSURLResponse* response, NSError* taskError) {
             if (taskError || !location) {
+                TXLogEngine(@"Download failed: %@", taskError.localizedDescription ?: @"no data");
                 if (completion) completion(NO, @"download failed — check Wi-Fi and try again");
                 return;
             }
             NSError* moveError = nil;
             [fm moveItemAtURL:location toURL:[NSURL fileURLWithPath:gzPath] error:&moveError];
             if (moveError) {
+                TXLogEngine(@"Could not save the download: %@", moveError.localizedDescription ?: @"?");
                 if (completion) completion(NO, @"could not save the download");
                 return;
             }
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (progress) progress(0.6, @"Verifying the download…");
+                if (progress) progress(0.6, @"Verifying the download…", 0, 0);
             });
             if (!FileHasHash(gzPath, kRootfsGzSHA256)) {
+                TXLogEngine(@"Download hash mismatch — archive discarded");
                 [fm removeItemAtPath:gzPath error:nil];
                 if (completion) completion(NO, @"download hash mismatch — the file may be corrupt, try again");
                 return;
             }
+            TXLogEngine(@"Download hash OK");
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (progress) progress(0.7, @"Extracting the image…");
+                if (progress) progress(0.7, @"Extracting the image…", 0, 0);
             });
             NSString* extractError = nil;
             if (![self gunzipFile:gzPath to:rootfsPath error:&extractError]) {
+                TXLogEngine(@"Extract failed: %@", extractError ?: @"?");
                 if (completion) completion(NO, extractError);
                 return;
             }
             [fm removeItemAtPath:gzPath error:nil];
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (progress) progress(0.95, @"Verifying the image…");
+                if (progress) progress(0.95, @"Verifying the image…", 0, 0);
             });
             NSString* verifyError = nil;
             if (![self guestInstalledAt:rootfsPath error:&verifyError]) {
+                TXLogEngine(@"Image verification failed: %@", verifyError ?: @"?");
                 [fm removeItemAtPath:rootfsPath error:nil];
                 if (completion) completion(NO, verifyError ?: @"image verification failed");
                 return;
@@ -153,7 +162,7 @@ static BOOL FileHasHash(NSString* path, NSString* expected) {
             NSDictionary* attrs = @{NSFilePosixPermissions : @(0444)};
             [fm setAttributes:attrs ofItemAtPath:rootfsPath error:nil];
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (progress) progress(1.0, @"Guest ready");
+                if (progress) progress(1.0, @"Guest ready", 0, 0);
             });
             if (completion) completion(YES, nil);
         }];
@@ -167,7 +176,7 @@ static BOOL FileHasHash(NSString* path, NSString* expected) {
             if (expected > 0) {
                 double f = (double)received / (double)expected * 0.6;
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    if (progress) progress(f, @"Downloading Debian image…");
+                    if (progress) progress(f, @"Downloading Debian image…", received, expected);
                 });
             }
             [NSThread sleepForTimeInterval:0.25];

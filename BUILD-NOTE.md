@@ -5,44 +5,105 @@ minimal Debian (trixie) rootfs straight to a shell prompt in a
 NewTerm-modelled terminal view — no Android guest, no ADB, no Termux
 APK. See PORT-NOTE.md for the architecture and why Android is gone.
 
-## The IPA — NOT BUILT
+## The IPA — BUILT
 
-- **Path:** `termx/build/TermX.ipa` — does not exist.
-- **`termx/build.sh` exits 1 at its preflight**, verbatim:
+- **Path:** `termx/build/TermX.ipa`
+- **2026-11-20, first build:** 25,021,864 bytes, SHA-256
+  `d08fc245bde1b9bf9e1cfb48db9d2ba0e8af869c108d32ca79cb51b68a026a50`
+  (Mac framework run 44722011571 went green, ~45 min, xcode-27
+  image, stable Xcode 27.2).
+- **2026-11-20, startup screen + logs build:** 25,049,642 bytes,
+  SHA-256
+  `547fa232fcf5310fc4e8334a8cf2ce0733238e69fe306b8ec0e25bc9a5ff2668`.
+  Host-verified: Mach-O 64-bit arm64, bundle `app.termx.ios`,
+  MinOS 27.0, version 0.1.0, all four frameworks embedded
+  (KRuntime_6_18_4K, KosmicKrisp, MesaEGL, MesaGallium), new
+  startup/log strings present in the binary, zero BUILD-NOTE
+  strings. Built with `termx/build.sh` (clang-18 + iPhoneOS26.5.sdk
+  + ld64.lld-18, adhoc codesign). **Nothing has run on a device.**
+- The Linux runtime framework `KRuntime_6_18_4K.framework` is not
+  in any Kernarium release, is not in the Andarium IPA (that one
+  carries the Android flavour only), and cannot be built on this
+  Linux VM — upstream's CMake refuses non-Apple hosts
+  (`CMakeLists.txt:46-48`, FATAL_ERROR) and the build needs Xcode,
+  the Metal toolchain, Swift/SPM and codesigning. It was built on
+  a Mac via the GitHub Actions workflow in
+  `.github/workflows/build-framework.yml` (see the Mac framework
+  build section below) and copied into `termx/Frameworks/`; it is
+  deliberately untracked in git (52 MB, rebuildable via the
+  workflow). `termx/build.sh` still exits 1 at its preflight if
+  the framework is missing.
+- The toolchain itself is wiped by VM restarts (clang-18 and
+  ld64.lld-18 were gone again on 2026-11-20): restore with
+  `sudo apt-get update && sudo apt-get install -y clang-18 lld-18`.
+  The update took ~10 min through the egress proxy.
 
-```
-ERROR: Frameworks/KRuntime_6_18_4K.framework is missing.
-The Linux runtime framework is not in any Kernarium release and
-cannot be built on this Linux VM (upstream CMake refuses
-non-Apple hosts). Build it on a Mac:
-  git clone https://github.com/imxieyi/Kernarium
-  cd Kernarium
-  Kernarium/scripts/package-ios-frameworks.sh --sdk device
-then copy .build/kernarium-xcframeworks/.../KRuntime_6_18_4K.framework
-into Frameworks/ here and re-run this script. See BUILD-NOTE.md.
-```
+### Startup screen + logs (2026-11-20, user feedback: "no logs,
+### no progress bar")
 
-The Linux runtime framework `KRuntime_6_18_4K.framework` is not in
-any Kernarium release, is not in the Andarium IPA (that one carries
-the Android flavour only), and cannot be built on this Linux VM —
-upstream's CMake refuses non-Apple hosts (`CMakeLists.txt:46-48`,
-FATAL_ERROR) and the build needs Xcode, the Metal toolchain,
-Swift/SPM and codesigning. No IPA was fabricated; the build refuses
-to link without the framework. A Mac build of the framework is the
-blocker (see below).
+The first build had no logs and no progress bar. Added, copying
+the Andarium screenshot the user sent and the proven pattern from
+the OpenCode iOS app (`OCStartupViewController`,
+`OCCrashLog`, live log card):
 
-- **Update 2026-11-20 (from the OpenCode Kernarium rebuild, same
-  upstream):** the packaging script alone is not enough. Its Mac
-  build run 44667335172 failed in 27 s at "Package iOS frameworks"
-  because the workflow skipped Kernarium's upstream build phase —
-  `package-ios-frameworks.sh` only verifies prebuilt artifacts, so
-  the apple-gpu-vulkan-experiment prefix was never built. The Mac
-  build must first run the upstream build steps (`prepare.sh`, the
-  full GPU prefix build, the runtime-tree CMake build producing
-  `KRuntime_6_18_4K`) and only then package the frameworks. The
-  TermX framework build needs the same sequence; the bare
-  `package-ios-frameworks.sh --sdk device` command above will fail
-  the same way on a fresh clone.
+- **Startup screen** (`termx/src/TXStartupViewController.h/.m`):
+  top row with a teal dot + "Starting" left and a live elapsed
+  timer right; big bold "TermX" title; a thin teal progress bar
+  under the title; one dark rounded card with four checklist rows
+  (System image, Linux kernel, Storage, Startup). Rows are driven
+  ONLY by real engine state (`KernEngine` boot phase, download
+  byte counts, overlay allocation, console markers): a row checks
+  off teal only when its step really completed; the active row
+  spins with its detail in teal; a failed row shows a red outline
+  with the reason inline. Progress bar: the install fraction
+  while downloading/verifying, 0.35 once the kernel is booting,
+  0.7 once init is running, 1.0 at the login prompt — real phase
+  transitions, never a timer. The Log button opens the live log
+  view; Continue is always visible; the screen dismisses into the
+  terminal 0.7 s after the shell is really ready (login prompt on
+  the console, state Running). Shown when Boot or Install is
+  tapped, and on launch when the guest is installed (auto-boot,
+  like the OpenCode app's auto-start).
+- **File logging** (`termx/src/TXLog.h/.m`,
+  `termx/src/TXCrashLog.h/.m`, adapted from the OpenCode app):
+  every engine/install/startup line, timestamped, goes to
+  `Documents/Engine/engine.log`; every guest console byte goes
+  raw to `Documents/Engine/guest.log`. Both files are capped at
+  512 KB (last 256 KB kept). `TXCrashLog` is installed first
+  thing in `main()`: fatal signals and uncaught exceptions append
+  a CRASH line to engine.log and write `Documents/CRASH.txt`
+  (signal + last ~2 KB of the log), using only async-signal-safe
+  calls in the handler. Clean-shutdown markers are written on
+  background/terminate and a foreground marker on return, so the
+  next launch appends a "Previous run ended without shutdown"
+  line when the app was killed (jetsam leaves no crash line).
+  On the phone the user can find the logs in the Files app under
+  TermX: `Documents/Engine/engine.log`, `Documents/Engine/guest.log`,
+  `Documents/CRASH.txt`.
+- **In-app log view** (`termx/src/TXLogViewController.h/.m`):
+  live log card (engine log + guest console), refreshed every
+  second, with a Copy log button. Reachable from the startup
+  screen's Log button and from the terminal screen's Log button
+  in the top bar.
+- **Engine support** (`KernEngine.h/.m`): `TXBootPhase`
+  (Downloading / Verifying / Kernel / Services / Ready / Failed)
+  and `TXBootStep` (Image / Kernel / Storage / Startup) with
+  `failedStep`; `bootProgress`; live `downloadReceived` /
+  `downloadExpected` (the startup screen shows "156 MB of 368 MB"
+  and a measured MB/s); `storageUsedBytes` / `storageTotalBytes`
+  (overlay `st_blocks`, 4 GiB total); `kernelDetail`
+  ("6.18.60 · 2 vCPUs · 1 GiB RAM"), `imageDetail`
+  ("trixie · read-only"). The console callback logs every byte to
+  guest.log and moves the phase on `UML_BOOT_SWITCH_ROOT:/sbin/init`
+  (Services, "Starts services") and the login prompt (Ready).
+  `GuestInstall`'s progress block now also reports byte counts,
+  and install failures are logged.
+- **Build note:** `copyButton` / `copyLogButton` as a property
+  name trips clang's Cocoa owned-object naming rule; the button
+  is named `shareLogButton` (same as the OpenCode app). String
+  literals containing non-ASCII characters (·, —, …) are stored
+  by clang as UTF-16 in `__ustring`, so verify those with
+  `strings -e l`, not plain `strings`.
 
 ## What was verified, and how
 

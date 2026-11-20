@@ -29,9 +29,11 @@ extern const long long kRootfsSize;       // bytes of the extracted image
 + (BOOL)guestInstalledAt:(NSString*)rootfsPath error:(NSString**)error;
 
 // Download + verify + extract the image to rootfsPath.
-// Calls progress(0..1, step) on the main queue.
+// Calls progress(0..1, step, receivedBytes, expectedBytes) on the
+// main queue. received/expected are the download byte counts while
+// the archive is downloading, 0 for the verify/extract steps.
 + (void)installGuestTo:(NSString*)rootfsPath
-              progress:(void (^)(double fraction, NSString* step))progress
+              progress:(void (^)(double fraction, NSString* step, int64_t received, int64_t expected))progress
             completion:(void (^)(BOOL ok, NSString* error))completion;
 
 @end
