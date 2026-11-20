@@ -150,15 +150,21 @@ jobs:
           echo "gmake: $(command -v gmake) $(gmake --version | head -1)"
           echo "libtoolize: $(command -v libtoolize)"
           # The kernel links ELF with ld.lld and publishes with
-          # llvm-objcopy; both come from Homebrew LLVM.
-          if command -v ld.lld >/dev/null 2>&1; then
-            LLVM_BIN="$(dirname "$(command -v ld.lld)")"
-          else
-            HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm
-            LLVM_BIN="$(brew --prefix llvm)/bin"
-          fi
+          # llvm-objcopy. Homebrew llvm 23+ split LLD into a separate
+          # `lld` formula, so `llvm` alone no longer provides ld.lld
+          # (run 44676637886 died in build-kernel.sh with "linker is
+          # unavailable: ld.lld" even though LLVM_BIN pointed at the
+          # freshly installed llvm prefix). Install both, and put
+          # lld's bin dir on PATH for every later step.
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm lld
+          LLVM_BIN="$(brew --prefix llvm)/bin"
           echo "LLVM tools: $LLVM_BIN"
           echo "LLVM_BIN=$LLVM_BIN" >> "$GITHUB_ENV"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          command -v ld.lld >/dev/null 2>&1 || { echo "ld.lld still missing after brew install"; exit 1; }
+          command -v "$LLVM_BIN/clang" >/dev/null 2>&1 || { echo "clang missing from $LLVM_BIN"; exit 1; }
+          command -v "$LLVM_BIN/llvm-objcopy" >/dev/null 2>&1 || { echo "llvm-objcopy missing from $LLVM_BIN"; exit 1; }
           # Python 3.11+ and the modules the GPU build needs.
           if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
             echo "python3 is older than 3.11; installing python@3.12"
