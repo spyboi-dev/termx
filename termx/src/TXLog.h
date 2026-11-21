@@ -27,6 +27,13 @@ NS_ASSUME_NONNULL_BEGIN
 // Safe from any thread.
 void TXLogEngine(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 
+// Block until every line queued so far is on disk. Safe from any
+// thread except the log queue itself. Use at phase boundaries where
+// the next step can kill the process (see GuestInstall): without it
+// a crash a millisecond later leaves the last line the async queue
+// happened to flush, not the true phase.
+void TXLogFlush(void);
+
 // Append raw guest console bytes to guest.log. Safe from any thread
 // (the runtime's console callback runs on a runtime thread).
 void TXLogConsoleData(NSData *data);

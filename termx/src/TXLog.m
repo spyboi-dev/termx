@@ -74,6 +74,10 @@ void TXLogEngine(NSString *format, ...) {
     });
 }
 
+void TXLogFlush(void) {
+    dispatch_sync(TXLogQueue(), ^{});
+}
+
 void TXLogConsoleData(NSData *data) {
     if (!data.length) return;
     NSData *copy = [data copy];

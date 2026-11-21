@@ -52,6 +52,13 @@ static const unsigned long long kFreeSpaceNeededBeforeExtract = 3ULL << 29;  // 
 // byte count in engine.log.
 static const uint64_t kLogEveryBytes = 256ULL << 20;
 
+// Gunzip chunk: heap-allocated, never on the stack. The old code kept
+// a 1 MiB array on the stack, but this runs on a GCD worker thread
+// whose stack is 512 KiB on iOS: the first gzread touched the stack
+// guard page and died with SIGBUS on every Install that reached
+// extraction (the 09:33 and 07:57 runs). 256 KiB streams just as fast.
+static const size_t kGunzipChunkBytes = 256 << 10;
+
 static unsigned long long TXFreeSpaceAtPath(NSString* path) {
     NSDictionary* attrs = [[NSFileManager defaultManager] attributesOfFileSystemForPath:path error:nil];
     return [attrs[NSFileSystemFreeSize] unsignedLongLongValue];
@@ -131,6 +138,21 @@ static BOOL FileHasHash(NSString* path, NSString* expected, NSString* label) {
     NSError* error = nil;
     NSString* hash = SHA256OfFile(path, label, &error);
     return hash && [hash isEqualToString:expected];
+}
+
+// The install pipeline (hash, gunzip, verify) runs here, one at a
+// time: two Install taps racing two gunzips at the same destination
+// would truncate each other's output. The old global-queue dispatch
+// allowed exactly that (the 07:57 log shows two pipelines
+// interleaved). All callers dispatch_async onto this queue, never
+// sync, so no caller can deadlock on it.
+static dispatch_queue_t TXInstallPipelineQueue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("app.termx.ios.install-pipeline", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
 }
 
 // TXRootfsDownload: one background download, owned for the process
@@ -236,7 +258,7 @@ static TXRootfsDownload* s_activeDownload = nil;
         [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
             TXLogEngine(@"Background time expired during install pipeline — the archive is kept, Install will reuse it");
         }];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    dispatch_async(TXInstallPipelineQueue(), ^{
         [self reportProgress:0.6 step:@"Verifying the download…"];
         if (!FileHasHash(gzPath, kRootfsGzSHA256, @"Verifying download")) {
             TXLogEngine(@"Download hash mismatch — archive discarded");
@@ -257,6 +279,12 @@ static TXRootfsDownload* s_activeDownload = nil;
             return;
         }
         [self reportProgress:0.7 step:@"Extracting the image…"];
+        // Pin the phase to disk before the long extract: the log is
+        // async, and the progress line travels via the main queue, so
+        // wait for the main queue to apply it and for the log queue
+        // to write it. A crash a millisecond later must leave the
+        // true phase, not the last line the queues happened to flush.
+        dispatch_sync(dispatch_get_main_queue(), ^{ TXLogFlush(); });
         NSString* extractError = nil;
         if (![GuestInstall gunzipFile:gzPath to:rootfsPath error:&extractError]) {
             TXLogEngine(@"Extract failed: %@", extractError ?: @"?");
@@ -465,7 +493,7 @@ didCompleteWithError:(NSError*)error {
     return YES;
 }
 
-// Streaming gunzip of src (.gz) to dst, in 1 MB chunks: memory stays
+// Streaming gunzip of src (.gz) to dst, in heap chunks: memory stays
 // flat while 116 MB becomes 1 GiB. Logs every 256 MiB written, so a
 // kill during extraction leaves its position. Returns NO with *error
 // set on failure; the caller checks the hashes.
@@ -481,11 +509,21 @@ didCompleteWithError:(NSError*)error {
         if (error) *error = @"could not write the guest image";
         return NO;
     }
-    uint8_t buffer[1 << 20];
+    // Heap, not stack: see kGunzipChunkBytes. A stack buffer here
+    // overflowed the 512 KiB GCD worker thread stack and crashed
+    // with SIGBUS on the first gzread.
+    uint8_t* buffer = (uint8_t*)malloc(kGunzipChunkBytes);
+    if (!buffer) {
+        fclose(out);
+        gzclose(gz);
+        [[NSFileManager defaultManager] removeItemAtPath:dst error:nil];
+        if (error) *error = @"out of memory while extracting the image";
+        return NO;
+    }
     int n;
     BOOL ok = YES;
     uint64_t done = 0, lastLogged = 0;
-    while ((n = gzread(gz, buffer, (unsigned)sizeof(buffer))) > 0) {
+    while ((n = gzread(gz, buffer, (unsigned)kGunzipChunkBytes)) > 0) {
         if (fwrite(buffer, 1, (size_t)n, out) != (size_t)n) { ok = NO; break; }
         done += (uint64_t)n;
         if (done - lastLogged >= kLogEveryBytes) {
@@ -494,6 +532,7 @@ didCompleteWithError:(NSError*)error {
         }
     }
     if (n < 0) ok = NO;
+    free(buffer);
     fclose(out);
     gzclose(gz);
     if (!ok) {
