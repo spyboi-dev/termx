@@ -5,6 +5,8 @@
 #import "TXLog.h"
 #import <CommonCrypto/CommonDigest.h>
 #import <dlfcn.h>
+#import <fcntl.h>
+#import <limits.h>
 #import <sys/stat.h>
 
 NSString* const kTermXStateChanged = @"TermXStateChanged";
@@ -133,8 +135,41 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         }
         TXLogEngine(@"TermX engine init: state %@, guest %@",
                     TXStateName(_state), installed ? @"installed" : @"not installed");
+        // The runtime records how the last guest's session ended in
+        // guest/session.json ("running" from boot on, then the end,
+        // a kernel panic with its message). Read it before booting
+        // again: after a failed run it says what the last one did.
+        NSString* sessionPath = [_guestDir stringByAppendingPathComponent:@"session.json"];
+        NSString* record = [NSString stringWithContentsOfFile:sessionPath
+                                                      encoding:NSUTF8StringEncoding
+                                                         error:nil];
+        if (record.length) {
+            NSString* trimmed = [record stringByTrimmingCharactersInSet:
+                                 [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (trimmed.length > 2000) trimmed = [trimmed substringToIndex:2000];
+            TXLogEngine(@"Previous session record: %@", trimmed);
+        } else {
+            TXLogEngine(@"No previous session record");
+        }
     }
     return self;
+}
+
+// Whether a host path can be named in a `ubd<n>=` kernel argument
+// as itself: the runtime's uml::block::usable_ubd_path, replicated
+// here so the pre-flight names the exact check that fails it. UML
+// joins its arguments with spaces, and the kernel splits at
+// whitespace (including byte 0xa0), quotes, and reads a comma or
+// colon in a UBD specification as another field.
+static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
+    if (!path.length) return NO;
+    const char* s = path.UTF8String;
+    for (const char* p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' ||
+            c == '\r' || c == 0xa0 || c == '"' || c == ',' || c == ':') return NO;
+    }
+    return YES;
 }
 
 - (void)dealloc {
@@ -392,6 +427,182 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
     return YES;
 }
 
+// Pre-flight: replicate the runtime's runtimeRun() validation
+// with the real values, before run() is called. The 13:42 run
+// failed with "Guest run failed (-1)" — -UML_EMULATOR_INVALID_
+// ARGUMENT — three times, and the runtime prints the exact failing
+// check to stderr, which the app never captured (main() now does).
+// This check names the cause here instead: a failure returns NO
+// with *error set to the exact check, the engine goes Failed with
+// that text, and run() is never called. On success it logs the
+// validated values in one line and hands back the display size
+// run() must use. The checks run in the runtime's own order, so the
+// first failure named is the first failure the runtime would hit.
+- (BOOL)preflightBootOnView:(MTKView*)view
+                      width:(uint32_t*)outWidth
+                     height:(uint32_t*)outHeight
+                      error:(NSString**)error {
+    // 1. The request itself: the runtime refuses a struct smaller
+    // than everything before the adb key. The app's header is the
+    // upstream header at the pinned commit fbe12ee, the same commit
+    // the Mac framework was built from, and the framework reports
+    // ABI v43, which the header declares — but log the numbers, so
+    // a mismatch shows up instead of being assumed away.
+    uint32_t structSize = (uint32_t)sizeof(kernarium_runtime_boot);
+    size_t minStructSize = offsetof(kernarium_runtime_boot, android_adb_public_key);
+    TXLogEngine(@"Pre-flight: boot struct %u bytes (runtime needs >= %zu), ABI v%u",
+                structSize, minStructSize, KERNARIUM_RUNTIME_API_VERSION);
+    if (structSize < minStructSize) {
+        if (error) *error = @"Boot refused: boot request is too small for this runtime (struct_size)";
+        TXLogEngine(@"Pre-flight FAILED: struct_size %u < %zu", structSize, minStructSize);
+        return NO;
+    }
+    // 2. Display geometry: the runtime refuses a zero side, a side
+    // over its 4095 maximum, or zero DPI.
+    CGFloat scale = [UIScreen mainScreen].scale;
+    uint32_t width = (uint32_t)(view.bounds.size.width * scale);
+    uint32_t height = (uint32_t)(view.bounds.size.height * scale);
+    uint32_t dpi = 160;
+    TXLogEngine(@"Pre-flight: display %lux%lu pt @%.0fx = %ux%u px @%u DPI (max 4095)",
+                (unsigned long)view.bounds.size.width, (unsigned long)view.bounds.size.height,
+                (double)scale, width, height, dpi);
+    if (width == 0 || height == 0 || width > 4095 || height > 4095 || dpi == 0) {
+        if (error) *error = [NSString stringWithFormat:
+            @"Boot refused: guest display is %ux%u — the view has not laid out yet", width, height];
+        TXLogEngine(@"Pre-flight FAILED: invalid display geometry %ux%u @%u DPI", width, height, dpi);
+        return NO;
+    }
+    // 3. CPU and memory: the runtime admits 512 MiB through its
+    // ceiling in 64 MiB steps, and no more vCPUs than the host has.
+    // The ceiling never exceeds physical RAM, so that is the bound
+    // checked here; the GPU-budget call below reports the runtime's
+    // own limit as well.
+    NSUInteger hostCPUs = [NSProcessInfo processInfo].processorCount;
+    unsigned long long physicalMiB = [NSProcessInfo processInfo].physicalMemory >> 20;
+    TXLogEngine(@"Pre-flight: %u vCPUs (host %lu), %u MiB RAM (host %llu MiB, min 512, step 64)",
+                kGuestCPUs, (unsigned long)hostCPUs, kGuestMemoryMiB, physicalMiB);
+    if (kGuestCPUs == 0 || kGuestCPUs > (hostCPUs == 0 ? 1 : (uint32_t)hostCPUs)) {
+        if (error) *error = @"Boot refused: guest vCPU count is not admitted on this phone";
+        TXLogEngine(@"Pre-flight FAILED: %u vCPUs vs host %lu", kGuestCPUs, (unsigned long)hostCPUs);
+        return NO;
+    }
+    if (kGuestMemoryMiB < 512 || (kGuestMemoryMiB - 512) % 64 != 0 ||
+        kGuestMemoryMiB > physicalMiB) {
+        if (error) *error = @"Boot refused: guest memory size is not admitted on this phone";
+        TXLogEngine(@"Pre-flight FAILED: %u MiB RAM vs host %llu MiB", kGuestMemoryMiB, physicalMiB);
+        return NO;
+    }
+    // 4. Session record path: empty or PATH_MAX long is refused.
+    _sessionRecordPath = [_guestDir stringByAppendingPathComponent:@"session.json"];
+    TXLogEngine(@"Pre-flight: session record path %@ (%lu bytes)",
+                _sessionRecordPath, (unsigned long)_sessionRecordPath.length);
+    if (_sessionRecordPath.length == 0 || _sessionRecordPath.length >= PATH_MAX) {
+        if (error) *error = @"Boot refused: session record path is invalid";
+        TXLogEngine(@"Pre-flight FAILED: session record path length %lu",
+                    (unsigned long)_sessionRecordPath.length);
+        return NO;
+    }
+    // 5. Rootfs and overlay: both must be regular files. The rootfs
+    // must also be an .ext4 image with no write bits at all — the
+    // runtime's immutableExt4Rootfs. The image on the phone was
+    // installed by build 11f547d; the pipeline chmods it to 0444
+    // after verify, and the 13:42 legacy hash running proves it had
+    // no write bits then — but bits can change (a restore, a file
+    // provider), so re-assert them here instead of assuming: if
+    // they are wrong, fix them and log it; only fail when the fix
+    // does not stick.
+    struct stat rootSt;
+    if (stat(_rootfsPath.UTF8String, &rootSt) != 0 || !S_ISREG(rootSt.st_mode)) {
+        if (error) *error = @"Boot refused: guest image is missing or not a file";
+        TXLogEngine(@"Pre-flight FAILED: rootfs %@ is not a regular file", _rootfsPath);
+        return NO;
+    }
+    if ((unsigned long long)rootSt.st_size != (unsigned long long)kRootfsSize) {
+        if (error) *error = @"Boot refused: guest image has the wrong size";
+        TXLogEngine(@"Pre-flight FAILED: rootfs size %@, expected %@",
+                    TXFormatBytes((unsigned long long)rootSt.st_size),
+                    TXFormatBytes((unsigned long long)kRootfsSize));
+        return NO;
+    }
+    if (![[_rootfsPath.pathExtension lowercaseString] isEqualToString:@"ext4"]) {
+        if (error) *error = @"Boot refused: guest image is not an .ext4 image";
+        TXLogEngine(@"Pre-flight FAILED: rootfs extension is %@", _rootfsPath.pathExtension);
+        return NO;
+    }
+    mode_t rootMode = rootSt.st_mode & 0777;
+    if (rootMode & 0222) {
+        TXLogEngine(@"Pre-flight: rootfs has write bits (mode %04o) — re-applying read-only", rootMode);
+        chmod(_rootfsPath.UTF8String, 0444);
+        if (stat(_rootfsPath.UTF8String, &rootSt) != 0 || (rootSt.st_mode & 0222)) {
+            if (error) *error = @"Boot refused: guest image could not be made read-only";
+            TXLogEngine(@"Pre-flight FAILED: rootfs still writable after chmod 0444");
+            return NO;
+        }
+        TXLogEngine(@"Pre-flight: rootfs is read-only again (mode %04o)", rootSt.st_mode & 0777);
+    }
+    // The runtime checks only the extension and the bits, but a file
+    // with the right name and bits could still be the wrong bytes:
+    // confirm the ext4 superblock magic (0xEF53 at offset 1080).
+    int magicFd = open(_rootfsPath.UTF8String, O_RDONLY);
+    if (magicFd >= 0) {
+        unsigned char magic[2] = {0, 0};
+        ssize_t n = pread(magicFd, magic, sizeof(magic), 1080);
+        close(magicFd);
+        if (n == 2) {
+            TXLogEngine(@"Pre-flight: rootfs ext4 magic %02x %02x (want 53 ef)", magic[0], magic[1]);
+            if (magic[0] != 0x53 || magic[1] != 0xEF) {
+                if (error) *error = @"Boot refused: guest image is not an ext4 filesystem";
+                TXLogEngine(@"Pre-flight FAILED: rootfs superblock magic is not ext4");
+                return NO;
+            }
+        } else {
+            TXLogEngine(@"Pre-flight: could not read rootfs superblock magic — continuing");
+        }
+    }
+    struct stat overlaySt;
+    if (stat(_dataDiskPath.UTF8String, &overlaySt) != 0 || !S_ISREG(overlaySt.st_mode)) {
+        if (error) *error = @"Boot refused: data disk is missing or not a file";
+        TXLogEngine(@"Pre-flight FAILED: overlay %@ is not a regular file", _dataDiskPath);
+        return NO;
+    }
+    TXLogEngine(@"Pre-flight: rootfs %@ (mode %04o), overlay %@",
+                _rootfsPath, rootSt.st_mode & 0777, _dataDiskPath);
+    // 6. Both paths are named in `ubd<n>=` kernel arguments, which
+    // cannot carry whitespace, a quote, a comma or a colon.
+    if (!TXPathUsableOnKernelCommandLine(_rootfsPath)) {
+        if (error) *error = @"Boot refused: guest image path cannot be named on the kernel command line";
+        TXLogEngine(@"Pre-flight FAILED: rootfs path fails the UBD check: %@", _rootfsPath);
+        return NO;
+    }
+    if (!TXPathUsableOnKernelCommandLine(_dataDiskPath)) {
+        if (error) *error = @"Boot refused: data disk path cannot be named on the kernel command line";
+        TXLogEngine(@"Pre-flight FAILED: overlay path fails the UBD check: %@", _dataDiskPath);
+        return NO;
+    }
+    // 7. The GPU budget the runtime will compute for this boot: its
+    // process limit is the one LiveContainer (or SideStore) gives
+    // this process, so log the numbers instead of assuming them.
+    if (_api->plan_gpu_budget) {
+        kernarium_runtime_gpu_budget budget;
+        memset(&budget, 0, sizeof(budget));
+        budget.struct_size = (uint32_t)sizeof(budget);
+        _api->plan_gpu_budget(kGuestMemoryMiB, kGuestCPUs, 0, 0, 0, &budget);
+        TXLogEngine(@"Pre-flight: GPU budget %@ of a %@ limit, short_of_floor=%u, footprint %@",
+                    TXFormatBytes(budget.budget_bytes),
+                    TXFormatBytes(budget.process_limit_bytes),
+                    budget.short_of_floor,
+                    TXFormatBytes(TXCurrentFootprintBytes()));
+        if (budget.short_of_floor) {
+            self.statusText = @"Warning: low memory headroom — booting anyway";
+        }
+    }
+    if (outWidth) *outWidth = width;
+    if (outHeight) *outHeight = height;
+    TXLogEngine(@"Pre-flight OK: display %ux%u, %u vCPUs, %u MiB RAM, rootfs read-only ext4, overlay present",
+                width, height, kGuestCPUs, kGuestMemoryMiB);
+    return YES;
+}
+
 - (void)bootOnView:(MTKView*)view {
     NSString* loadError = nil;
     if (![self loadRuntimeWithError:&loadError]) {
@@ -426,37 +637,38 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         return;
     }
     _dataDiskReady = YES;
-    // Memory check first: the runtime says whether the process is likely
-    // to be killed for the guest size we ask for.
-    kernarium_runtime_gpu_budget budget;
-    memset(&budget, 0, sizeof(budget));
-    budget.struct_size = (uint32_t)sizeof(budget);
-    if (_api->plan_gpu_budget) {
-        _api->plan_gpu_budget(kGuestMemoryMiB, kGuestCPUs, 0, 0, 0, &budget);
-        if (budget.short_of_floor) {
-            self.statusText = @"Warning: low memory headroom — booting anyway";
-        }
+    // Pre-flight first: replicate the runtime's validation with the
+    // real values. A failure names the exact check, goes Failed with
+    // that text, and never calls run() — the 13:42 run failed three
+    // times with a bare "Guest run failed (-1)" and no cause.
+    uint32_t bootWidth = 0, bootHeight = 0;
+    NSString* preflightError = nil;
+    if (![self preflightBootOnView:view width:&bootWidth height:&bootHeight error:&preflightError]) {
+        self.bootPhase = TXBootPhaseFailed;
+        self.failedStep = TXBootStepKernel;
+        self.state = TermXStateFailed;
+        self.statusText = preflightError ?: @"Boot refused — see the log for the exact check";
+        TXLogFlush(); // the named cause must be on disk even if the app is killed next
+        return;
     }
     _api->set_console_output_callback(ConsoleOutput, (__bridge void*)self);
-    CGFloat scale = [UIScreen mainScreen].scale;
     kernarium_runtime_boot boot;
     memset(&boot, 0, sizeof(boot));
     boot.struct_size = (uint32_t)sizeof(boot);
-    boot.width = (uint32_t)(view.bounds.size.width * scale);
-    boot.height = (uint32_t)(view.bounds.size.height * scale);
+    boot.width = bootWidth;
+    boot.height = bootHeight;
     boot.dots_per_inch = 160;
     boot.guest_memory_mib = kGuestMemoryMiB;
     boot.guest_processor_count = kGuestCPUs;
     boot.rootfs_path = _rootfsPath.UTF8String;
     boot.overlay_path = _dataDiskPath.UTF8String;
-    _sessionRecordPath = [_guestDir stringByAppendingPathComponent:@"session.json"];
-    boot.session_record_path = _sessionRecordPath.UTF8String;
+    boot.session_record_path = _sessionRecordPath.UTF8String; // set by the pre-flight
     boot.use_jit = 0; // gadget (interpreter) engine: no JIT, no debugger
     self.bootPhase = TXBootPhaseKernel;
     self.state = TermXStateBooting;
     self.statusText = @"Booting Debian…";
-    TXLogEngine(@"Boot started: %u vCPUs, %u MiB RAM, data disk %llu GiB",
-                kGuestCPUs, kGuestMemoryMiB, kDataDiskGiB);
+    TXLogEngine(@"Boot started: %ux%u display, %u vCPUs, %u MiB RAM, data disk %llu GiB",
+                bootWidth, bootHeight, kGuestCPUs, kGuestMemoryMiB, kDataDiskGiB);
     _running = YES;
     // run() blocks until the guest stops, so it owns its own thread.
     // The boot struct's C strings point into NSStrings the engine holds

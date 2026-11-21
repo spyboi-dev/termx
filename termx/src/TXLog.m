@@ -2,6 +2,96 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "TXLog.h"
 #import <mach/mach.h>
+#import <errno.h>
+#import <fcntl.h>
+#import <pthread.h>
+#import <signal.h>
+#import <string.h>
+#import <unistd.h>
+
+// The runtime's stdout/stderr reader: one thread, blocking reads,
+// lines forwarded to TXLogEngine with a "runtime: " prefix. Runs
+// for the process lifetime; a line longer than the buffer is
+// truncated, never grown.
+static void* TXLogRuntimeReader(void* arg) {
+    int fd = (int)(intptr_t)arg;
+    char chunk[4096];
+    char line[4096];
+    size_t lineLen = 0;
+    for (;;) {
+        ssize_t n = read(fd, chunk, sizeof(chunk));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            // A failed read must not spin: wait, then try again.
+            [NSThread sleepForTimeInterval:1.0];
+            continue;
+        }
+        if (n == 0) {
+            // All write ends closed (cannot happen while fds 1/2 are
+            // the pipe): wait, then try again.
+            [NSThread sleepForTimeInterval:1.0];
+            continue;
+        }
+        for (ssize_t i = 0; i < n; i++) {
+            char c = chunk[i];
+            if (c == '\n') {
+                line[lineLen] = '\0';
+                if (lineLen > 0) {
+                    @autoreleasepool {
+                        NSString* text = [[NSString alloc] initWithBytes:line
+                                                                    length:lineLen
+                                                                  encoding:NSUTF8StringEncoding];
+                        if (text) TXLogEngine(@"runtime: %@", text);
+                        else TXLogEngine(@"runtime: <non-UTF8 output>");
+                    }
+                }
+                lineLen = 0;
+            } else if (c != '\r') {
+                if (lineLen < sizeof(line) - 1) line[lineLen++] = (char)c;
+            }
+        }
+    }
+    return NULL;
+}
+
+void TXLogCaptureRuntimeOutput(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // A reader that stops reading must never stall the runtime:
+        // SIGPIPE is ignored, and the write end is non-blocking, so
+        // a full pipe drops lines instead of blocking the boot
+        // thread that is writing the failure.
+        signal(SIGPIPE, SIG_IGN);
+        int fds[2];
+        if (pipe(fds) != 0) return;
+        // pipe() returns the lowest free fds: if stdout/stderr were
+        // closed at launch it can hand back 1 or 2 themselves, and
+        // dup2 would then destroy the read end. Move both ends above
+        // fd 2 first.
+        int r = fds[0], w = fds[1];
+        if (r <= STDERR_FILENO) {
+            int n = fcntl(r, F_DUPFD_CLOEXEC, 3);
+            if (n < 0) return;
+            close(r);
+            r = n;
+        }
+        if (w <= STDERR_FILENO) {
+            int n = fcntl(w, F_DUPFD_CLOEXEC, 3);
+            if (n < 0) return;
+            close(w);
+            w = n;
+        }
+        int flags = fcntl(w, F_GETFL, 0);
+        if (flags >= 0) (void)fcntl(w, F_SETFL, flags | O_NONBLOCK);
+        (void)dup2(w, STDOUT_FILENO);
+        (void)dup2(w, STDERR_FILENO);
+        (void)close(w);
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, TXLogRuntimeReader, (void*)(intptr_t)r) == 0) {
+            pthread_detach(thread);
+        }
+    });
+}
 
 static dispatch_queue_t TXLogQueue(void) {
     static dispatch_queue_t q;

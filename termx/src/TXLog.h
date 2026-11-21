@@ -42,6 +42,17 @@ void TXLogConsoleData(NSData *data);
 NSString *TXLogEngineLogPath(void);
 NSString *TXLogGuestLogPath(void);
 
+// Capture the process's own stdout/stderr (fd 1/2) into engine.log:
+// the Kernarium runtime prints the exact reason a boot fails there
+// ("Kernarium: invalid display geometry", "emulator creation
+// failed: %d", ...), and the app never saw it — every failed boot
+// arrived as a bare "Guest run failed (-1)". Installs a pipe, dup2s
+// it onto fds 1 and 2, and forwards lines to TXLogEngine with a
+// "runtime: " prefix. The write end is non-blocking and SIGPIPE is
+// ignored, so a stalled reader can only drop lines, never stall the
+// boot thread. Safe from any thread; call once, early in main().
+void TXLogCaptureRuntimeOutput(void);
+
 // Full diagnostic text for the in-app log view: the engine log,
 // then the guest console log. Missing files read as empty.
 NSString *TXLogFullText(void);

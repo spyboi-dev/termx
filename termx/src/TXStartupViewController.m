@@ -33,6 +33,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 @property (nonatomic, assign) BOOL autoBootDone;
 @property (nonatomic, assign) BOOL bootRetryUsed;
 @property (nonatomic, assign) BOOL bootRetryScheduled;
+@property (nonatomic, strong, nullable) NSDate *autoBootDeferredSince; // first tick the guest view had no size
 @property (nonatomic, strong) UIButton *eraseButton; // small destructive text button
 @property (nonatomic, strong) NSMutableArray<UIView *> *rowIcons;
 @property (nonatomic, strong) NSMutableArray<UIImageView *> *rowChecks;
@@ -597,6 +598,26 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     if (engine.state != TermXStateReady) return;
     if (self.autoBootDone) return;
     if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+    // Never hand run() a zero-sized view: the runtime refuses a
+    // zero display geometry with -1, and a boot on the first tick
+    // before layout would burn the one automatic boot on exactly
+    // that. Wait for the next poll tick instead; if the view still
+    // has no size after 10 s, boot anyway so the pre-flight names
+    // the failure on screen instead of waiting forever.
+    if (self.guestView.bounds.size.width <= 0 || self.guestView.bounds.size.height <= 0) {
+        if (!self.autoBootDeferredSince) {
+            self.autoBootDeferredSince = [NSDate date];
+            TXLogEngine(@"Auto-boot deferred: guest view has no size yet — waiting for layout");
+        } else if ([[NSDate date] timeIntervalSinceDate:self.autoBootDeferredSince] > 10.0) {
+            TXLogEngine(@"Auto-boot: guest view still has no size after 10 s — booting anyway so the failure is named");
+            self.autoBootDeferredSince = nil;
+            self.autoBootDone = YES;
+            TXLogEngine(@"Auto-boot: guest is ready, starting the engine");
+            [engine bootOnView:self.guestView];
+        }
+        return;
+    }
+    self.autoBootDeferredSince = nil;
     self.autoBootDone = YES;
     TXLogEngine(@"Auto-boot: guest is ready, starting the engine");
     [engine bootOnView:self.guestView];
