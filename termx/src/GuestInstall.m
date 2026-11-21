@@ -9,6 +9,11 @@
 // Private helper defined below its first use.
 @interface GuestInstall ()
 + (BOOL)gunzipFile:(NSString*)src to:(NSString*)dst error:(NSString**)error;
+// The body of installGuestTo:, on a background queue (the installed
+// check can SHA-256 a 1.6 GB image; never on the main thread).
++ (void)installGuestToOnQueue:(NSString*)rootfsPath
+                     progress:(void (^)(double, NSString*, int64_t, int64_t))progress
+                   completion:(void (^)(BOOL, NSString*))completion;
 @end
 
 // Guest image: Debian trixie arm64, built 2026-11-20 (see rootfs-build/).
@@ -54,6 +59,31 @@ static NSString* TXGuestDir(void) {
 
 static NSString* TXResumeDataPath(void) {
     return [TXGuestDir() stringByAppendingPathComponent:@"rootfs-download.resume"];
+}
+
+// Resume data is a plist the system wrote when a download was
+// interrupted. It can go stale: the daemon temp file it names may
+// be purged between runs, or the blob can be truncated. And
+// downloadTaskWithResumeData: THROWS NSInvalidArgumentException on
+// malformed data instead of returning nil — an unguarded call is an
+// instant crash on every Install tap until the file is deleted.
+// That is the regression: the previous build never wrote resume
+// data, so it never hit this; this build writes it on every failure
+// and cancel, so the very next Install can die in under a second.
+// Validate first (lenient: a plist dictionary with a remote URL),
+// and still catch, so a bad blob can only ever cost a fresh
+// download, never a crash.
+static BOOL TXResumeDataIsUsable(NSData* data) {
+    if (!data.length) return NO;
+    NSError* error = nil;
+    id plist = [NSPropertyListSerialization propertyListWithData:data
+                                                         options:NSPropertyListImmutable
+                                                          format:NULL
+                                                           error:&error];
+    if (![plist isKindOfClass:[NSDictionary class]]) return NO;
+    NSString* remoteURL = plist[@"NSURLSessionResumeInfoRemoteURL"];
+    if (![remoteURL isKindOfClass:[NSString class]] || !remoteURL.length) return NO;
+    return YES;
 }
 
 // SHA-256 of a file, streaming in 1 MB chunks: memory stays flat no
@@ -112,6 +142,7 @@ static BOOL FileHasHash(NSString* path, NSString* expected, NSString* label) {
 @property (nonatomic) NSInteger lastLoggedPercent; // -1 until the first 10%
 @property (nonatomic) BOOL cancelledByUser;
 @property (nonatomic) BOOL completionCalled;
+@property (nonatomic) UIBackgroundTaskIdentifier pipelineBackgroundTask; // UIBackgroundTaskInvalid when none
 @end
 
 static TXRootfsDownload* s_activeDownload = nil;
@@ -119,7 +150,13 @@ static TXRootfsDownload* s_activeDownload = nil;
 @implementation TXRootfsDownload
 
 + (instancetype)active {
-    if (!s_activeDownload) {
+    // Thread-safe: installGuestTo: now starts on a background queue,
+    // and the background-wake path calls this from the main thread,
+    // so two threads can race the old nil check and create two
+    // sessions with the same identifier (the second invalidates the
+    // first, and its tasks die with it).
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
         s_activeDownload = [[TXRootfsDownload alloc] init];
         NSURLSessionConfiguration* config =
             [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:kDownloadSessionIdentifier];
@@ -132,7 +169,7 @@ static TXRootfsDownload* s_activeDownload = nil;
                                                  selector:@selector(memoryWarning:)
                                                      name:UIApplicationDidReceiveMemoryWarningNotification
                                                    object:nil];
-    }
+    });
     return s_activeDownload;
 }
 
@@ -158,6 +195,10 @@ static TXRootfsDownload* s_activeDownload = nil;
 - (void)finish:(BOOL)ok error:(NSString*)error {
     if (self.completionCalled) return;
     self.completionCalled = YES;
+    if (self.pipelineBackgroundTask != UIBackgroundTaskInvalid) {
+        [[UIApplication sharedApplication] endBackgroundTask:self.pipelineBackgroundTask];
+        self.pipelineBackgroundTask = UIBackgroundTaskInvalid;
+    }
     void (^completion)(BOOL, NSString*) = self.completion;
     self.task = nil;
     if (completion) {
@@ -174,6 +215,16 @@ static TXRootfsDownload* s_activeDownload = nil;
     NSString* gzPath = self.gzPath;
     NSString* rootfsPath = self.rootfsPath;
     NSFileManager* fm = [NSFileManager defaultManager];
+    // The pipeline (hash 368 MB, gunzip to 1.6 GB, hash 1.6 GB) takes
+    // longer than a background wake's budget. Without an assertion
+    // the system kills the app mid-pipeline, leaving a partial image
+    // and a fresh resume blob — the exact state that crashed the next
+    // Install. The assertion is ended in finish:, the single funnel
+    // every pipeline exit goes through.
+    self.pipelineBackgroundTask =
+        [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
+            TXLogEngine(@"Background time expired during install pipeline — the archive is kept, Install will reuse it");
+        }];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self reportProgress:0.6 step:@"Verifying the download…"];
         if (!FileHasHash(gzPath, kRootfsGzSHA256, @"Verifying download")) {
@@ -256,17 +307,40 @@ static TXRootfsDownload* s_activeDownload = nil;
 
     NSData* resumeData = [NSData dataWithContentsOfFile:TXResumeDataPath()];
     if (resumeData.length > 0) {
-        TXLogEngine(@"Resuming the download from saved resume data (%@)", TXFormatBytes(resumeData.length));
-        self.task = [self.session downloadTaskWithResumeData:resumeData];
+        if (TXResumeDataIsUsable(resumeData)) {
+            TXLogEngine(@"Resuming the download from saved resume data (%@)", TXFormatBytes(resumeData.length));
+            @try {
+                self.task = [self.session downloadTaskWithResumeData:resumeData];
+            } @catch (NSException* exception) {
+                // Stale resume data throws instead of returning nil.
+                // Log it, drop the blob, and start fresh — never crash.
+                TXLogEngine(@"Resume data threw %@: %@ — starting a fresh download",
+                            exception.name ?: @"?", exception.reason ?: @"?");
+                self.task = nil;
+            }
+        } else {
+            TXLogEngine(@"Saved resume data failed validation — discarding it");
+        }
         if (!self.task) {
-            TXLogEngine(@"Resume data was unusable — starting a fresh download");
             [fm removeItemAtPath:TXResumeDataPath() error:nil];
         }
     }
     if (!self.task) {
         NSURL* url = [NSURL URLWithString:kRootfsURL];
         TXLogEngine(@"Downloading guest image from %@", kRootfsURL);
-        self.task = [self.session downloadTaskWithURL:url];
+        @try {
+            self.task = [self.session downloadTaskWithURL:url];
+        } @catch (NSException* exception) {
+            TXLogEngine(@"Creating the download task threw %@: %@",
+                        exception.name ?: @"?", exception.reason ?: @"?");
+            [self finish:NO error:@"could not start the download — try again"];
+            return;
+        }
+        if (!self.task) {
+            TXLogEngine(@"Download task creation returned nil");
+            [self finish:NO error:@"could not start the download — try again"];
+            return;
+        }
     }
     [self reportProgress:0.0 step:@"Downloading Debian image…"];
     [self.task resume];
@@ -413,6 +487,17 @@ didCompleteWithError:(NSError*)error {
 + (void)installGuestTo:(NSString*)rootfsPath
               progress:(void (^)(double, NSString*, int64_t, int64_t))progress
             completion:(void (^)(BOOL, NSString*))completion {
+    // The installed check below can SHA-256 a 1.6 GB image: never on
+    // the main thread. The whole start runs on a background queue;
+    // progress/completion hop to the main queue themselves.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self installGuestToOnQueue:rootfsPath progress:progress completion:completion];
+    });
+}
+
++ (void)installGuestToOnQueue:(NSString*)rootfsPath
+                     progress:(void (^)(double, NSString*, int64_t, int64_t))progress
+                   completion:(void (^)(BOOL, NSString*))completion {
     NSString* error = nil;
     if ([self guestInstalledAt:rootfsPath error:&error]) {
         TXLogEngine(@"Install skipped: guest image already verified");
