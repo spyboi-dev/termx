@@ -2,11 +2,14 @@
 #import "KernEngine.h"
 #import "KernariumRuntime.h"
 #import "GuestInstall.h"
+#import "TXBootPathCheck.h"
 #import "TXLog.h"
 #import <CommonCrypto/CommonDigest.h>
 #import <dlfcn.h>
 #import <fcntl.h>
 #import <limits.h>
+#import <stdlib.h>
+#import <string.h>
 #import <sys/stat.h>
 
 NSString* const kTermXStateChanged = @"TermXStateChanged";
@@ -26,9 +29,14 @@ static const uint64_t kDataDiskGiB = 8;
     void* _runtimeHandle; // dlopen handle; held for the process lifetime
     BOOL _running;
     // Held for the whole run: the boot struct hands the runtime C strings,
-    // and they must stay alive until run() returns.
-    NSString* _sessionRecordPath;
-    NSString* _dataDiskPath;
+    // and they must stay alive until run() returns. All four are __strong
+    // (verified: no weak/assign anywhere) — the paths are built once in
+    // init, the session record once per boot in the pre-flight, and
+    // nothing reassigns them while a run is in flight.
+    __strong NSString* _sessionRecordPath;
+    __strong NSString* _dataDiskPath;
+    __strong NSString* _guestDir;
+    __strong NSString* _rootfsPath;
     BOOL _dataDiskReady;
 }
 // Readwrite here so the console callback and the boot/install paths
@@ -106,7 +114,16 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         _statusText = @"Not installed yet — tap Install";
         NSString* docs = NSSearchPathForDirectoriesInDomains(
             NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        _guestDir = [docs stringByAppendingPathComponent:@"guest"];
+        // Canonicalize once, here: /var is a symlink to /private/var,
+        // so the raw Documents path starts with /var/mobile/... while
+        // the framework resolves /private/var/mobile/... . Every guest
+        // path below is built from this one, so all of them are
+        // canonical from the start. (Side effect, one time: the
+        // install fingerprint is keyed by the exact path string, so
+        // the first launch of this build does one full hash verify
+        // and re-records the fingerprint under the canonical path.)
+        _guestDir = TXCanonicalizePath([docs stringByAppendingPathComponent:@"guest"]);
+        TXLogEngine(@"Guest dir: %@", _guestDir);
         _rootfsPath = [_guestDir stringByAppendingPathComponent:kRootfsName];
         // Fixed path in the data container, NOT the tmp directory: iOS
         // may purge tmp, and a persistent disk must survive. The file
@@ -153,6 +170,32 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         }
     }
     return self;
+}
+
+// Canonicalize a path with realpath(): /var is a symlink to
+// /private/var, so the guest paths the app builds start with
+// /var/mobile/... while the framework's own dlopen path in the log
+// reads /private/var/mobile/... . The runtime's std::filesystem
+// checks should not care about a symlinked prefix, but a symlinked
+// prefix is the one difference between the path the app stats and
+// the path the framework resolves — remove it, so both sides name
+// the same file the same way. Falls back to canonicalizing the
+// parent directory and re-appending the last component when the
+// file itself does not exist yet (the session record is created by
+// the runtime during the run; the guest dir may not exist before
+// the first install).
+static NSString* TXCanonicalizePath(NSString* path) {
+    if (!path.length) return path;
+    char resolved[PATH_MAX];
+    if (realpath(path.UTF8String, resolved)) {
+        return [NSString stringWithUTF8String:resolved];
+    }
+    NSString* parent = [path stringByDeletingLastPathComponent];
+    NSString* name = [path lastPathComponent];
+    if (parent.length && realpath(parent.UTF8String, resolved)) {
+        return [[NSString stringWithUTF8String:resolved] stringByAppendingPathComponent:name];
+    }
+    return path;
 }
 
 // Whether a host path can be named in a `ubd<n>=` kernel argument
@@ -493,7 +536,10 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
         return NO;
     }
     // 4. Session record path: empty or PATH_MAX long is refused.
-    _sessionRecordPath = [_guestDir stringByAppendingPathComponent:@"session.json"];
+    // Canonicalized like the other boot paths (see
+    // TXCanonicalizePath): the file itself may not exist yet, so
+    // the parent directory is what realpath() resolves.
+    _sessionRecordPath = TXCanonicalizePath([_guestDir stringByAppendingPathComponent:@"session.json"]);
     TXLogEngine(@"Pre-flight: session record path %@ (%lu bytes)",
                 _sessionRecordPath, (unsigned long)_sessionRecordPath.length);
     if (_sessionRecordPath.length == 0 || _sessionRecordPath.length >= PATH_MAX) {
@@ -619,6 +665,21 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
         self.statusText = @"No guest display — this is an app bug";
         return;
     }
+    // Canonicalize the boot paths before anything reads them: the
+    // guest dir was canonicalized in init, so this is normally a
+    // no-op, but a path built any other way (a restore, a file
+    // provider) still gets the /var -> /private/var symlink resolved
+    // here, so the install check, the pre-flight and the runtime all
+    // name the same files the same way. Log it when it changes
+    // anything: that is the evidence the fix fired.
+    NSString* oldRootfs = _rootfsPath;
+    NSString* oldDataDisk = _dataDiskPath;
+    _rootfsPath = TXCanonicalizePath(_rootfsPath);
+    _dataDiskPath = TXCanonicalizePath(_dataDiskPath);
+    if (![_rootfsPath isEqualToString:oldRootfs] || ![_dataDiskPath isEqualToString:oldDataDisk]) {
+        TXLogEngine(@"Canonicalized boot paths: rootfs %@ -> %@, overlay %@ -> %@",
+                    oldRootfs, _rootfsPath, oldDataDisk, _dataDiskPath);
+    }
     if (![self guestInstalled]) {
         self.bootPhase = TXBootPhaseFailed;
         self.failedStep = TXBootStepImage;
@@ -664,6 +725,25 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
     boot.overlay_path = _dataDiskPath.UTF8String;
     boot.session_record_path = _sessionRecordPath.UTF8String; // set by the pre-flight
     boot.use_jit = 0; // gadget (interpreter) engine: no JIT, no debugger
+    // The boot struct's C strings must stay valid until run() returns,
+    // on the run's own thread: copy them into buffers this boot owns,
+    // so no NSString UTF8String lifetime question can remain. The
+    // run's block frees them after run() returns; a second boot
+    // allocates its own buffers, so the two can never share one.
+    char* bootRootfs = boot.rootfs_path ? strdup(boot.rootfs_path) : NULL;
+    char* bootOverlay = boot.overlay_path ? strdup(boot.overlay_path) : NULL;
+    char* bootSession = boot.session_record_path ? strdup(boot.session_record_path) : NULL;
+    if (!bootRootfs || !bootOverlay || (boot.session_record_path && !bootSession)) {
+        free(bootRootfs); free(bootOverlay); free(bootSession);
+        self.bootPhase = TXBootPhaseFailed;
+        self.failedStep = TXBootStepKernel;
+        self.state = TermXStateFailed;
+        self.statusText = @"Boot refused: could not copy the guest paths";
+        return;
+    }
+    boot.rootfs_path = bootRootfs;
+    boot.overlay_path = bootOverlay;
+    boot.session_record_path = bootSession;
     self.bootPhase = TXBootPhaseKernel;
     self.state = TermXStateBooting;
     self.statusText = @"Booting Debian…";
@@ -671,12 +751,45 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
                 bootWidth, bootHeight, kGuestCPUs, kGuestMemoryMiB, kDataDiskGiB);
     _running = YES;
     // run() blocks until the guest stops, so it owns its own thread.
-    // The boot struct's C strings point into NSStrings the engine holds
-    // (properties and ivars), so the pointers stay valid for the run.
     // A Linux guest has no boot_completed signal: the console callback
     // flips the state to Running on the login prompt.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        // The experiment, on the exact C strings run() is about to
+        // read: log the raw bytes (pointer, length, full text, hex
+        // dump), then repeat the runtime's exact std::filesystem
+        // checks on them. If the strings are wrong here, the pointers
+        // were the problem all along; if the checks fail here, the
+        // log names which one and its error; if they pass here and
+        // run() still fails with the runtime's line, the runtime sees
+        // different bytes than the app hands it — that is the
+        // distinction this build exists to draw. A failure refuses
+        // the boot with the named cause instead of handing possibly
+        // bad pointers to the runtime.
+        NSUInteger rootfsBytes = [self->_rootfsPath lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+        NSUInteger overlayBytes = [self->_dataDiskPath lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+        NSUInteger sessionBytes = [self->_sessionRecordPath lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+        // Each logged separately (no && chain): a bad first string
+        // must not hide the other two.
+        BOOL rootfsStringOK = TXLogBootCString("rootfs", boot.rootfs_path, rootfsBytes);
+        BOOL overlayStringOK = TXLogBootCString("overlay", boot.overlay_path, overlayBytes);
+        BOOL sessionStringOK = TXLogBootCString("session", boot.session_record_path, sessionBytes);
+        // The exact check runs even when a string looks wrong: the
+        // two are independent evidence, and both belong in the log.
+        BOOL pathsExactOK = TXCheckBootPathsExact(boot.rootfs_path, boot.overlay_path);
+        BOOL stringsOK = rootfsStringOK && overlayStringOK && sessionStringOK;
+        BOOL pathsOK = stringsOK && pathsExactOK;
+        TXLogFlush(); // the experiment lines must be on disk even if the run kills the process
+        if (!pathsOK) {
+            free(bootRootfs); free(bootOverlay); free(bootSession);
+            self->_running = NO;
+            self.bootPhase = TXBootPhaseFailed;
+            self.failedStep = TXBootStepKernel;
+            self.state = TermXStateFailed;
+            self.statusText = @"Boot refused: the runtime's own path check fails on the boot paths — see the log";
+            return;
+        }
         int result = self->_api->run(view, &boot);
+        free(bootRootfs); free(bootOverlay); free(bootSession);
         self->_running = NO;
         if (result == 0) {
             self.bootPhase = TXBootPhaseIdle;
