@@ -243,7 +243,7 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
 }
 
 - (NSString*)imageDetail {
-    return @"trixie · read-only";
+    return @"trixie slim · read-only";
 }
 
 - (void)enterBackground {

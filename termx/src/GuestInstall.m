@@ -10,38 +10,43 @@
 @interface GuestInstall ()
 + (BOOL)gunzipFile:(NSString*)src to:(NSString*)dst error:(NSString**)error;
 // The body of installGuestTo:, on a background queue (the installed
-// check can SHA-256 a 1.6 GB image; never on the main thread).
+// check can SHA-256 a 1 GiB image; never on the main thread).
 + (void)installGuestToOnQueue:(NSString*)rootfsPath
                      progress:(void (^)(double, NSString*, int64_t, int64_t))progress
                    completion:(void (^)(BOOL, NSString*))completion;
 @end
 
-// Guest image: Debian trixie arm64, built 2026-11-20 (see rootfs-build/).
-// The .ext4.gz must be published at kRootfsURL before first use from the app;
-// the app refuses an image whose hash does not match.
+// Guest image: Debian trixie arm64 MINIMAL (slim), built 2026-11-21
+// (see rootfs-build/build-rootfs-slim.sh). Boots to a shell with working
+// apt and networking; users apt-install what they need. The .ext4.gz must
+// be published at kRootfsURL before first use from the app; the app
+// refuses an image whose hash does not match.
 //
-// NOTE: these four constants are the FULL image. The slim minimal image
-// (release rootfs-20261121-slim) is being published separately; when it
-// lands, only these four lines change to point at it. Nothing else in
-// this file hardcodes an image size or hash.
+// NOTE: these four constants are the SLIM image (release
+// rootfs-20261121-slim). The local filename kRootfsName is deliberately
+// UNCHANGED from the old full image: the slim image replaces the full
+// one at the same path, so a phone holding the full image sees a
+// size/hash mismatch, treats it as "reinstall", and swaps cleanly.
+// The persistent data disk (termx-data.ext4) is a separate file and is
+// never touched by the image switch.
 NSString* const kRootfsURL =
-    @"https://github.com/spyboi-dev/termx/releases/download/rootfs-20261120/termx-debian-trixie-arm64.ext4.gz";
+    @"https://github.com/spyboi-dev/termx/releases/download/rootfs-20261121-slim/termx-debian-trixie-arm64-slim.ext4.gz";
 NSString* const kRootfsName = @"termx-debian-trixie-arm64.ext4";
-NSString* const kRootfsGzSHA256 = @"7bc05dcf82a48d7b1f04413c2d3a8c3cafa5ea4450cc2284b82725e7aba79676";
-NSString* const kRootfsSHA256 = @"a11e2dd31cce3ab20630b48ff288586b9cc6691a7cf1992ff7d0193b00ba2f14";
-const long long kRootfsSize = 1728053248; // extracted image size in bytes (1,648 MiB)
+NSString* const kRootfsGzSHA256 = @"26924f8b8e52c5ec095a767499dc20567a4b267551fb6dc3e0029724e5db549b";
+NSString* const kRootfsSHA256 = @"2d2565701f685733ddc8cfdc6645dc0522e6ff38e6a38b0343f2ed19f0813f0c";
+const long long kRootfsSize = 1073741824; // extracted image size in bytes (exactly 1 GiB)
 
 // Background session: one identifier for the process lifetime, so a
 // download survives the phone locking, the app suspending, and the app
 // being killed, and the system can wake the app when it finishes.
 static NSString* const kDownloadSessionIdentifier = @"app.termx.ios.rootfs-download";
 
-// The .gz download is ~368 MB and the extracted image ~1.6 GB. The
+// The .gz download is ~116 MB and the extracted image exactly 1 GiB. The
 // install needs both alive at once, plus headroom for the OS, so refuse
 // to start (or to extract) when the phone is too full, with the numbers
 // in the error, instead of dying halfway through with ENOSPC.
-static const unsigned long long kFreeSpaceNeededBeforeDownload = 3ULL << 30; // 3 GiB
-static const unsigned long long kFreeSpaceNeededBeforeExtract = 2ULL << 30;  // 2 GiB
+static const unsigned long long kFreeSpaceNeededBeforeDownload = 1ULL << 30; // 1 GiB
+static const unsigned long long kFreeSpaceNeededBeforeExtract = 3ULL << 29;  // 1.5 GiB
 // Log a line every 10% of the download and every 256 MiB of the
 // extract/verify steps, so the next crash leaves the exact phase and
 // byte count in engine.log.
@@ -72,7 +77,11 @@ static NSString* TXResumeDataPath(void) {
 // and cancel, so the very next Install can die in under a second.
 // Validate first (lenient: a plist dictionary with a remote URL),
 // and still catch, so a bad blob can only ever cost a fresh
-// download, never a crash.
+// download, never a crash. The remote URL must also match the image
+// this build downloads: a resume blob from the old full image (a
+// different release URL) is stale by definition — resuming it would
+// keep downloading the wrong image, which then fails the hash check.
+// Such a blob is discarded and the download starts fresh.
 static BOOL TXResumeDataIsUsable(NSData* data) {
     if (!data.length) return NO;
     NSError* error = nil;
@@ -83,12 +92,13 @@ static BOOL TXResumeDataIsUsable(NSData* data) {
     if (![plist isKindOfClass:[NSDictionary class]]) return NO;
     NSString* remoteURL = plist[@"NSURLSessionResumeInfoRemoteURL"];
     if (![remoteURL isKindOfClass:[NSString class]] || !remoteURL.length) return NO;
+    if (![remoteURL isEqualToString:kRootfsURL]) return NO;
     return YES;
 }
 
 // SHA-256 of a file, streaming in 1 MB chunks: memory stays flat no
 // matter how big the file is. Logs a milestone every 256 MiB with the
-// label, so a kill during the 1.6 GB verify leaves its position.
+// label, so a kill during the 1 GiB verify leaves its position.
 static NSString* SHA256OfFile(NSString* path, NSString* label, NSError** outError) {
     NSFileHandle* handle = [NSFileHandle fileHandleForReadingAtPath:path];
     if (!handle) {
@@ -141,6 +151,7 @@ static BOOL FileHasHash(NSString* path, NSString* expected, NSString* label) {
 @property (nonatomic) int64_t expected;
 @property (nonatomic) NSInteger lastLoggedPercent; // -1 until the first 10%
 @property (nonatomic) BOOL cancelledByUser;
+@property (nonatomic) NSInteger staleCancellationsPending; // cancels of tasks for the old image; their error callbacks are swallowed
 @property (nonatomic) BOOL completionCalled;
 @property (nonatomic) UIBackgroundTaskIdentifier pipelineBackgroundTask; // UIBackgroundTaskInvalid when none
 @end
@@ -215,7 +226,7 @@ static TXRootfsDownload* s_activeDownload = nil;
     NSString* gzPath = self.gzPath;
     NSString* rootfsPath = self.rootfsPath;
     NSFileManager* fm = [NSFileManager defaultManager];
-    // The pipeline (hash 368 MB, gunzip to 1.6 GB, hash 1.6 GB) takes
+    // The pipeline (hash 116 MB, gunzip to 1 GiB, hash 1 GiB) takes
     // longer than a background wake's budget. Without an assertion
     // the system kills the app mid-pipeline, leaving a partial image
     // and a fresh resume blob — the exact state that crashed the next
@@ -286,7 +297,7 @@ static TXRootfsDownload* s_activeDownload = nil;
 
     // An archive already on disk whose hash checks out is reused
     // instead of downloaded again: a kill during extraction used to
-    // throw away 368 MB of good download and start from zero.
+    // throw away 116 MB of good download and start from zero.
     if ([fm fileExistsAtPath:self.gzPath] &&
         FileHasHash(self.gzPath, kRootfsGzSHA256, @"Verifying download")) {
         TXLogEngine(@"Reusing the already-downloaded archive");
@@ -392,6 +403,14 @@ didFinishDownloadingToURL:(NSURL*)location {
               task:(NSURLSessionTask*)task
 didCompleteWithError:(NSError*)error {
     (void)session; (void)task;
+    if (self.staleCancellationsPending > 0) {
+        // This error is the expected echo of cancelling a task that
+        // belonged to the old image (see installGuestToOnQueue):
+        // swallow it, do not finish the new install with an error.
+        self.staleCancellationsPending--;
+        TXLogEngine(@"Swallowed the error callback of a cancelled stale download task");
+        return;
+    }
     if (!error) return; // success is handled by didFinishDownloadingToURL
     NSData* resumeData = error.userInfo[NSURLSessionDownloadTaskResumeData];
     if (resumeData.length > 0) {
@@ -447,7 +466,7 @@ didCompleteWithError:(NSError*)error {
 }
 
 // Streaming gunzip of src (.gz) to dst, in 1 MB chunks: memory stays
-// flat while 368 MB becomes 1.6 GB. Logs every 256 MiB written, so a
+// flat while 116 MB becomes 1 GiB. Logs every 256 MiB written, so a
 // kill during extraction leaves its position. Returns NO with *error
 // set on failure; the caller checks the hashes.
 + (BOOL)gunzipFile:(NSString*)src to:(NSString*)dst error:(NSString**)error {
@@ -487,7 +506,7 @@ didCompleteWithError:(NSError*)error {
 + (void)installGuestTo:(NSString*)rootfsPath
               progress:(void (^)(double, NSString*, int64_t, int64_t))progress
             completion:(void (^)(BOOL, NSString*))completion {
-    // The installed check below can SHA-256 a 1.6 GB image: never on
+    // The installed check below can SHA-256 a 1 GiB image: never on
     // the main thread. The whole start runs on a background queue;
     // progress/completion hop to the main queue themselves.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -508,17 +527,28 @@ didCompleteWithError:(NSError*)error {
     // A download is already in flight (e.g. the app was relaunched
     // while the background session was running): attach the new
     // progress/completion blocks to it instead of starting a second.
+    // But only if it is downloading THIS image: a task left over from
+    // the old full image must be dropped, or it would keep fetching
+    // 368 MB that then fails the slim hash check.
     if (download.task && download.task.state == NSURLSessionTaskStateRunning) {
-        TXLogEngine(@"Install attached to the download already in flight");
-        download.progress = progress;
-        download.completion = completion;
-        download.completionCalled = NO;
-        [download reportProgress:0.0 step:@"Downloading Debian image…"];
-        return;
+        if (![download.task.originalRequest.URL.absoluteString isEqualToString:kRootfsURL]) {
+            TXLogEngine(@"In-flight download is for the old image — cancelling it and starting fresh");
+            download.staleCancellationsPending++;
+            [download.task cancel];
+            download.task = nil;
+        } else {
+            TXLogEngine(@"Install attached to the download already in flight");
+            download.progress = progress;
+            download.completion = completion;
+            download.completionCalled = NO;
+            [download reportProgress:0.0 step:@"Downloading Debian image…"];
+            return;
+        }
     }
     // No live task: the background session may still hold one (the
     // app was killed and relaunched). Ask the session; a found task
-    // is the same download, re-attached, not a new one.
+    // for THIS image is the same download, re-attached, not a new
+    // one. Tasks for the old image are cancelled the same way.
     download.rootfsPath = rootfsPath;
     download.progress = progress;
     download.completion = completion;
@@ -526,12 +556,24 @@ didCompleteWithError:(NSError*)error {
                                                       NSArray<NSURLSessionUploadTask*>* uploadTasks,
                                                       NSArray<NSURLSessionDownloadTask*>* downloadTasks) {
         (void)dataTasks; (void)uploadTasks;
-        if (downloadTasks.count > 0) {
-            NSURLSessionDownloadTask* existing = downloadTasks.firstObject;
+        NSURLSessionDownloadTask* matching = nil;
+        for (NSURLSessionDownloadTask* t in downloadTasks) {
+            if ([t.originalRequest.URL.absoluteString isEqualToString:kRootfsURL]) {
+                if (!matching) matching = t;
+                continue;
+            }
+            // Already being cancelled: counted once already, do not
+            // count it twice or a later genuine error gets swallowed.
+            if (t.state != NSURLSessionTaskStateCanceling) {
+                download.staleCancellationsPending++;
+                [t cancel];
+            }
+        }
+        if (matching) {
             TXLogEngine(@"Re-attached to a background download task already running");
-            download.task = existing;
-            download.received = existing.countOfBytesReceived;
-            download.expected = existing.countOfBytesExpectedToReceive;
+            download.task = matching;
+            download.received = matching.countOfBytesReceived;
+            download.expected = matching.countOfBytesExpectedToReceive;
             [download reportProgress:0.0 step:@"Downloading Debian image…"];
             return;
         }

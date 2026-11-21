@@ -460,7 +460,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     } else if (engine.state == TermXStateDownloading) {
         [self setRow:TXBootStepImage state:TXStartupRowActive detail:[self downloadDetail]];
     } else {
-        [self setRow:TXBootStepImage state:TXStartupRowPending detail:@"Debian trixie · 368 MB"];
+        [self setRow:TXBootStepImage state:TXStartupRowPending detail:@"Debian trixie slim · 116 MB"];
     }
 
     // Linux kernel.
@@ -504,7 +504,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     }
 }
 
-// "Downloading… 42% · 156 MB of 368 MB · 2.1 MB/s", from the real
+// "Downloading… 42% · 56 MB of 116 MB · 2.1 MB/s", from the real
 // byte counts the download watcher reports. The rate is measured
 // between poll ticks; it is omitted until two ticks exist.
 - (NSString *)downloadDetail {

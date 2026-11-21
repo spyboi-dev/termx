@@ -11,7 +11,7 @@
 // download happens at all.
 //
 // The download URL is the release the image is published under. Publish
-// rootfs-build/termx-debian-trixie-arm64.ext4.gz there before the first
+// rootfs-build/termx-debian-trixie-arm64-slim.ext4.gz there before the first
 // install from the app (see BUILD-NOTE.md).
 //
 // Download survival: the download runs on a background NSURLSession, so

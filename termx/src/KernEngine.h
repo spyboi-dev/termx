@@ -78,7 +78,7 @@ extern NSString* const kTermXStateChanged;
 @property (nonatomic, readonly) double bootProgress;
 
 // Live download counters (bytes), for the startup screen's
-// "156 MB of 368 MB" line. 0 when no download is in flight.
+// "56 MB of 116 MB" line. 0 when no download is in flight.
 @property (nonatomic, readonly) int64_t downloadReceived;
 @property (nonatomic, readonly) int64_t downloadExpected;
 

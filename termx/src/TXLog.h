@@ -39,7 +39,7 @@ NSString *TXLogGuestLogPath(void);
 // then the guest console log. Missing files read as empty.
 NSString *TXLogFullText(void);
 
-// Human byte size: "368 MB", "1.7 GiB", "128 MiB".
+// Human byte size: "116 MB", "1.0 GiB", "128 MiB".
 NSString *TXFormatBytes(unsigned long long bytes);
 
 // This process's current physical memory footprint, in bytes
