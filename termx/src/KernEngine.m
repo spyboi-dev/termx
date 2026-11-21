@@ -126,12 +126,13 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
                                                      name:UIApplicationDidReceiveMemoryWarningNotification
                                                    object:nil];
         // Refresh the state from disk on launch: an installed guest means Ready.
-        if ([self guestInstalled]) {
+        BOOL installed = [self guestInstalled];
+        if (installed) {
             _state = TermXStateReady;
             _statusText = @"Guest ready — tap Boot";
         }
         TXLogEngine(@"TermX engine init: state %@, guest %@",
-                    TXStateName(_state), [self guestInstalled] ? @"installed" : @"not installed");
+                    TXStateName(_state), installed ? @"installed" : @"not installed");
     }
     return self;
 }
@@ -147,9 +148,27 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
 // table stays valid until process exit.
 - (BOOL)loadRuntimeWithError:(NSString**)error {
     if (_api) return YES;
+    // The framework lives in the bundle's Frameworks/ subdirectory,
+    // which pathForResource:ofType: does NOT search on its own: the
+    // bare call always returned nil, so every Boot failed with
+    // "runtime framework is missing from the app bundle" even though
+    // the framework is in the IPA. Look in Frameworks/ explicitly,
+    // and fall back to the direct bundle-path construction.
     NSString* frameworkPath = [[NSBundle mainBundle] pathForResource:@"KRuntime_6_18_4K"
-                                                              ofType:@"framework"];
+                                                              ofType:@"framework"
+                                                         inDirectory:@"Frameworks"];
     if (!frameworkPath) {
+        frameworkPath = [[[NSBundle mainBundle] bundlePath]
+                         stringByAppendingPathComponent:@"Frameworks/KRuntime_6_18_4K.framework"];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:frameworkPath]) frameworkPath = nil;
+    }
+    if (!frameworkPath) {
+        // Diagnosable miss: log where we looked and what is there.
+        NSString* bundlePath = [[NSBundle mainBundle] bundlePath];
+        NSString* frameworksDir = [bundlePath stringByAppendingPathComponent:@"Frameworks"];
+        NSArray* contents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:frameworksDir error:nil];
+        TXLogEngine(@"Runtime framework not found. Bundle: %@. Frameworks/: %@",
+                    bundlePath, contents ?: @[]);
         if (error) *error = @"runtime framework is missing from the app bundle";
         return NO;
     }
@@ -289,7 +308,14 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
             strongSelf.bootPhase = TXBootPhaseIdle;
             strongSelf.state = TermXStateReady;
             strongSelf.statusText = @"Guest ready — tap Boot";
-            TXLogEngine(@"Install complete: guest image verified");
+            // Distinct from the pipeline's "Install complete: guest
+            // image verified" line: that one is the pipeline finishing,
+            // this one is the completion reaching the engine. The two
+            // used to share one string, which read as the pipeline
+            // running twice (the 10:32 log) when the completion was
+            // merely delayed behind the per-tick re-hash on the main
+            // queue.
+            TXLogEngine(@"Install done — guest ready");
         } else if ([error isEqualToString:@"cancelled"]) {
             // A user cancel is not a failure: back to Idle, and the
             // next Install resumes from the saved resume data.

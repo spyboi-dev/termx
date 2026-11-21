@@ -14,6 +14,12 @@
 + (void)installGuestToOnQueue:(NSString*)rootfsPath
                      progress:(void (^)(double, NSString*, int64_t, int64_t))progress
                    completion:(void (^)(BOOL, NSString*))completion;
+// One-time full-hash verify of the extracted image (pipeline only);
+// the fingerprint helpers behind the cheap guestInstalledAt check.
++ (BOOL)guestImageHashValidAt:(NSString*)rootfsPath error:(NSString**)error;
++ (NSDictionary*)verifiedRootfsFingerprint;
++ (BOOL)verifiedFingerprintMatchesPath:(NSString*)path attrs:(NSDictionary*)attrs;
++ (void)recordVerifiedFingerprintForPath:(NSString*)path attrs:(NSDictionary*)attrs;
 @end
 
 // Guest image: Debian trixie arm64 MINIMAL (slim), built 2026-11-21
@@ -313,7 +319,10 @@ static TXRootfsDownload* s_activeDownload = nil;
         [fm removeItemAtPath:TXResumeDataPath() error:nil];
         [self reportProgress:0.95 step:@"Verifying the image…"];
         NSString* verifyError = nil;
-        if (![GuestInstall guestInstalledAt:rootfsPath error:&verifyError]) {
+        // The pipeline's own one-time verify, not guestInstalledAt:
+        // the just-extracted file still carries write bits until the
+        // chmod below, and guestInstalledAt treats that as unverified.
+        if (![GuestInstall guestImageHashValidAt:rootfsPath error:&verifyError]) {
             TXLogEngine(@"Image verification failed: %@", verifyError ?: @"?");
             [fm removeItemAtPath:rootfsPath error:nil];
             [self finish:NO error:verifyError ?: @"image verification failed"];
@@ -494,8 +503,61 @@ didCompleteWithError:(NSError*)error {
 
 @end
 
+// Verified-image fingerprint: once the install pipeline has SHA-256'd
+// the extracted image, the verdict is remembered in NSUserDefaults as
+// the file's path, size and modification date. guestInstalledAt —
+// called on the startup screen's 0.5 s poll timer — then answers from
+// that fingerprint with a stat call, instead of re-hashing 1 GiB
+// every tick (which is what looped "Verifying image" once a second
+// forever after the 10:30 install). The fingerprint only counts for
+// the exact file it was recorded for: any size or mtime change voids
+// it and forces one fresh hash, which then records a new fingerprint.
+static NSString* const kVerifiedRootfsKey = @"app.termx.ios.verified-rootfs";
+
 @implementation GuestInstall
 
++ (NSDictionary*)verifiedRootfsFingerprint {
+    id fp = [[NSUserDefaults standardUserDefaults] objectForKey:kVerifiedRootfsKey];
+    return [fp isKindOfClass:[NSDictionary class]] ? fp : nil;
+}
+
++ (BOOL)verifiedFingerprintMatchesPath:(NSString*)path attrs:(NSDictionary*)attrs {
+    NSDictionary* fp = [self verifiedRootfsFingerprint];
+    if (!fp) return NO;
+    if (![fp[@"path"] isEqualToString:path]) return NO;
+    if ([fp[@"size"] unsignedLongLongValue] != [attrs fileSize]) return NO;
+    NSDate* mtime = fp[@"mtime"];
+    if (![mtime isKindOfClass:[NSDate class]]) return NO;
+    return [mtime isEqualToDate:[attrs fileModificationDate]];
+}
+
++ (void)recordVerifiedFingerprintForPath:(NSString*)path attrs:(NSDictionary*)attrs {
+    NSDictionary* fp = @{@"path": path,
+                         @"size": @([attrs fileSize]),
+                         @"mtime": [attrs fileModificationDate]};
+    [[NSUserDefaults standardUserDefaults] setObject:fp forKey:kVerifiedRootfsKey];
+}
+
+// The pipeline's one-time verify: full SHA-256 of the extracted
+// image, run once after extraction. On success the fingerprint is
+// recorded, so every later guestInstalledAt call is a stat.
++ (BOOL)guestImageHashValidAt:(NSString*)rootfsPath error:(NSString**)error {
+    if (!FileHasHash(rootfsPath, kRootfsSHA256, @"Verifying image")) {
+        if (error) *error = @"guest image hash mismatch — reinstall";
+        return NO;
+    }
+    NSDictionary* attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:rootfsPath error:nil];
+    if (attrs) [self recordVerifiedFingerprintForPath:rootfsPath attrs:attrs];
+    return YES;
+}
+
+// Cheap by design: exists + size + read-only bit, then the recorded
+// fingerprint. NEVER a hash here — this runs on the startup screen's
+// 0.5 s poll timer and on engine init, and a full SHA-256 of 1 GiB
+// on every tick is the "Verifying image" loop. The only full hashes
+// are the pipeline's one-time verify (guestImageHashValidAt:) and the
+// single legacy hash below, for an image installed by a build that
+// predates the fingerprint.
 + (BOOL)guestInstalledAt:(NSString*)rootfsPath error:(NSString**)error {
     NSFileManager* fm = [NSFileManager defaultManager];
     NSDictionary* attrs = [fm attributesOfItemAtPath:rootfsPath error:nil];
@@ -507,11 +569,18 @@ didCompleteWithError:(NSError*)error {
         if (error) *error = @"guest image has the wrong size — reinstall";
         return NO;
     }
-    if (!FileHasHash(rootfsPath, kRootfsSHA256, @"Verifying image")) {
-        if (error) *error = @"guest image hash mismatch — reinstall";
+    // This exact file was already hash-verified: the verdict stands.
+    if ([self verifiedFingerprintMatchesPath:rootfsPath attrs:attrs]) return YES;
+    // Not yet verified by this build, or the file changed since it
+    // was: a half-extracted file still carries write bits, so it is
+    // not installed — and hashing it would only waste a second.
+    if ([attrs filePosixPermissions] & 0222) {
+        if (error) *error = @"guest image is not verified — reinstall";
         return NO;
     }
-    return YES;
+    // Legacy image (installed before fingerprints existed), or a file
+    // that changed after verification: one full hash, then remember it.
+    return [self guestImageHashValidAt:rootfsPath error:error];
 }
 
 // Streaming gunzip of src (.gz) to dst, in heap chunks: memory stays

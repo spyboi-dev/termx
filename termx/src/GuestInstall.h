@@ -34,8 +34,11 @@ extern const long long kRootfsSize;       // bytes of the extracted image
 
 @interface GuestInstall : NSObject
 
-// True when rootfsPath exists, has the expected size, and hashes to
-// kRootfsSHA256.
+// Cheap: true when rootfsPath exists, has the expected size, and
+// either matches the fingerprint recorded when the pipeline last
+// hash-verified it, or hashes to kRootfsSHA256 on a one-time check.
+// Never re-hashes on every call — the startup screen polls this
+// twice a second.
 + (BOOL)guestInstalledAt:(NSString*)rootfsPath error:(NSString**)error;
 
 // Download + verify + extract the image to rootfsPath.
