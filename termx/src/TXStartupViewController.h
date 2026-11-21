@@ -13,11 +13,13 @@
 // red. Nothing is faked, no timers pretend to be progress.
 //
 // This screen is the app's control centre, and the ONLY place with
-// controls: Install-or-Boot, Stop, Log, Continue, and Erase data
-// disk. The terminal window has no buttons at all; it is presented
-// from here once the shell is really ready (login prompt on the
-// console, engine state Running), or when Continue is tapped, and
-// a swipe down from the top edge of the terminal returns here.
+// controls: Install, Log, and Erase data disk. Install is the only
+// tap in the whole flow: one tap installs the guest, then the engine
+// boots itself and the terminal opens on its own; on later launches
+// the engine starts by itself. The terminal window has no buttons
+// at all; it is presented from here once the shell is really ready
+// (login prompt on the console, engine state Running), and a swipe
+// down from the top edge of the terminal returns here.
 //
 // The guest's Metal view lives on this screen (behind the opaque
 // scroll view) because the guest boots from here, before any

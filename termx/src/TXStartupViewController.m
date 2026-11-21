@@ -27,8 +27,12 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 @property (nonatomic, strong) UIProgressView *progressView;
 @property (nonatomic, strong) UILabel *reasonLabel;
 @property (nonatomic, strong) MTKView *guestView; // the guest framebuffer; never seen
-@property (nonatomic, strong) UIButton *actionButton; // Install or Boot, by state
-@property (nonatomic, strong) UIButton *stopButton;
+@property (nonatomic, strong) UIButton *actionButton; // Install (or Start when the guest is powered off), by state
+// Auto-boot bookkeeping: one automatic boot per launch, plus one
+// automatic retry if a boot fails. The user never taps Boot.
+@property (nonatomic, assign) BOOL autoBootDone;
+@property (nonatomic, assign) BOOL bootRetryUsed;
+@property (nonatomic, assign) BOOL bootRetryScheduled;
 @property (nonatomic, strong) UIButton *eraseButton; // small destructive text button
 @property (nonatomic, strong) NSMutableArray<UIView *> *rowIcons;
 @property (nonatomic, strong) NSMutableArray<UIImageView *> *rowChecks;
@@ -157,14 +161,13 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     self.reasonLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
     // All controls live here, on this screen, and nowhere else:
-    // Install-or-Boot is the primary action, Stop ends a download or
-    // a running guest, Log opens the live log view, Continue goes to
-    // the terminal. The terminal window has no buttons at all.
+    // Install is the only action button — one tap installs, then
+    // the engine boots itself and the terminal opens on its own.
+    // Log opens the live log view. The terminal window has no
+    // buttons at all.
     self.actionButton = [self buttonWithTitle:@"Install" action:@selector(actionTapped)];
-    self.stopButton = [self buttonWithTitle:@"Stop" action:@selector(stopTapped)];
     UIButton *logButton = [self buttonWithTitle:@"Log" action:@selector(logTapped)];
-    UIButton *continueButton = [self buttonWithTitle:@"Continue" action:@selector(continueTapped)];
-    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[self.actionButton, self.stopButton, logButton, continueButton]];
+    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[self.actionButton, logButton]];
     buttons.axis = UILayoutConstraintAxisVertical;
     buttons.spacing = 12;
     buttons.translatesAutoresizingMaskIntoConstraints = NO;
@@ -243,12 +246,10 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         self.terminalPresented = NO;
     }
     [self maybePresentTerminal];
-    // On launch with the guest installed, boot straight away: there
-    // is nothing else to do first, and the progress is visible here
-    // from the first byte.
-    if ([KernEngine shared].state == TermXStateReady && !self.presentedViewController) {
-        [[KernEngine shared] bootOnView:self.guestView];
-    }
+    // The automatic boot lives in refresh() (see maybeAutoBoot),
+    // which just ran above: on launch with the guest installed
+    // there is nothing else to do first, and the progress is
+    // visible here from the first byte.
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -358,14 +359,20 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     [self refreshRows];
     [self refreshButtons];
     self.progressView.progress = (float)[KernEngine shared].bootProgress;
+    // The automatic flow lives here, so every path that updates the
+    // screen also considers it: install completing, a cold launch,
+    // and the poll tick after returning to the foreground when the
+    // install finished while backgrounded.
+    [self maybeAutoBoot];
+    [self maybeScheduleBootRetry];
 }
 
-// The buttons follow the engine state, and only the state: Install
-// when nothing is installed (or the last install failed), Boot when
-// the guest is ready or stopped, disabled with the live phase while
-// something is in flight. Stop is live while a download is running
-// or the guest is booting or running. Erase is live only when
-// nothing is running.
+// The one button follows the engine state, and only the state:
+// Install when nothing is installed (or the last step failed),
+// Start when the guest is installed but powered off, disabled with
+// the live phase while something is in flight. The boot itself is
+// automatic (see maybeAutoBoot) — there is no Boot button to tap.
+// Erase is live only when nothing is running.
 - (void)refreshButtons {
     KernEngine *engine = [KernEngine shared];
     switch (engine.state) {
@@ -374,10 +381,13 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             [self.actionButton setTitle:@"Install" forState:UIControlStateNormal];
             self.actionButton.enabled = YES;
             break;
-        case TermXStateReady:
         case TermXStateStopped:
-            [self.actionButton setTitle:@"Boot" forState:UIControlStateNormal];
+            [self.actionButton setTitle:@"Start" forState:UIControlStateNormal];
             self.actionButton.enabled = YES;
+            break;
+        case TermXStateReady:
+            [self.actionButton setTitle:@"Starting…" forState:UIControlStateNormal];
+            self.actionButton.enabled = NO;
             break;
         case TermXStateDownloading:
             [self.actionButton setTitle:@"Downloading…" forState:UIControlStateNormal];
@@ -392,9 +402,6 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             self.actionButton.enabled = NO;
             break;
     }
-    self.stopButton.enabled = (engine.state == TermXStateDownloading ||
-                               engine.state == TermXStateBooting ||
-                               engine.state == TermXStateRunning);
     self.eraseButton.enabled = (engine.state != TermXStateDownloading &&
                                 engine.state != TermXStateBooting &&
                                 engine.state != TermXStateRunning);
@@ -578,6 +585,54 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     }
 }
 
+// Automatic boot: one tap on Install is the whole flow. When the
+// engine reaches Ready — the install just finished, or a cold launch
+// with the guest already installed — boot at once, once per launch.
+// Only while the app is in the foreground: booting while
+// backgrounded would fight iOS for CPU it will not give. If the
+// install finished while backgrounded, the flag stays clear and the
+// poll tick after the return to the foreground boots instead.
+- (void)maybeAutoBoot {
+    KernEngine *engine = [KernEngine shared];
+    if (engine.state != TermXStateReady) return;
+    if (self.autoBootDone) return;
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+    self.autoBootDone = YES;
+    TXLogEngine(@"Auto-boot: guest is ready, starting the engine");
+    [engine bootOnView:self.guestView];
+}
+
+// One automatic retry if a boot fails: a failed kernel or storage
+// step is often transient (a bad first dlopen, a disk still
+// settling). An install failure (failedStep Image) is not retried
+// here — the image itself is the problem, and Install is the tap
+// for that. If the retry also fails, the Install button is the
+// fallback: it re-checks the image (cheap when it is already
+// verified) and boots again.
+- (void)maybeScheduleBootRetry {
+    KernEngine *engine = [KernEngine shared];
+    if (engine.state != TermXStateFailed) {
+        self.bootRetryScheduled = NO;
+        return;
+    }
+    if (engine.failedStep == TXBootStepImage) return;
+    if (self.bootRetryScheduled || self.bootRetryUsed) return;
+    self.bootRetryScheduled = YES;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.bootRetryScheduled = NO;
+        KernEngine *engine2 = [KernEngine shared];
+        if (engine2.state != TermXStateFailed) return;
+        if (engine2.failedStep == TXBootStepImage) return;
+        if (strongSelf.bootRetryUsed) return;
+        strongSelf.bootRetryUsed = YES;
+        TXLogEngine(@"Boot failed — retrying automatically");
+        [engine2 bootOnView:strongSelf.guestView];
+    });
+}
+
 // Present the terminal once the shell is really ready. A short
 // beat at full green first, so the user sees every check done. If
 // the log screen is open on top, wait until it closes instead of
@@ -607,18 +662,24 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 
 - (void)actionTapped {
     KernEngine *engine = [KernEngine shared];
-    if (engine.state == TermXStateReady || engine.state == TermXStateStopped) {
+    if (engine.state == TermXStateStopped) {
+        // The guest is installed but powered off: start it. A manual
+        // start earns a fresh automatic retry if this boot fails.
+        self.bootRetryUsed = NO;
+        self.bootRetryScheduled = NO;
         [engine bootOnView:self.guestView];
         return;
     }
     if (engine.state == TermXStateIdle || engine.state == TermXStateFailed) {
+        // A manual Install resets the automatic flow, so the Ready
+        // state it ends in boots by itself (see maybeAutoBoot), and
+        // a boot failure after it gets its one automatic retry.
+        self.autoBootDone = NO;
+        self.bootRetryUsed = NO;
+        self.bootRetryScheduled = NO;
         [engine installGuestWithCompletion:nil];
         return;
     }
-}
-
-- (void)stopTapped {
-    [[KernEngine shared] stopGuest];
 }
 
 - (void)eraseTapped {
@@ -655,13 +716,6 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             [weakSelf presentTerminal];
         }
     }];
-}
-
-- (void)continueTapped {
-    // Go to the terminal even before the shell is ready: the console
-    // output is visible there as it boots.
-    self.terminalPresented = YES;
-    [self presentTerminal];
 }
 
 @end

@@ -12,8 +12,7 @@
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     // The startup screen IS the app: it is the root view controller.
     // The terminal is only ever presented from it, once the shell is
-    // really ready (or when Continue is tapped). No control lives on
-    // the terminal window at all.
+    // really ready. No control lives on the terminal window at all.
     self.window.rootViewController = [[TXStartupViewController alloc] init];
     [self.window makeKeyAndVisible];
     return YES;

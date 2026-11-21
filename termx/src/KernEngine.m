@@ -129,7 +129,7 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         BOOL installed = [self guestInstalled];
         if (installed) {
             _state = TermXStateReady;
-            _statusText = @"Guest ready — tap Boot";
+            _statusText = @"Guest ready — starting the engine…";
         }
         TXLogEngine(@"TermX engine init: state %@, guest %@",
                     TXStateName(_state), installed ? @"installed" : @"not installed");
@@ -307,7 +307,7 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         if (ok) {
             strongSelf.bootPhase = TXBootPhaseIdle;
             strongSelf.state = TermXStateReady;
-            strongSelf.statusText = @"Guest ready — tap Boot";
+            strongSelf.statusText = @"Guest ready — starting the engine…";
             // Distinct from the pipeline's "Install complete: guest
             // image verified" line: that one is the pipeline finishing,
             // this one is the completion reaching the engine. The two
