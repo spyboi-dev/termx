@@ -4,6 +4,8 @@
 #import "KernEngine.h"
 #import "TXLog.h"
 #import "TXLogViewController.h"
+#import "TerminalViewController.h"
+#import <MetalKit/MetalKit.h>
 
 // Andarium's teal, as in the screenshot: the dot, the "Starting"
 // text, the in-progress detail, and the done check circles.
@@ -24,6 +26,10 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 @property (nonatomic, strong) UILabel *timerLabel;
 @property (nonatomic, strong) UIProgressView *progressView;
 @property (nonatomic, strong) UILabel *reasonLabel;
+@property (nonatomic, strong) MTKView *guestView; // the guest framebuffer; never seen
+@property (nonatomic, strong) UIButton *actionButton; // Install or Boot, by state
+@property (nonatomic, strong) UIButton *stopButton;
+@property (nonatomic, strong) UIButton *eraseButton; // small destructive text button
 @property (nonatomic, strong) NSMutableArray<UIView *> *rowIcons;
 @property (nonatomic, strong) NSMutableArray<UIImageView *> *rowChecks;
 @property (nonatomic, strong) NSMutableArray<UIActivityIndicatorView *> *rowSpinners;
@@ -31,8 +37,8 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 @property (nonatomic, strong) NSMutableArray<UILabel *> *rowDetails;
 @property (nonatomic, strong, nullable) NSTimer *pollTimer;
 @property (nonatomic, strong) NSDate *startTime;
-@property (nonatomic, assign) BOOL dismissScheduled;
-@property (nonatomic, assign) BOOL dismissAfterLogCloses;
+@property (nonatomic, assign) BOOL terminalPresented; // shown once per Running state
+@property (nonatomic, assign) BOOL presentAfterLogCloses;
 // Download rate: bytes and time of the last poll tick, so the
 // "MB/s" figure is measured, not guessed.
 @property (nonatomic, assign) int64_t lastReceived;
@@ -51,6 +57,16 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     self.rowSpinners = [NSMutableArray array];
     self.rowTitles = [NSMutableArray array];
     self.rowDetails = [NSMutableArray array];
+
+    // The guest's Metal view sits behind everything, full screen. The
+    // runtime refuses a null view, and the startup screen and the
+    // terminal are both opaque, so the framebuffer is never seen: the
+    // console is the interface. It lives here, on the root screen,
+    // because the guest boots from this screen, before any terminal
+    // exists.
+    self.guestView = [[MTKView alloc] initWithFrame:self.view.bounds];
+    self.guestView.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.guestView];
 
     // Top row: teal dot + "Starting" left, elapsed timer right.
     self.statusDot = [[UIView alloc] init];
@@ -140,12 +156,28 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     self.reasonLabel.hidden = YES;
     self.reasonLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
+    // All controls live here, on this screen, and nowhere else:
+    // Install-or-Boot is the primary action, Stop ends a download or
+    // a running guest, Log opens the live log view, Continue goes to
+    // the terminal. The terminal window has no buttons at all.
+    self.actionButton = [self buttonWithTitle:@"Install" action:@selector(actionTapped)];
+    self.stopButton = [self buttonWithTitle:@"Stop" action:@selector(stopTapped)];
     UIButton *logButton = [self buttonWithTitle:@"Log" action:@selector(logTapped)];
     UIButton *continueButton = [self buttonWithTitle:@"Continue" action:@selector(continueTapped)];
-    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[logButton, continueButton]];
+    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[self.actionButton, self.stopButton, logButton, continueButton]];
     buttons.axis = UILayoutConstraintAxisVertical;
     buttons.spacing = 12;
     buttons.translatesAutoresizingMaskIntoConstraints = NO;
+
+    // Erase data disk: small, destructive, clearly separate. The
+    // persistent data disk is the guest's saved state; when it is
+    // broken, this is the only way back short of deleting the app.
+    self.eraseButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.eraseButton setTitle:@"Erase data disk…" forState:UIControlStateNormal];
+    self.eraseButton.titleLabel.font = [UIFont systemFontOfSize:14];
+    [self.eraseButton setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
+    self.eraseButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.eraseButton addTarget:self action:@selector(eraseTapped) forControlEvents:UIControlEventTouchUpInside];
 
     // A spacer holds the title and card low on the screen, the way
     // the Andarium screen does, instead of crowding the top row.
@@ -153,20 +185,27 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     spacer.translatesAutoresizingMaskIntoConstraints = NO;
     [spacer.heightAnchor constraintEqualToConstant:120].active = YES;
 
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[topRow, spacer, titleLabel, self.progressView, card, self.reasonLabel, buttons]];
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[topRow, spacer, titleLabel, self.progressView, card, self.reasonLabel, buttons, self.eraseButton]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 28;
     // The progress bar sits tight under the title, not a full
     // 28-point gap away.
     [stack setCustomSpacing:12 afterView:titleLabel];
     [stack setCustomSpacing:28 afterView:self.progressView];
+    [stack setCustomSpacing:16 afterView:buttons];
     stack.translatesAutoresizingMaskIntoConstraints = NO;
 
     UIScrollView *scroll = [[UIScrollView alloc] init];
     scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    // Opaque: the guest framebuffer behind this screen is never seen.
+    scroll.backgroundColor = [UIColor blackColor];
     [self.view addSubview:scroll];
     [scroll addSubview:stack];
     [NSLayoutConstraint activateConstraints:@[
+        [self.guestView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [self.guestView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.guestView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.guestView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
         [scroll.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
         [scroll.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [scroll.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
@@ -185,7 +224,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
                                                    usingBlock:^(NSNotification * _Nonnull note) {
         (void)note;
         [weakSelf refresh];
-        [weakSelf maybeDismissForRunning];
+        [weakSelf maybePresentTerminal];
     }];
 }
 
@@ -198,7 +237,18 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     [super viewDidAppear:animated];
     [self startPollTimer];
     [self refresh];
-    [self maybeDismissForRunning];
+    // A new Running state may auto-present the terminal once; coming
+    // back from the terminal must not re-trigger it.
+    if ([KernEngine shared].state != TermXStateRunning) {
+        self.terminalPresented = NO;
+    }
+    [self maybePresentTerminal];
+    // On launch with the guest installed, boot straight away: there
+    // is nothing else to do first, and the progress is visible here
+    // from the first byte.
+    if ([KernEngine shared].state == TermXStateReady && !self.presentedViewController) {
+        [[KernEngine shared] bootOnView:self.guestView];
+    }
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -306,7 +356,48 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
                             (unsigned long)(elapsed / 60), (unsigned long)((NSInteger)elapsed % 60)];
     [self refreshHeader];
     [self refreshRows];
+    [self refreshButtons];
     self.progressView.progress = (float)[KernEngine shared].bootProgress;
+}
+
+// The buttons follow the engine state, and only the state: Install
+// when nothing is installed (or the last install failed), Boot when
+// the guest is ready or stopped, disabled with the live phase while
+// something is in flight. Stop is live while a download is running
+// or the guest is booting or running. Erase is live only when
+// nothing is running.
+- (void)refreshButtons {
+    KernEngine *engine = [KernEngine shared];
+    switch (engine.state) {
+        case TermXStateIdle:
+        case TermXStateFailed:
+            [self.actionButton setTitle:@"Install" forState:UIControlStateNormal];
+            self.actionButton.enabled = YES;
+            break;
+        case TermXStateReady:
+        case TermXStateStopped:
+            [self.actionButton setTitle:@"Boot" forState:UIControlStateNormal];
+            self.actionButton.enabled = YES;
+            break;
+        case TermXStateDownloading:
+            [self.actionButton setTitle:@"Downloading…" forState:UIControlStateNormal];
+            self.actionButton.enabled = NO;
+            break;
+        case TermXStateBooting:
+            [self.actionButton setTitle:@"Starting…" forState:UIControlStateNormal];
+            self.actionButton.enabled = NO;
+            break;
+        case TermXStateRunning:
+            [self.actionButton setTitle:@"Running" forState:UIControlStateNormal];
+            self.actionButton.enabled = NO;
+            break;
+    }
+    self.stopButton.enabled = (engine.state == TermXStateDownloading ||
+                               engine.state == TermXStateBooting ||
+                               engine.state == TermXStateRunning);
+    self.eraseButton.enabled = (engine.state != TermXStateDownloading &&
+                                engine.state != TermXStateBooting &&
+                                engine.state != TermXStateRunning);
 }
 
 - (void)refreshHeader {
@@ -351,10 +442,10 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 // System image is Done when the image exists on disk with the
 // right hash (KernEngine.guestInstalled); Linux kernel is Done
 // when init is running (the UML_BOOT_SWITCH_ROOT marker, i.e.
-// bootPhase Services or Ready); Storage is Done when the overlay
-// was created for this boot; Startup is Done when the login
-// prompt was seen (state Running). A row is Done only when its
-// step really finished, never on a guess.
+// bootPhase Services or Ready); Storage is Done when the persistent
+// data disk was created or reused for this boot; Startup is Done
+// when the login prompt was seen (state Running). A row is Done only
+// when its step really finished, never on a guess.
 - (void)refreshRows {
     KernEngine *engine = [KernEngine shared];
     BOOL failed = engine.state == TermXStateFailed;
@@ -387,15 +478,15 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     // Storage.
     if (failed && failedStep == TXBootStepStorage) {
         [self setRow:TXBootStepStorage state:TXStartupRowFailed detail:status];
-    } else if (engine.overlayCreated) {
+    } else if (engine.dataDiskReady) {
         NSString *detail = [NSString stringWithFormat:@"%@ of %@",
                             TXFormatBytes(engine.storageUsedBytes),
                             TXFormatBytes(engine.storageTotalBytes)];
         [self setRow:TXBootStepStorage state:TXStartupRowDone detail:detail];
     } else if (engine.state == TermXStateBooting) {
-        [self setRow:TXBootStepStorage state:TXStartupRowActive detail:@"Creating overlay disk…"];
+        [self setRow:TXBootStepStorage state:TXStartupRowActive detail:@"Opening data disk…"];
     } else {
-        [self setRow:TXBootStepStorage state:TXStartupRowPending detail:@"4 GiB overlay, fresh each boot"];
+        [self setRow:TXBootStepStorage state:TXStartupRowPending detail:@"8 GiB data disk · persists across boots"];
     }
 
     // Startup.
@@ -487,24 +578,64 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     }
 }
 
-// Dismiss into the terminal once the shell is really ready. A short
+// Present the terminal once the shell is really ready. A short
 // beat at full green first, so the user sees every check done. If
 // the log screen is open on top, wait until it closes instead of
-// yanking it away.
-- (void)maybeDismissForRunning {
+// yanking it away. Coming back from the terminal (swipe down from
+// the top edge) does not re-trigger this: the user chose to return.
+- (void)maybePresentTerminal {
     if ([KernEngine shared].state != TermXStateRunning) return;
-    if (self.dismissScheduled) return;
-    self.dismissScheduled = YES;
+    if (self.terminalPresented) return;
+    self.terminalPresented = YES;
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return;
         if (strongSelf.presentedViewController) {
-            strongSelf.dismissAfterLogCloses = YES;
+            strongSelf.presentAfterLogCloses = YES;
             return;
         }
-        [strongSelf dismissViewControllerAnimated:YES completion:nil];
+        [strongSelf presentTerminal];
     });
+}
+
+- (void)presentTerminal {
+    TerminalViewController *terminal = [[TerminalViewController alloc] init];
+    terminal.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:terminal animated:YES completion:nil];
+}
+
+- (void)actionTapped {
+    KernEngine *engine = [KernEngine shared];
+    if (engine.state == TermXStateReady || engine.state == TermXStateStopped) {
+        [engine bootOnView:self.guestView];
+        return;
+    }
+    if (engine.state == TermXStateIdle || engine.state == TermXStateFailed) {
+        [engine installGuestWithCompletion:nil];
+        return;
+    }
+}
+
+- (void)stopTapped {
+    [[KernEngine shared] stopGuest];
+}
+
+- (void)eraseTapped {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Erase data disk?"
+                                                                   message:@"This deletes everything saved in the guest — installed packages, files, all of it. The Debian system image is untouched, and the next boot starts with a fresh, empty data disk."
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Erase" style:UIAlertActionStyleDestructive handler:^(__kindof UIAlertAction *action) {
+        (void)action;
+        NSString *error = nil;
+        if (![[KernEngine shared] eraseDataDiskWithError:&error]) {
+            TXLogEngine(@"Erase data disk failed: %@", error ?: @"?");
+        }
+        [weakSelf refresh];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)logTapped {
@@ -519,15 +650,18 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     [self dismissViewControllerAnimated:YES completion:^{
         // The shell came up while the log was open: go to the
         // terminal now.
-        if (weakSelf.dismissAfterLogCloses) {
-            weakSelf.dismissAfterLogCloses = NO;
-            [weakSelf dismissViewControllerAnimated:YES completion:nil];
+        if (weakSelf.presentAfterLogCloses) {
+            weakSelf.presentAfterLogCloses = NO;
+            [weakSelf presentTerminal];
         }
     }];
 }
 
 - (void)continueTapped {
-    [self dismissViewControllerAnimated:YES completion:nil];
+    // Go to the terminal even before the shell is ready: the console
+    // output is visible there as it boots.
+    self.terminalPresented = YES;
+    [self presentTerminal];
 }
 
 @end

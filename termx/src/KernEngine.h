@@ -5,6 +5,15 @@
 // no ADB, no Termux APK: the shell IS the app.
 // Interpreter (gadget) engine only: use_jit is always 0, so no StikDebug,
 // no StikJIT and no debugger are needed at any point.
+//
+// The runtime framework is NOT linked at launch: the app binary carries
+// no framework load commands, and the framework is dlopen()ed on Start
+// instead. Linking it mapped its 53 MB (with the 36 MB kernel inside)
+// into the process before anything ran, which is the launch-memory
+// pattern that kills apps during a long download; dlopen keeps that
+// memory out until the guest actually boots. The framework's own
+// dependencies (the three GPU frameworks) load with it, as its own
+// load commands name them.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import <Foundation/Foundation.h>
 #import <MetalKit/MetalKit.h>
@@ -20,7 +29,7 @@ typedef NS_ENUM(NSInteger, TermXState) {
 };
 
 // Boot phase, driven only by real events: the download steps, the
-// overlay creation, run() starting, the UML_BOOT_SWITCH_ROOT console
+// data disk creation, run() starting, the UML_BOOT_SWITCH_ROOT console
 // marker, and the login prompt. The startup screen's rows and its
 // progress bar read this, never a timer.
 typedef NS_ENUM(NSInteger, TXBootPhase) {
@@ -39,7 +48,7 @@ typedef NS_ENUM(NSInteger, TXBootPhase) {
 typedef NS_ENUM(NSInteger, TXBootStep) {
     TXBootStepImage = 0,       // system image (download + verify)
     TXBootStepKernel,          // Linux kernel boot
-    TXBootStepStorage,         // overlay disk creation
+    TXBootStepStorage,         // data disk creation
     TXBootStepStartup,         // init + services up to the login prompt
     TXBootStepCount,
 };
@@ -73,25 +82,31 @@ extern NSString* const kTermXStateChanged;
 @property (nonatomic, readonly) int64_t downloadReceived;
 @property (nonatomic, readonly) int64_t downloadExpected;
 
-// Writable storage: bytes actually allocated on the overlay disk
+// Writable storage: bytes actually allocated on the data disk
 // (sparse file, so this grows as the guest writes) and its total
-// capacity. 0 used before the overlay is created for a boot.
+// capacity. 0 used before the data disk is created for a boot.
 @property (nonatomic, readonly) unsigned long long storageUsedBytes;
 @property (nonatomic, readonly) unsigned long long storageTotalBytes;
 
 // Fixed guest facts for the startup screen's row details.
 @property (nonatomic, readonly) NSString* kernelDetail;  // "6.18.60 · 2 vCPUs · 1 GiB RAM"
 @property (nonatomic, readonly) NSString* imageDetail;   // "trixie · read-only"
-@property (nonatomic, readonly) BOOL overlayCreated;     // overlay exists for this boot
+@property (nonatomic, readonly) BOOL dataDiskReady;      // data disk exists for this boot
 
 // Guest files live here. rootfsPath is the Debian ext4 image (read-only,
-// no write bits, as the runtime requires); overlayPath is the sparse
-// overlay disk the boot formats fresh on ubd1 at every boot, so a guest's
-// writes live for one session only — apt installs do not survive a reboot.
-// Bake the tools you want into the image instead (see rootfs-build/).
+// no write bits, as the runtime requires); dataDiskPath is the guest's
+// persistent writable data disk: one sparse file at a fixed path in the
+// app's data container, created once on first install and reused on
+// every boot, so anything installed or saved in a session is still
+// there after a reboot. The system image stays read-only; only the
+// data disk is writable. (The stock upstream boot-ramdisk /init
+// formats the overlay upper layer on every boot, which ends the layer
+// with the run; TermX ships a framework built with that step changed
+// to format-only-when-unformatted — see patches/ — so the same file
+// survives across boots.)
 @property (nonatomic, readonly) NSString* guestDir;
 @property (nonatomic, readonly) NSString* rootfsPath;
-@property (nonatomic, readonly) NSString* overlayPath;
+@property (nonatomic, readonly) NSString* dataDiskPath;
 
 + (instancetype)shared;
 
@@ -109,6 +124,12 @@ extern NSString* const kTermXStateChanged;
 // guest's framebuffer; the terminal view sits on top of it.
 - (void)bootOnView:(MTKView*)view;
 - (void)stopGuest;
+
+// Delete the persistent data disk (the guest's saved state: installed
+// packages, files, everything). The system image is untouched. The
+// next boot creates a fresh data disk. This is the recovery path when
+// the guest's saved state is broken.
+- (BOOL)eraseDataDiskWithError:(NSString**)error;
 
 // Console I/O: bytes to the guest's ttyS0, and the entry point the
 // console-output callback feeds.

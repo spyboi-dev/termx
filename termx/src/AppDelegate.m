@@ -1,16 +1,34 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "AppDelegate.h"
-#import "TerminalViewController.h"
+#import "TXStartupViewController.h"
 #import "TXCrashLog.h"
+#import "TXLog.h"
+#import "GuestInstall.h"
 
 @implementation AppDelegate
 
 - (BOOL)application:(UIApplication*)application
     didFinishLaunchingWithOptions:(NSDictionary*)launchOptions {
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    self.window.rootViewController = [[TerminalViewController alloc] init];
+    // The startup screen IS the app: it is the root view controller.
+    // The terminal is only ever presented from it, once the shell is
+    // really ready (or when Continue is tapped). No control lives on
+    // the terminal window at all.
+    self.window.rootViewController = [[TXStartupViewController alloc] init];
     [self.window makeKeyAndVisible];
     return YES;
+}
+
+// The background download finished while the app was suspended or
+// killed: re-attach to the session so its delegate callbacks arrive,
+// and hand the system completion handler over so it is called once
+// the session has delivered all its events.
+- (void)application:(UIApplication*)application
+    handleEventsForBackgroundURLSession:(NSString*)identifier
+                      completionHandler:(void (^)(void))completionHandler {
+    (void)application;
+    TXLogEngine(@"Background URL session event: %@", identifier);
+    [GuestInstall reconnectBackgroundSessionWithCompletionHandler:completionHandler];
 }
 
 - (void)applicationDidEnterBackground:(UIApplication*)application {

@@ -1,0 +1,28 @@
+--- a/tools/rootfs/boot-ramdisk/init
++++ b/tools/rootfs/boot-ramdisk/init
+@@ -185,9 +185,22 @@
+ 		;;
+ 	ext4)
+ 		wait_for_device "$upper_device"
+-		mkfs.ext4 -F -q -m 0 \
+-			-E nodiscard,lazy_itable_init=1,lazy_journal_init=1 \
+-			"$upper_device" || fail "cannot format $upper_device"
++		# TermX: the upper layer is the guest's persistent data disk.
++		# Format it only when it holds no ext4 filesystem yet (first
++		# boot). A later boot reuses the existing filesystem, so
++		# anything installed or saved in a session survives a reboot.
++		# Upstream formats unconditionally here, which ends the layer
++		# with the run.
++		case "$(blkid "$upper_device" 2>/dev/null)" in
++		*TYPE=\"ext4\"*)
++			echo "UML_BOOT_UPPER_KEEP:existing ext4 on $upper_device"
++			;;
++		*)
++			mkfs.ext4 -F -q -m 0 \
++				-E nodiscard,lazy_itable_init=1,lazy_journal_init=1 \
++				"$upper_device" || fail "cannot format $upper_device"
++			;;
++		esac
+ 		mount -t ext4 -o noatime,nosuid,nodev "$upper_device" /state || \
+ 			fail "cannot mount $upper_device"
+ 		;;

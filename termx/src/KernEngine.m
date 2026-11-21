@@ -4,6 +4,7 @@
 #import "GuestInstall.h"
 #import "TXLog.h"
 #import <CommonCrypto/CommonDigest.h>
+#import <dlfcn.h>
 #import <sys/stat.h>
 
 NSString* const kTermXStateChanged = @"TermXStateChanged";
@@ -12,18 +13,21 @@ NSString* const kTermXStateChanged = @"TermXStateChanged";
 // leave the process headroom the runtime's GPU budget wants.
 static const uint32_t kGuestMemoryMiB = 1024;
 static const uint32_t kGuestCPUs = 2;
-// Writable space for one session, in GiB. The boot formats the overlay
-// fresh every time, so this is session scratch, not storage.
-static const uint64_t kOverlayGiB = 4;
+// The guest's persistent data disk, in GiB: one sparse file at a fixed
+// path (see dataDiskPath), created once and reused on every boot, so
+// the 8 GiB is capacity, not allocated size — the file only grows as
+// the guest writes, like Andarium's "628 MiB of 8 GiB".
+static const uint64_t kDataDiskGiB = 8;
 
 @interface KernEngine () {
     const kernarium_runtime_api* _api;
+    void* _runtimeHandle; // dlopen handle; held for the process lifetime
     BOOL _running;
     // Held for the whole run: the boot struct hands the runtime C strings,
     // and they must stay alive until run() returns.
     NSString* _sessionRecordPath;
-    NSString* _overlayPath;
-    BOOL _overlayCreated;
+    NSString* _dataDiskPath;
+    BOOL _dataDiskReady;
 }
 // Readwrite here so the console callback and the boot/install paths
 // (which run outside the @implementation) can move the phase.
@@ -102,14 +106,25 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
             NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
         _guestDir = [docs stringByAppendingPathComponent:@"guest"];
         _rootfsPath = [_guestDir stringByAppendingPathComponent:kRootfsName];
-        _overlayPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"kterm-overlay.ext4"];
-        _api = kernarium_runtime_get_api_v28();
+        // Fixed path in the data container, NOT the tmp directory: iOS
+        // may purge tmp, and a persistent disk must survive. The file
+        // is created once and reused on every boot (see
+        // createDataDiskIfNeededWithError:).
+        _dataDiskPath = [_guestDir stringByAppendingPathComponent:@"termx-data.ext4"];
+        // The runtime framework is deliberately NOT loaded here: the
+        // app binary carries no framework load commands, and the
+        // framework (53 MB, kernel inside) is dlopen()ed on Start
+        // instead, so launch stays light. See loadRuntimeWithError:.
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(enterBackground)
                                                      name:@"TermXEnterBackground" object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(enterForeground)
                                                      name:@"TermXEnterForeground" object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(memoryWarning:)
+                                                     name:UIApplicationDidReceiveMemoryWarningNotification
+                                                   object:nil];
         // Refresh the state from disk on launch: an installed guest means Ready.
         if ([self guestInstalled]) {
             _state = TermXStateReady;
@@ -123,6 +138,51 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
 
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+// Load the runtime framework on Start, not at launch (see the header).
+// The framework's own load commands pull in the three GPU frameworks,
+// so nothing else needs loading. The handle is held forever: the
+// runtime owns one host runtime per process lifetime, and its API
+// table stays valid until process exit.
+- (BOOL)loadRuntimeWithError:(NSString**)error {
+    if (_api) return YES;
+    NSString* frameworkPath = [[NSBundle mainBundle] pathForResource:@"KRuntime_6_18_4K"
+                                                              ofType:@"framework"];
+    if (!frameworkPath) {
+        if (error) *error = @"runtime framework is missing from the app bundle";
+        return NO;
+    }
+    NSString* binaryPath = [frameworkPath stringByAppendingPathComponent:@"KRuntime_6_18_4K"];
+    TXLogEngine(@"Loading runtime framework (dlopen): %@", binaryPath);
+    _runtimeHandle = dlopen(binaryPath.UTF8String, RTLD_NOW | RTLD_LOCAL);
+    if (!_runtimeHandle) {
+        const char* why = dlerror();
+        TXLogEngine(@"dlopen failed: %s", why ?: "?");
+        if (error) *error = [NSString stringWithFormat:@"runtime framework did not load: %s", why ?: "?"];
+        return NO;
+    }
+    typedef const kernarium_runtime_api* (*TXGetRuntimeAPIFn)(void);
+    TXGetRuntimeAPIFn getAPI = (TXGetRuntimeAPIFn)dlsym(_runtimeHandle, "kernarium_runtime_get_api_v28");
+    if (!getAPI) {
+        TXLogEngine(@"dlsym failed: no kernarium_runtime_get_api_v28 in the framework");
+        if (error) *error = @"runtime framework has no API entry point";
+        return NO;
+    }
+    _api = getAPI();
+    if (!_api) {
+        if (error) *error = @"runtime framework returned no API";
+        return NO;
+    }
+    TXLogEngine(@"Runtime loaded: ABI v%u, footprint %@", _api->abi_version,
+                TXFormatBytes(TXCurrentFootprintBytes()));
+    return YES;
+}
+
+- (void)memoryWarning:(NSNotification*)note {
+    (void)note;
+    TXLogEngine(@"MEMORY WARNING: state %@, footprint %@",
+                TXStateName(self.state), TXFormatBytes(TXCurrentFootprintBytes()));
 }
 
 - (void)setState:(TermXState)state {
@@ -163,16 +223,16 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
 
 - (unsigned long long)storageUsedBytes {
     struct stat st;
-    if (stat(_overlayPath.UTF8String, &st) != 0) return 0;
+    if (stat(_dataDiskPath.UTF8String, &st) != 0) return 0;
     return (unsigned long long)st.st_blocks * 512ULL;
 }
 
 - (unsigned long long)storageTotalBytes {
-    return (unsigned long long)kOverlayGiB << 30;
+    return (unsigned long long)kDataDiskGiB << 30;
 }
 
-- (BOOL)overlayCreated {
-    return _overlayCreated;
+- (BOOL)dataDiskReady {
+    return _dataDiskReady;
 }
 
 - (NSString*)kernelDetail {
@@ -194,8 +254,8 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
     if (_api && _running) _api->set_gpu_hold(0);
 }
 
-- (NSString*)overlayPath {
-    return _overlayPath;
+- (NSString*)dataDiskPath {
+    return _dataDiskPath;
 }
 
 - (BOOL)guestInstalled {
@@ -230,6 +290,12 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
             strongSelf.state = TermXStateReady;
             strongSelf.statusText = @"Guest ready — tap Boot";
             TXLogEngine(@"Install complete: guest image verified");
+        } else if ([error isEqualToString:@"cancelled"]) {
+            // A user cancel is not a failure: back to Idle, and the
+            // next Install resumes from the saved resume data.
+            strongSelf.bootPhase = TXBootPhaseIdle;
+            strongSelf.state = TermXStateIdle;
+            strongSelf.statusText = @"Download cancelled — tap Install to resume";
         } else {
             strongSelf.bootPhase = TXBootPhaseFailed;
             strongSelf.failedStep = TXBootStepImage;
@@ -240,30 +306,73 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
     }];
 }
 
-// Create the sparse overlay file the boot formats fresh on ubd1.
-// The path must name no spaces, quotes, commas or colons (the runtime
-// names it on the kernel command line); NSTemporaryDirectory is safe.
-- (BOOL)createOverlayWithError:(NSString**)error {
+// Create the persistent data disk if it does not exist yet; reuse it
+// otherwise. The path must name no spaces, quotes, commas or colons
+// (the runtime names it on the kernel command line); Documents/guest
+// is safe. The file is sparse (ftruncate), so an 8 GiB disk costs
+// nothing until the guest writes, and it is excluded from backup: a
+// multi-gigabyte guest disk must never ride along in an iCloud backup.
+// The stock upstream boot-ramdisk /init formats the upper layer on
+// every boot, which would wipe this file's contents each time; TermX
+// ships a framework built with that step changed to
+// format-only-when-unformatted, so a reused file keeps its data.
+- (BOOL)createDataDiskIfNeededWithError:(NSString**)error {
     NSFileManager* fm = [NSFileManager defaultManager];
-    [fm removeItemAtPath:_overlayPath error:nil];
-    int fd = open(_overlayPath.UTF8String, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    NSDictionary* attrs = [fm attributesOfItemAtPath:_dataDiskPath error:nil];
+    off_t size = (off_t)kDataDiskGiB << 30;
+    if (attrs) {
+        if ([attrs fileSize] == (unsigned long long)size) {
+            TXLogEngine(@"Reusing data disk: %@ used of %@",
+                        TXFormatBytes(self.storageUsedBytes),
+                        TXFormatBytes(self.storageTotalBytes));
+            return YES;
+        }
+        TXLogEngine(@"Data disk has the wrong size (%@) — recreating it",
+                    TXFormatBytes([attrs fileSize]));
+        [fm removeItemAtPath:_dataDiskPath error:nil];
+    }
+    int fd = open(_dataDiskPath.UTF8String, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
-        if (error) *error = @"could not create the overlay disk";
+        if (error) *error = @"could not create the data disk";
         return NO;
     }
-    off_t size = (off_t)kOverlayGiB << 30;
     BOOL ok = ftruncate(fd, size) == 0;
     close(fd);
-    if (!ok && error) *error = @"could not size the overlay disk";
-    return ok;
+    if (!ok) {
+        if (error) *error = @"could not size the data disk";
+        return NO;
+    }
+    NSURL* url = [NSURL fileURLWithPath:_dataDiskPath];
+    [url setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:nil];
+    TXLogEngine(@"Created data disk: %@ at %@", TXFormatBytes(self.storageTotalBytes), _dataDiskPath);
+    return YES;
+}
+
+- (BOOL)eraseDataDiskWithError:(NSString**)error {
+    if (self.state == TermXStateRunning || self.state == TermXStateBooting ||
+        self.state == TermXStateDownloading) {
+        if (error) *error = @"stop the guest before erasing the data disk";
+        return NO;
+    }
+    NSFileManager* fm = [NSFileManager defaultManager];
+    NSError* removeError = nil;
+    if ([fm fileExistsAtPath:_dataDiskPath] &&
+        ![fm removeItemAtPath:_dataDiskPath error:&removeError]) {
+        if (error) *error = @"could not erase the data disk";
+        return NO;
+    }
+    _dataDiskReady = NO;
+    TXLogEngine(@"Data disk erased");
+    return YES;
 }
 
 - (void)bootOnView:(MTKView*)view {
-    if (!_api) {
+    NSString* loadError = nil;
+    if (![self loadRuntimeWithError:&loadError]) {
         self.bootPhase = TXBootPhaseFailed;
         self.failedStep = TXBootStepKernel;
         self.state = TermXStateFailed;
-        self.statusText = @"Runtime framework did not load";
+        self.statusText = loadError ?: @"Runtime framework did not load";
         return;
     }
     if (!view) {
@@ -280,17 +389,17 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         self.statusText = @"Guest is not installed — tap Install first";
         return;
     }
-    _overlayCreated = NO;
+    _dataDiskReady = NO;
     self.failedStep = -1;
     NSString* error = nil;
-    if (![self createOverlayWithError:&error]) {
+    if (![self createDataDiskIfNeededWithError:&error]) {
         self.bootPhase = TXBootPhaseFailed;
         self.failedStep = TXBootStepStorage;
         self.state = TermXStateFailed;
         self.statusText = error;
         return;
     }
-    _overlayCreated = YES;
+    _dataDiskReady = YES;
     // Memory check first: the runtime says whether the process is likely
     // to be killed for the guest size we ask for.
     kernarium_runtime_gpu_budget budget;
@@ -313,15 +422,15 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
     boot.guest_memory_mib = kGuestMemoryMiB;
     boot.guest_processor_count = kGuestCPUs;
     boot.rootfs_path = _rootfsPath.UTF8String;
-    boot.overlay_path = _overlayPath.UTF8String;
+    boot.overlay_path = _dataDiskPath.UTF8String;
     _sessionRecordPath = [_guestDir stringByAppendingPathComponent:@"session.json"];
     boot.session_record_path = _sessionRecordPath.UTF8String;
     boot.use_jit = 0; // gadget (interpreter) engine: no JIT, no debugger
     self.bootPhase = TXBootPhaseKernel;
     self.state = TermXStateBooting;
     self.statusText = @"Booting Debian…";
-    TXLogEngine(@"Boot started: %u vCPUs, %u MiB RAM, overlay %llu GiB",
-                kGuestCPUs, kGuestMemoryMiB, kOverlayGiB);
+    TXLogEngine(@"Boot started: %u vCPUs, %u MiB RAM, data disk %llu GiB",
+                kGuestCPUs, kGuestMemoryMiB, kDataDiskGiB);
     _running = YES;
     // run() blocks until the guest stops, so it owns its own thread.
     // The boot struct's C strings point into NSStrings the engine holds
@@ -354,6 +463,14 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
 }
 
 - (void)stopGuest {
+    // Stopping a download cancels it (the background session saves
+    // resume data) and goes back to Idle; stopping a running guest
+    // asks the runtime to stop it.
+    if (self.state == TermXStateDownloading) {
+        TXLogEngine(@"Stop requested during download");
+        [GuestInstall cancelDownload];
+        return;
+    }
     TXLogEngine(@"Stop requested");
     if (_api && _running) _api->request_stop();
 }

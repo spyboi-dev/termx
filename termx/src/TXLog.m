@@ -1,6 +1,7 @@
 // TXLog - see the header.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "TXLog.h"
+#import <mach/mach.h>
 
 static dispatch_queue_t TXLogQueue(void) {
     static dispatch_queue_t q;
@@ -107,4 +108,13 @@ NSString *TXFormatBytes(unsigned long long bytes) {
         return [NSString stringWithFormat:@"%.0f KiB", (double)bytes / (double)(1ULL << 10)];
     }
     return [NSString stringWithFormat:@"%llu B", bytes];
+}
+
+unsigned long long TXCurrentFootprintBytes(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS) {
+        return (unsigned long long)info.phys_footprint;
+    }
+    return 0;
 }

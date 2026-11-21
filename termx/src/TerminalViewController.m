@@ -10,16 +10,16 @@
 // cannot build here); the key bytes match NewTerm's TerminalConstants
 // exactly. The shell itself lives in the guest, never on iOS: typed input
 // goes to the guest console, guest output feeds the terminal view.
+// There is no top bar and no control button on this screen at all: the
+// startup screen is the control centre, and a swipe down from the top
+// edge returns to it.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "TerminalViewController.h"
 
 #import "KernEngine.h"
-#import "TXLogViewController.h"
-#import "TXStartupViewController.h"
 #import "vt.h"
-#import <MetalKit/MetalKit.h>
 
-@interface TerminalViewController () <KernEngineDelegate, UITextFieldDelegate>
+@interface TerminalViewController () <KernEngineDelegate, UITextFieldDelegate, UIGestureRecognizerDelegate>
 @end
 
 // xterm 256-colour palette: 0-15 the standard colours, 16-231 the 6x6x6
@@ -55,14 +55,9 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
 @implementation TerminalViewController {
     KernEngine *_engine;
-    MTKView *_guestView; // the guest framebuffer; hidden behind the terminal
     vt_t _vt;
     UITextView *_output;
     UITextField *_input;
-    UILabel *_status;
-    UIButton *_mainButton;
-    UIButton *_stopButton;
-    UIButton *_logButton;
     UIButton *_ctrlButton;
     UIButton *_moreButton;
     UIButton *_fnButton;
@@ -71,6 +66,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIScrollView *_fnRow;
     NSTimer *_flushTimer;
     NSLayoutConstraint *_toolbarBottom;
+    CGPoint _exitPanStart; // where the top-edge exit drag began
 }
 
 - (void)viewDidLoad {
@@ -81,36 +77,10 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _engine = [KernEngine shared];
     _engine.delegate = self;
 
-    // The guest's Metal view sits behind the terminal, full screen. The
-    // runtime refuses a null view, and the terminal view is opaque, so
-    // the framebuffer is never seen: the console is the interface.
-    _guestView = [[MTKView alloc] initWithFrame:self.view.bounds];
-    _guestView.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:_guestView];
-
-    // Top bar: status text on the left, Install-or-Boot / Stop on the right.
-    UIView *bar = [[UIView alloc] init];
-    bar.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:bar];
-
-    _status = [[UILabel alloc] init];
-    _status.translatesAutoresizingMaskIntoConstraints = NO;
-    _status.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
-    _status.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-    _status.numberOfLines = 2;
-    _status.text = @"Starting…";
-    [bar addSubview:_status];
-
-    _mainButton = [self barButton:@"Install" action:@selector(onMain)];
-    _stopButton = [self barButton:@"Stop" action:@selector(onStop)];
-    _logButton = [self barButton:@"Log" action:@selector(onLog)];
-    [bar addSubview:_mainButton];
-    [bar addSubview:_stopButton];
-    [bar addSubview:_logButton];
-
     // The terminal itself: NewTerm's defaults — black, #f2f2f2 text,
     // system monospace. Lines never wrap: the text container is wider
-    // than the screen, so long lines scroll horizontally.
+    // than the screen, so long lines scroll horizontally. It starts
+    // at the top of the screen: there is no bar above it any more.
     _output = [[UITextView alloc] init];
     _output.translatesAutoresizingMaskIntoConstraints = NO;
     _output.editable = NO;
@@ -227,24 +197,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [_guestView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
-        [_guestView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [_guestView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [_guestView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
-        [bar.topAnchor constraintEqualToAnchor:safe.topAnchor],
-        [bar.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8],
-        [bar.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-8],
-        [bar.heightAnchor constraintEqualToConstant:44],
-        [_status.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor],
-        [_status.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor],
-        [_status.trailingAnchor constraintEqualToAnchor:_logButton.leadingAnchor constant:-8],
-        [_logButton.trailingAnchor constraintEqualToAnchor:_mainButton.leadingAnchor constant:-6],
-        [_logButton.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor],
-        [_mainButton.trailingAnchor constraintEqualToAnchor:_stopButton.leadingAnchor constant:-6],
-        [_mainButton.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor],
-        [_stopButton.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor],
-        [_stopButton.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor],
-        [_output.topAnchor constraintEqualToAnchor:bar.bottomAnchor constant:2],
+        [_output.topAnchor constraintEqualToAnchor:safe.topAnchor],
         [_output.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
         [_output.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
         [_output.bottomAnchor constraintEqualToAnchor:toolbar.topAnchor],
@@ -275,16 +228,17 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         initWithTarget:self action:@selector(onTapTerminal)];
     [_output addGestureRecognizer:tap];
 
-    [self termXEngineDidChangeState:_engine.state status:_engine.statusText];
-}
+    // The way back to the startup screen: a downward drag that
+    // starts in the top strip of the terminal. A scroll through the
+    // scrollback starts anywhere and goes either way; this one only
+    // fires for a drag that begins at the very top and moves
+    // decisively down, so ordinary scrolling never triggers it.
+    UIPanGestureRecognizer *exitPan = [[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onExitPan:)];
+    exitPan.delegate = self;
+    [_output addGestureRecognizer:exitPan];
 
-- (UIButton *)barButton:(NSString *)title action:(SEL)action {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.translatesAutoresizingMaskIntoConstraints = NO;
-    [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    return b;
+    [self termXEngineDidChangeState:_engine.state status:_engine.statusText];
 }
 
 - (UIButton *)keyButton:(NSString *)title {
@@ -321,65 +275,6 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
 #pragma mark - Actions
 
-// On launch with the guest installed, go straight to the startup
-// screen and boot: the user asked for a startup screen, and there
-// is nothing else to do first. The guard is the state: once the
-// boot starts the state leaves Ready, so a return from the modal
-// (or a later Stop) never re-triggers this.
-- (void)viewDidAppear:(BOOL)animated {
-    [super viewDidAppear:animated];
-    if (_engine.state == TermXStateReady && !self.presentedViewController) {
-        [self showStartupThen:^{
-            [self->_engine bootOnView:self->_guestView];
-        }];
-    }
-}
-
-// Present the startup screen, then run the work (boot or install)
-// once it is on screen, so the progress is visible from the first
-// byte. If a modal is already up, just run the work.
-- (void)showStartupThen:(void (^)(void))work {
-    if (self.presentedViewController) {
-        if (work) work();
-        return;
-    }
-    TXStartupViewController *startup = [[TXStartupViewController alloc] init];
-    startup.modalPresentationStyle = UIModalPresentationFullScreen;
-    [self presentViewController:startup animated:YES completion:^{
-        if (work) work();
-    }];
-}
-
-- (void)onMain {
-    if (_engine.state == TermXStateReady || _engine.state == TermXStateStopped) {
-        [self showStartupThen:^{
-            [self->_engine bootOnView:self->_guestView];
-        }];
-        return;
-    }
-    if (_engine.state == TermXStateIdle || _engine.state == TermXStateFailed) {
-        [self showStartupThen:^{
-            [self->_engine installGuestWithCompletion:nil];
-        }];
-        return;
-    }
-}
-
-- (void)onLog {
-    TXLogViewController *logVC = [[TXLogViewController alloc] init];
-    logVC.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(logDoneTapped)];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:logVC];
-    [self presentViewController:nav animated:YES completion:nil];
-}
-
-- (void)logDoneTapped {
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
-
-- (void)onStop {
-    [_engine stopGuest];
-}
-
 - (void)onCtrl {
     _ctrlLatched = !_ctrlLatched;
     [self setToggle:_ctrlButton on:_ctrlLatched];
@@ -408,29 +303,47 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [_input becomeFirstResponder];
 }
 
+// The exit drag: a downward pan that began in the top strip of the
+// terminal returns to the startup screen, where Stop, Logs, Install
+// and Boot live. Ordinary scrolling starts anywhere and moves either
+// way; this needs a top-strip start and a decisive downward move.
+- (void)onExitPan:(UIPanGestureRecognizer *)pan {
+    switch (pan.state) {
+        case UIGestureRecognizerStateBegan:
+            _exitPanStart = [pan locationInView:_output];
+            break;
+        case UIGestureRecognizerStateEnded: {
+            CGPoint translation = [pan translationInView:_output];
+            if (_exitPanStart.y < 44 && translation.y > 80 &&
+                fabs(translation.y) > fabs(translation.x)) {
+                [self dismissViewControllerAnimated:YES completion:nil];
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// Let the exit pan watch touches alongside the text view's own
+// scrolling, so a drag can be both a scroll and a candidate exit.
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
+    (void)gestureRecognizer; (void)otherGestureRecognizer;
+    return YES;
+}
+
 #pragma mark - Engine delegate
 
 - (void)termXEngineDidChangeState:(TermXState)state status:(NSString *)status {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self->_status.text = status;
-        self->_stopButton.enabled = (state == TermXStateRunning || state == TermXStateBooting);
-        switch (state) {
-        case TermXStateReady:
-        case TermXStateStopped:
-            [self->_mainButton setTitle:@"Boot" forState:UIControlStateNormal];
-            self->_mainButton.enabled = YES;
-            break;
-        case TermXStateIdle:
-        case TermXStateFailed:
-            [self->_mainButton setTitle:@"Install" forState:UIControlStateNormal];
-            self->_mainButton.enabled = YES;
-            break;
-        default:
-            self->_mainButton.enabled = NO;
-            break;
-        }
-        if (state == TermXStateRunning) [self->_input becomeFirstResponder];
-    });
+    (void)status;
+    // The only thing the terminal itself does with state: focus the
+    // keyboard once the shell is up, so the user can type at once.
+    if (state == TermXStateRunning) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self->_input becomeFirstResponder];
+        });
+    }
 }
 
 - (void)kernEngineDidReceiveConsoleOutput:(NSData *)data {

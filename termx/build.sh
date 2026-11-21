@@ -5,11 +5,15 @@
 # ~/workspace/spytube-ios/native/build26.sh).
 #
 # The runtime is NOT compiled here: upstream's CMake refuses non-Apple
-# hosts and the whole chain needs Xcode. The app links the Linux-flavour
-# runtime framework KRuntime_6_18_4K, plus the GPU frameworks it loads
-# (KosmicKrisp, MesaEGL, MesaGallium). The Linux framework is NOT in any
-# Kernarium release and NOT in the Andarium IPA (that one carries the
-# Android flavour only): it must be built on a Mac first, with
+# hosts and the whole chain needs Xcode. The app dlopen()s the Linux
+# flavour runtime framework KRuntime_6_18_4K on Start (see KernEngine
+# loadRuntimeWithError:), so the app binary carries NO framework load
+# commands: linking it mapped its 53 MB (36 MB kernel inside) at launch
+# before anything ran. The framework's own load commands pull in the
+# three GPU frameworks it loads (KosmicKrisp, MesaEGL, MesaGallium).
+# The Linux framework is NOT in any Kernarium release and NOT in the
+# Andarium IPA (that one carries the Android flavour only): it must be
+# built on a Mac first, with
 #   Kernarium/scripts/package-ios-frameworks.sh --sdk device
 # (default --runtimes all), which writes it to
 #   .build/kernarium-xcframeworks/
@@ -63,7 +67,6 @@ echo "== link"
 ld64.lld-18 -arch arm64 -platform_version ios $MIN 26.5 \
   -syslibroot "$SDK" \
   -F"$SDK/System/Library/Frameworks" \
-  -F"Frameworks" \
   -L"$SDK/usr/lib" \
   -adhoc_codesign -ObjC \
   -rpath @executable_path/Frameworks \
@@ -73,8 +76,6 @@ ld64.lld-18 -arch arm64 -platform_version ios $MIN 26.5 \
   "$OUT"/vt.o \
   -framework UIKit -framework Foundation -framework CoreGraphics \
   -framework QuartzCore -framework Metal -framework MetalKit \
-  -framework KRuntime_6_18_4K \
-  -framework KosmicKrisp -framework MesaEGL -framework MesaGallium \
   -lz -lobjc -lSystem \
   -o "$APP/TermX"
 

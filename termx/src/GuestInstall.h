@@ -13,6 +13,16 @@
 // The download URL is the release the image is published under. Publish
 // rootfs-build/termx-debian-trixie-arm64.ext4.gz there before the first
 // install from the app (see BUILD-NOTE.md).
+//
+// Download survival: the download runs on a background NSURLSession, so
+// it keeps going when the phone locks or the app is suspended, and the
+// system wakes the app when it finishes. If the app is killed mid
+// download, the next Install resumes from the saved resume data instead
+// of restarting from zero. An already-downloaded archive whose hash
+// checks out is reused instead of downloaded again. Every milestone —
+// each 10% of the download, each 256 MiB of extract/verify, every
+// memory warning — is written to engine.log with the byte count, so a
+// crash during the install leaves the exact phase and position behind.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import <Foundation/Foundation.h>
 
@@ -32,8 +42,21 @@ extern const long long kRootfsSize;       // bytes of the extracted image
 // Calls progress(0..1, step, receivedBytes, expectedBytes) on the
 // main queue. received/expected are the download byte counts while
 // the archive is downloading, 0 for the verify/extract steps.
+// If the user cancels, completion is called with ok=NO and
+// error=@"cancelled" (the exact string; the engine turns that into
+// the Idle state, not a failure).
 + (void)installGuestTo:(NSString*)rootfsPath
               progress:(void (^)(double fraction, NSString* step, int64_t received, int64_t expected))progress
             completion:(void (^)(BOOL ok, NSString* error))completion;
+
+// Cancel the in-flight download, if any, saving resume data so the
+// next Install continues where this one stopped.
++ (void)cancelDownload;
+
+// Re-attach to the background session after the system wakes the app
+// for a finished background download (AppDelegate's
+// handleEventsForBackgroundURLSession). The stored completion
+// handler is called once the session has delivered all its events.
++ (void)reconnectBackgroundSessionWithCompletionHandler:(void (^)(void))handler;
 
 @end

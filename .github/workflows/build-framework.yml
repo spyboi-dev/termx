@@ -226,6 +226,17 @@ jobs:
           git checkout FETCH_HEAD
           test "$(git rev-parse HEAD)" = fbe12ee72d195f0241c4fc24090a98b259026604
 
+      - name: Apply TermX runtime patches
+        run: |
+          cd kernarium
+          # The stock boot-ramdisk /init formats the overlay upper
+          # layer on every boot, so nothing installed or saved in a
+          # session survives a reboot. TermX keeps a persistent data
+          # disk instead: format only when the device holds no ext4
+          # filesystem yet, reuse it on later boots.
+          git apply "$GITHUB_WORKSPACE/patches/kernarium-boot-ramdisk-persistent-upper.patch"
+          git diff --stat
+
       - name: Restore build cache
         uses: actions/cache@v4
         with:
@@ -467,6 +478,12 @@ jobs:
           # The entry point TermX calls.
           nm -gU "$FW/KRuntime_6_18_4K" | grep -q ' _kernarium_runtime_get_api_v28' \
             || { echo "runtime API symbol missing"; exit 1; }
+          # The TermX boot-ramdisk patch must be embedded: the per-run
+          # /init lives in __uml_boot_init, and without the
+          # format-only-when-unformatted change the data disk would
+          # still be wiped on every boot.
+          strings "$FW/KRuntime_6_18_4K" | grep -q UML_BOOT_UPPER_KEEP \
+            || { echo "patched boot init missing: data disk will not persist"; exit 1; }
           /usr/libexec/PlistBuddy -c "Print MinimumOSVersion" "$FW/Info.plist"
           echo "KRuntime_6_18_4K.framework verified"
 

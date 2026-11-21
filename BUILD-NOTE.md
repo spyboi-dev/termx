@@ -496,6 +496,92 @@ is `Kernarium/Runtime/KernariumRuntime.h` (API version 43,
   the Android preset, or the rootfs layout.
 - Adhoc signature: SideStore with a development profile is required;
   a free profile may still lack the two memory entitlements.
+## 2026-11-21 — startup screen is the app; download crash; persistent data disk
+
+Three fixes from the user's first device test (2026-11-20 23:45 IST),
+all in this round; the slim rootfs swap (release rootfs-20261121-slim)
+is a separate step — only the four constants in GuestInstall.m change
+when the parent supplies its URL/hashes/size.
+
+**Startup screen is the root, terminal has no buttons.** AppDelegate
+now roots on TXStartupViewController. All controls live only there:
+Install-or-Boot, Stop, Log, Continue, Erase data disk. The terminal
+window is just the terminal (keyboard key row is typing input, not a
+control). Way back: swipe down starting from the top edge of the
+terminal returns to the startup screen. The guest's Metal view moved
+to the startup screen (behind its opaque scroll view), since the
+guest boots from there. The startup screen presents a fresh
+TerminalViewController full-screen once the shell is ready (0.7 s
+after Running, or on Continue), and does not re-present on returning
+from the terminal. Auto-boot on appear when state is Ready.
+Storage row now shows the persistent data disk usage and no longer
+says "fresh each boot".
+
+**Download crash.** GuestInstall now uses a background NSURLSession
+(identifier `app.termx.ios.rootfs-download`), so the download survives
+the phone locking and the app going to the background; resume data is
+persisted at `Documents/guest/rootfs-download.resume` and an
+interrupted download resumes instead of restarting from 0; an
+already-downloaded hash-verified .gz is reused instead of
+re-downloading; progress is driven by the delegate callback, with a
+milestone to engine.log every 10% of the download and every 256 MiB
+of extract/verify (with the byte count), and a memory warning logs
+the phase, received byte count and footprint. Free-space checks
+before download (3 GiB) and before extract (2 GiB) fail honestly
+with "not enough space". The download must cover both readings of
+the user's "70-80%": download percent (~260–295 MB) and overall
+progress (0.7 extracting / 0.95 verifying). gunzip and SHA-256
+stream in 1 MB chunks (confirmed in code). No device run exists to
+reproduce the crash; the logging names the phase and byte count so
+the next engine.log does. AppDelegate forwards background session
+events (`handleEventsForBackgroundURLSession:`).
+
+**The app binary no longer links the runtime at launch.** The
+KRuntime_6_18_4K framework binary is 53,621,616 bytes and its
+`__TEXT,__uml_elf` kernel section is 36,564,992 bytes (34.9 MiB);
+mapping that at launch (four LC_LOAD_DYLIB entries) was the
+launch-memory pattern the OpenCode app already fixed by going
+dlopen-only. KernEngine now dlopen()s the framework on Start
+(`loadRuntimeWithError:`, handle held for process lifetime) and
+build.sh no longer passes `-framework KRuntime_6_18_4K` etc.;
+`-rpath @executable_path/Frameworks` stays so the framework's own
+@rpath deps (the three GPU frameworks) resolve at dlopen time.
+Verify: zero framework LC_LOAD_DYLIB in the app binary.
+
+**Persistent data disk.** The app kept one 8 GiB sparse data disk at
+`Documents/guest/termx-data.ext4` (excluded from backup), created
+once on first install and reused every boot; the system image stays
+read-only. The old per-boot overlay wipe is gone from the app — but
+the stock framework wipes the disk anyway: upstream's per-run /init
+(`tools/rootfs/boot-ramdisk/init`, `mount_overlay_root()`) runs
+`mkfs.ext4 -F` unconditionally on every boot, and its header says
+the writable layer "ends with the run". So persistence needs the
+framework patched: `patches/kernarium-boot-ramdisk-persistent-upper.patch`
+formats only when the device holds no ext4 filesystem yet (blkid
+check, prints `UML_BOOT_UPPER_KEEP:…`), else reuses it. The patch
+applies cleanly to a fresh copy of upstream init (`git apply
+--check`, shell syntax verified) and is applied by the Mac workflow
+("Apply TermX runtime patches" step after "Clone Kernarium"), which
+also fails the build if `UML_BOOT_UPPER_KEEP` is not found in the
+built framework's strings. Until a framework with that patch ships,
+persistence does NOT work on device even with the new app code —
+do not claim it until the Mac run goes green and the IPA is rebuilt
+against the new framework. Erase data disk (confirm alert, startup
+screen only) recreates the disk for a wedged guest. Andarium's
+"628 MiB of 8 GiB" Storage row is the layout mirrored here.
+
+**Size breakdown (measured 2026-11-21, full image).** Kernel
+`__uml_elf` 36,564,992 bytes (34.9 MiB); framework binary
+53,621,616 bytes; .gz download 385,788,644 bytes (368 MiB);
+extracted image 1,728,053,248 bytes (1,648 MiB), ~1,272 MiB used.
+Inside the image (dpkg Installed-Size, 265 packages, 999 MiB
+total): Docker stack 187.4 MiB, gcc/g++ toolchain ~175 MiB, git
+48.4 MiB, libnode115 48.3 MiB, perl ~50 MiB, vim-runtime 37.5 MiB,
+libicu76 36.7 MiB, libc6 23.2 MiB, locales 15.4 MiB, systemd
+13.0 MiB. The kernel is ~36 MB; the ~1.6 GB is the full Debian
+system with Python, Node, Docker, git and build tools baked in.
+The slim image (no Docker, minimal base) is a separate choice.
+
 - Guest writes do not survive a reboot (overlay formatted fresh
   every boot). One guest, one shell. No desktop UI, no file browser,
   no statistics — terminal-first by design.

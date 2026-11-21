@@ -42,4 +42,10 @@ NSString *TXLogFullText(void);
 // Human byte size: "368 MB", "1.7 GiB", "128 MiB".
 NSString *TXFormatBytes(unsigned long long bytes);
 
+// This process's current physical memory footprint, in bytes
+// (0 when it cannot be read). Used to log memory pressure next to
+// the download/install byte counts, so a jetsam kill leaves the
+// footprint it died at.
+unsigned long long TXCurrentFootprintBytes(void);
+
 NS_ASSUME_NONNULL_END
