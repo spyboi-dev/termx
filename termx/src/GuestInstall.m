@@ -59,9 +59,24 @@ static const uint64_t kLogEveryBytes = 256ULL << 20;
 // extraction (the 09:33 and 07:57 runs). 256 KiB streams just as fast.
 static const size_t kGunzipChunkBytes = 256 << 10;
 
+// Free space on the volume holding path. attributesOfFileSystemForPath:
+// returns nil when the path does not exist, and a nil value reads as 0 —
+// which used to fail every Install: startDownload deletes the image
+// file, then measured that deleted path and read 0 B free (the 10:21
+// run: five taps, "0 B free, need 1.0 GiB" every time). Callers must pass
+// a path that exists. And a measurement that cannot be taken must never
+// block a good install: log it and fail OPEN (the OS still fails
+// honestly with ENOSPC if the disk really is full).
 static unsigned long long TXFreeSpaceAtPath(NSString* path) {
-    NSDictionary* attrs = [[NSFileManager defaultManager] attributesOfFileSystemForPath:path error:nil];
-    return [attrs[NSFileSystemFreeSize] unsignedLongLongValue];
+    NSError* error = nil;
+    NSDictionary* attrs = [[NSFileManager defaultManager] attributesOfFileSystemForPath:path error:&error];
+    NSNumber* freeSize = attrs[NSFileSystemFreeSize];
+    if (!freeSize) {
+        TXLogEngine(@"Free-space check failed for %@: %@ — proceeding without the check",
+                    path, error.localizedDescription ?: @"no attributes returned");
+        return ~0ULL;
+    }
+    return [freeSize unsignedLongLongValue];
 }
 
 static NSString* TXGuestDir(void) {
@@ -267,6 +282,9 @@ static TXRootfsDownload* s_activeDownload = nil;
             return;
         }
         TXLogEngine(@"Download hash OK");
+        // gzPath provably exists here: it was just hashed above (or the
+        // download delegate just moved the file there), so this read is
+        // real — and the helper fails open if the measurement ever fails.
         unsigned long long free = TXFreeSpaceAtPath(gzPath);
         if (free < kFreeSpaceNeededBeforeExtract) {
             TXLogEngine(@"Not enough free space to extract: %@ free, need %@",
@@ -334,7 +352,10 @@ static TXRootfsDownload* s_activeDownload = nil;
     }
     [fm removeItemAtPath:self.gzPath error:nil];
 
-    unsigned long long free = TXFreeSpaceAtPath(self.rootfsPath);
+    // Measure the guest directory, which was just created above — never
+    // the image file: it was deleted a few lines up, and measuring a
+    // deleted path always reads 0 B free (every Install failed on it).
+    unsigned long long free = TXFreeSpaceAtPath(guestDir);
     if (free < kFreeSpaceNeededBeforeDownload) {
         TXLogEngine(@"Not enough free space to install: %@ free, need %@",
                     TXFormatBytes(free), TXFormatBytes(kFreeSpaceNeededBeforeDownload));
