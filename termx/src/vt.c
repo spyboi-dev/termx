@@ -63,7 +63,16 @@ static void vt_scroll_up(vt_t *vt) {
         else if (ch < 0x800) { buf[n++] = 0xC0 | (ch >> 6); buf[n++] = 0x80 | (ch & 0x3F); }
         else if (ch < 0x10000) { buf[n++] = 0xE0 | (ch >> 12); buf[n++] = 0x80 | ((ch >> 6) & 0x3F); buf[n++] = 0x80 | (ch & 0x3F); }
         else { buf[n++] = 0xF0 | (ch >> 18); buf[n++] = 0x80 | ((ch >> 12) & 0x3F); buf[n++] = 0x80 | ((ch >> 6) & 0x3F); buf[n++] = 0x80 | (ch & 0x3F); }
-        if (len + (size_t)n + 1 > cap) { cap = (cap + 64) * 2; line = realloc(line, cap); if (!line) return; }
+        if (len + (size_t)n + 1 > cap) {
+            // Grow with a temp: if realloc fails the old buffer
+            // must survive (assigning its result straight to line
+            // would lose it), and the grid is left untouched.
+            size_t new_cap = (cap + 64) * 2;
+            char *grown = realloc(line, new_cap);
+            if (!grown) { free(line); return; }
+            line = grown;
+            cap = new_cap;
+        }
         memcpy(line + len, buf, (size_t)n);
         len += (size_t)n;
     }
@@ -76,9 +85,15 @@ static void vt_scroll_up(vt_t *vt) {
             memmove(vt->scrollback, vt->scrollback + 1, sizeof(char *) * (size_t)(vt->scrollback_cap - 1));
             vt->scrollback_count--;
         } else {
-            vt->scrollback_cap = vt->scrollback_cap ? vt->scrollback_cap * 2 : 64;
-            vt->scrollback = realloc(vt->scrollback, sizeof(char *) * (size_t)vt->scrollback_cap);
-            if (!vt->scrollback) { free(line); return; }
+            // Grow with a temp: if realloc fails the old array must
+            // survive. Assigning the result straight to scrollback
+            // would lose it (NULL) while scrollback_cap was already
+            // doubled, and the next scroll would write through NULL.
+            int new_cap = vt->scrollback_cap ? vt->scrollback_cap * 2 : 64;
+            char **grown = realloc(vt->scrollback, sizeof(char *) * (size_t)new_cap);
+            if (!grown) { free(line); return; }
+            vt->scrollback = grown;
+            vt->scrollback_cap = new_cap;
         }
     }
     vt->scrollback[vt->scrollback_count++] = line;
@@ -254,7 +269,12 @@ void vt_feed(vt_t *vt, const uint8_t *bytes, size_t len) {
             }
             if (b >= 0x20 && b <= 0x2F) break; /* intermediates: ignored. */
             if (b >= 0x40 && b <= 0x7E) {
-                if (P.cur >= 0 || P.nparams > 0) P.nparams++;
+                // Count this parameter, capped at the array: without
+                // the cap a sequence with more than 16 parameters
+                // pushes nparams to 17 and vt_csi's SGR loop reads
+                // params[16], past the end of the array (proven with
+                // -fsanitize=bounds on a 20-parameter SGR).
+                if ((P.cur >= 0 || P.nparams > 0) && P.nparams < 16) P.nparams++;
                 vt_csi(vt, b);
                 vt->dirty = 1;
                 P.state = VT_GROUND;

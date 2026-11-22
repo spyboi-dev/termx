@@ -92,9 +92,24 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // Replay the console output from before this screen existed: the
     // engine's delegate is nil until here, so the boot log and the
     // login prompt printed during boot would otherwise never reach
-    // the view and the terminal would start black.
+    // the view and the terminal would start black. Feed it in small
+    // chunks, the way the runtime delivers live output — the parser
+    // keeps its state across calls, so chunked feeding renders
+    // exactly what one big feed would, and the single 128 KiB call
+    // is a code path live delivery never exercises. The whole buffer
+    // is still replayed: only the earliest kernel lines would be
+    // beyond the scrollback anyway.
     NSData *backlog = [_engine bufferedConsoleOutput];
-    if (backlog.length) vt_feed(&_vt, backlog.bytes, backlog.length);
+    if (backlog.length) {
+        const uint8_t *bytes = backlog.bytes;
+        size_t remaining = backlog.length;
+        while (remaining > 0) {
+            size_t chunk = remaining > 1024 ? 1024 : remaining;
+            vt_feed(&_vt, bytes, chunk);
+            bytes += chunk;
+            remaining -= chunk;
+        }
+    }
 
     // The terminal itself: NewTerm's defaults — black, #f2f2f2 text,
     // system monospace. Lines never wrap: the text container is wider
