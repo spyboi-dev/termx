@@ -71,6 +71,19 @@ static const uint64_t kDataDiskGiB = 8;
 @property (nonatomic, strong) NSMutableData *consoleBuffer;
 @end
 
+// A/B revert (2026-11-22): the console ring buffer is compiled OUT.
+// The 378db9b sampler ruled memory out (footprint 248 MiB and rising,
+// headroom 3.8 GiB, system free 1.9 GiB stable at death), and the terminal
+// theory is dead (every failing run dies at kernel 0.12-0.47 s, before the
+// terminal ever presents). The ONLY 2bbe39f code running in that window is
+// the ring-buffer append below, audited safe three times but never
+// A/B-tested. Set this to 1 to restore the buffer; 0 leaves
+// bufferedConsoleOutput always empty, which the terminal replay
+// (TerminalViewController viewDidLoad) already handles via its
+// `if (backlog.length)` guard. Guest.log and the delegate callback are
+// untouched, so the terminal still works once the guest reaches the shell.
+#define TERMX_RING_BUFFER_AB 0
+
 // The console replay buffer keeps the most recent output (the boot
 // log and the login prompt are ~10-20 KiB); older bytes are dropped
 // from the front, so the buffer never grows without bound.
@@ -93,6 +106,7 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
     NSData* data = [NSData dataWithBytes:buffer length:length];
     // Every console byte also goes to Documents/Engine/guest.log.
     TXLogConsoleData(data);
+#if TERMX_RING_BUFFER_AB
     // And into the in-memory replay buffer, so a terminal presented
     // later can still show the boot log and the login prompt.
     @synchronized (engine) {
@@ -103,6 +117,7 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
                                             withBytes:NULL length:0];
         }
     }
+#endif
     id<KernEngineDelegate> delegate = engine.delegate;
     if (delegate) {
         // The callback runs on a runtime thread; the terminal view renders
@@ -194,6 +209,11 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         // its build. Runs right after the "--- App launch ---" marker.
         TXLogEngine(@"TermX build %s · guest %u MiB RAM · %u vCPUs",
                     TERMX_BUILD_COMMIT, kGuestMemoryMiB, kGuestCPUs);
+#if TERMX_RING_BUFFER_AB
+        TXLogEngine(@"A/B: console ring buffer ON");
+#else
+        TXLogEngine(@"A/B: console ring buffer OFF (revert build)");
+#endif
         TXLogEngine(@"TermX engine init: state %@, guest %@",
                     TXStateName(_state), installed ? @"installed" : @"not installed");
         // The runtime records how the last guest's session ended in
