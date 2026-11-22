@@ -4,6 +4,7 @@
 #import "TXCrashLog.h"
 #import "TXLog.h"
 #import "GuestInstall.h"
+#import "KernEngine.h"
 
 @implementation AppDelegate
 
@@ -50,6 +51,10 @@
 }
 
 - (void)applicationWillTerminate:(UIApplication*)application {
+    // Settle the guest's disk before the process dies (best effort,
+    // bounded — see KernEngine quiesceForTermination); the background
+    // quiesce is the primary defence.
+    [[KernEngine shared] quiesceForTermination];
     TXCrashLogMarkCleanShutdown();
 }
 

@@ -58,7 +58,22 @@ static const uint64_t kDataDiskGiB = 8;
     // Created in startMemorySampler, cancelled in stopMemorySampler;
     // nil when not running. Guarded by @synchronized(self).
     dispatch_source_t _samplerTimer;
+    // Background quiesce (the reboot-crash fix, 2026-11-22): a serial
+    // queue that orders the guest lifecycle calls (quiesce on
+    // background, resume on foreground), so a fast background /
+    // foreground cycle can never run a resume against a quiesce still
+    // in flight. The runtime serialises lifecycle calls itself, but
+    // the queue makes the app's own ordering explicit and keeps both
+    // calls off the main thread — a quiesce can block ~20 s.
+    dispatch_queue_t _lifecycleQueue;
+    // YES once quiesce_resident has suspended the guest: the
+    // foreground must call resume() before the guest can run again.
+    // Only set when the settle report says the guest suspended.
+    BOOL _quiesced;
 }
+// Runs on _lifecycleQueue only: suspends the guest and settles its
+// disk (see quiesceGuestForBackground).
+- (void)quiesceGuestForBackground;
 // Readwrite here so the console callback and the boot/install paths
 // (which run outside the @implementation) can move the phase.
 @property (nonatomic, readwrite) TXBootPhase bootPhase;
@@ -198,6 +213,11 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
                                                  selector:@selector(memoryWarning:)
                                                      name:UIApplicationDidReceiveMemoryWarningNotification
                                                    object:nil];
+        // Serial queue for the guest lifecycle calls (background
+        // quiesce, foreground resume, terminate quiesce): the order
+        // is the fix — a resume must wait for a quiesce in flight.
+        _lifecycleQueue = dispatch_queue_create("app.termx.ios.lifecycle", DISPATCH_QUEUE_SERIAL);
+        _quiesced = NO;
         // Refresh the state from disk on launch: an installed guest means Ready.
         BOOL installed = [self guestInstalled];
         if (installed) {
@@ -591,12 +611,155 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
     return @"trixie slim · read-only";
 }
 
+// Words for the quiesce settle report (KernariumRuntime.h: the
+// KERNARIUM_RUNTIME_GUEST_STORAGE_* and
+// KERNARIUM_RUNTIME_GUEST_SUSPENSION_* values), so the log reads
+// instead of numbering.
+static NSString* TXGuestStorageWord(uint32_t storage) {
+    switch (storage) {
+        case KERNARIUM_RUNTIME_GUEST_STORAGE_NOT_REPORTED: return @"not-reported";
+        case KERNARIUM_RUNTIME_GUEST_STORAGE_CONFIRMED: return @"confirmed";
+        case KERNARIUM_RUNTIME_GUEST_STORAGE_NO_GUEST: return @"no-guest";
+        case KERNARIUM_RUNTIME_GUEST_STORAGE_UNCONFIRMED: return @"unconfirmed";
+        case KERNARIUM_RUNTIME_GUEST_STORAGE_REFUSED: return @"refused";
+        case KERNARIUM_RUNTIME_GUEST_STORAGE_UNREACHABLE: return @"unreachable";
+        default: return @"?";
+    }
+}
+
+static NSString* TXGuestSuspensionWord(uint32_t suspension) {
+    switch (suspension) {
+        case KERNARIUM_RUNTIME_GUEST_SUSPENSION_NOT_ASKED: return @"not-asked";
+        case KERNARIUM_RUNTIME_GUEST_SUSPENSION_SUSPENDED: return @"suspended";
+        case KERNARIUM_RUNTIME_GUEST_SUSPENSION_NOT_SUSPENDED: return @"not-suspended";
+        default: return @"?";
+    }
+}
+
+// Runs on _lifecycleQueue only (see enterBackground): has the guest
+// write its filesystems back, trims its cold page cache, enters full
+// system suspend and flushes the host's files, then releases the
+// guest's disk locks — the runtime's own suspend protocol. Sets
+// _quiesced only when the report says the guest suspended; a guest
+// that refused or did not answer is still running, and there is
+// nothing to resume.
+- (void)quiesceGuestForBackground {
+    if (!_api || !_running) return;
+    kernarium_runtime_settle settle;
+    memset(&settle, 0, sizeof(settle));
+    settle.struct_size = (uint32_t)sizeof(settle);
+    TXLogEngine(@"Background: quiescing the guest so the data disk is clean on the next launch");
+    TXLogFlush();
+    int rc = _api->quiesce_resident(&settle);
+    TXLogEngine(@"Background: quiesce returned %d, storage %@, suspension %@",
+                rc, TXGuestStorageWord(settle.guest_storage),
+                TXGuestSuspensionWord(settle.guest_suspension));
+    TXLogFlush();
+    _quiesced = (rc >= 0 &&
+                 settle.guest_suspension == KERNARIUM_RUNTIME_GUEST_SUSPENSION_SUSPENDED);
+    if (_quiesced) {
+        TXLogEngine(@"Background: guest suspended — the data disk is clean, resume on foreground");
+    } else {
+        TXLogEngine(@"Background: guest did not suspend — still running, nothing to resume");
+    }
+    TXLogFlush();
+}
+
+// Best effort for applicationWillTerminate: the process is about to
+// die, so try to settle the guest's disk now. Bounded wait (3 s) so
+// termination is not stalled — the first writeback is bounded at
+// 2 s, so this usually covers the disk settling even when the
+// suspend itself does not finish before the process dies. The
+// background quiesce is the primary defence (a force-quit never
+// calls applicationWillTerminate at all); this only covers a
+// terminate that arrives while foregrounded. No-op when the guest
+// is not running or is already quiesced.
+- (void)quiesceForTermination {
+    if (!_api || !_running || self.state != TermXStateRunning) return;
+    if (_quiesced) return;
+    TXLogEngine(@"Terminate: quiescing the guest so the data disk is clean");
+    TXLogFlush();
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(_lifecycleQueue, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) [strongSelf quiesceGuestForBackground];
+        dispatch_semaphore_signal(done);
+    });
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)));
+}
+
 - (void)enterBackground {
+    // Hold the guest GPU while backgrounded: iOS revokes the GPU within
+    // seconds, and the runtime must not submit work while it is gone.
     if (_api && _running) _api->set_gpu_hold(1);
+    // Quiesce the guest so the next launch does not find a dirty data
+    // disk. The reboot crash (2026-11-22): TermX never stopped the
+    // guest when the user left the app, so every restart was a
+    // force-quit that left the data disk dirty — an ext4 journal of
+    // uncommitted transactions — and the next boot died in early
+    // kernel init (the 12:54 run booted on a fresh empty disk; the
+    // 12:58 restart on the reused 137 MiB disk died at kernel
+    // 0.19-0.32 s, and the session record said end "running", stall
+    // total 0, memory healthy). The resident variant keeps the guest
+    // RAM in the process and writes no hibernation image (a plain
+    // quiesce writes up to 512 MiB to TMPDIR on every backgrounding,
+    // and a fresh run() discards stale hibernation images anyway);
+    // the disk settling is identical. Only when the guest is fully
+    // up: a mid-boot guest cannot suspend, and the quiesce would burn
+    // its bounded waits for nothing. Runs on the lifecycle queue,
+    // never the main thread — a quiesce can block ~20 s — under a
+    // background task so iOS gives it the time.
+    if (!_api || !_running || self.state != TermXStateRunning) return;
+    __block UIBackgroundTaskIdentifier bgTask = UIBackgroundTaskInvalid;
+    __block BOOL bgTaskEnded = NO;
+    // End the background task exactly once, on the main queue, from
+    // either the quiesce finishing or the expiration handler: both
+    // paths run through here, so the flag is race-free.
+    void (^endBgTask)(void) = ^{
+        if (!bgTaskEnded && bgTask != UIBackgroundTaskInvalid) {
+            bgTaskEnded = YES;
+            [[UIApplication sharedApplication] endBackgroundTask:bgTask];
+        }
+    };
+    bgTask = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
+        TXLogEngine(@"Background time expired during guest quiesce — ending the background task; the quiesce keeps running and the foreground resume waits for it");
+        dispatch_async(dispatch_get_main_queue(), endBgTask);
+    }];
+    if (bgTask == UIBackgroundTaskInvalid) {
+        TXLogEngine(@"Could not begin a background task for the guest quiesce — quiescing anyway");
+    }
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(_lifecycleQueue, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { dispatch_async(dispatch_get_main_queue(), endBgTask); return; }
+        [strongSelf quiesceGuestForBackground];
+        dispatch_async(dispatch_get_main_queue(), endBgTask);
+    });
 }
 
 - (void)enterForeground {
-    if (_api && _running) _api->set_gpu_hold(0);
+    // Resume a quiesced guest, then release the GPU hold. The resume
+    // runs on the lifecycle queue so it waits for any quiesce still
+    // in flight (a fast background/foreground cycle); the GPU hold
+    // is released on the main queue after the resume returns, as
+    // today. When the guest never quiesced, the resume is skipped
+    // and only the hold is released.
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(_lifecycleQueue, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (strongSelf->_quiesced && strongSelf->_api && strongSelf->_running) {
+            TXLogEngine(@"Foreground: resuming the quiesced guest");
+            strongSelf->_api->resume();
+            strongSelf->_quiesced = NO;
+            TXLogEngine(@"Foreground: guest resumed");
+            TXLogFlush();
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (strongSelf->_api && strongSelf->_running) strongSelf->_api->set_gpu_hold(0);
+        });
+    });
 }
 
 - (NSString*)dataDiskPath {

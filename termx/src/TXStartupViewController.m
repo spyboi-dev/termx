@@ -649,6 +649,23 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         if (engine2.failedStep == TXBootStepImage) return;
         if (strongSelf.bootRetryUsed) return;
         strongSelf.bootRetryUsed = YES;
+        // Belt-and-braces: a boot that fails in the kernel or storage
+        // step may be tripping on a dirty data disk (the reboot crash:
+        // every restart after a force-quit left the disk dirty and the
+        // next boot died in early kernel init). Give the retry a clean
+        // disk: erase it first — the next boot recreates it empty, and
+        // the system image is untouched. Only for kernel/storage: a
+        // startup failure reached init, so the disk mounted fine and
+        // is not the suspect. The retry is the one automatic retry, so
+        // this erases at most once per failure.
+        if (engine2.failedStep == TXBootStepKernel || engine2.failedStep == TXBootStepStorage) {
+            NSString *eraseError = nil;
+            if ([engine2 eraseDataDiskWithError:&eraseError]) {
+                TXLogEngine(@"Boot failed — data disk erased, retrying from a clean disk");
+            } else {
+                TXLogEngine(@"Boot failed — could not erase the data disk (%@), retrying anyway", eraseError ?: @"?");
+            }
+        }
         TXLogEngine(@"Boot failed — retrying automatically");
         [engine2 bootOnView:strongSelf.guestView];
     });
