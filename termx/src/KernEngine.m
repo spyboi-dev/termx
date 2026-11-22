@@ -45,7 +45,16 @@ static const uint64_t kDataDiskGiB = 8;
 @property (nonatomic, readwrite) NSInteger failedStep;
 @property (nonatomic, readwrite) int64_t downloadReceived;
 @property (nonatomic, readwrite) int64_t downloadExpected;
+// Console output buffered since boot for the terminal's replay (see
+// bufferedConsoleOutput). Appended on the runtime thread, read on
+// the main thread, so every access is under @synchronized(self).
+@property (nonatomic, strong) NSMutableData *consoleBuffer;
 @end
+
+// The console replay buffer keeps the most recent output (the boot
+// log and the login prompt are ~10-20 KiB); older bytes are dropped
+// from the front, so the buffer never grows without bound.
+static const NSUInteger kConsoleBufferMaxBytes = 128 * 1024;
 
 static NSString* TXStateName(TermXState state) {
     switch (state) {
@@ -64,6 +73,16 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
     NSData* data = [NSData dataWithBytes:buffer length:length];
     // Every console byte also goes to Documents/Engine/guest.log.
     TXLogConsoleData(data);
+    // And into the in-memory replay buffer, so a terminal presented
+    // later can still show the boot log and the login prompt.
+    @synchronized (engine) {
+        if (!engine.consoleBuffer) engine.consoleBuffer = [NSMutableData data];
+        [engine.consoleBuffer appendData:data];
+        if (engine.consoleBuffer.length > kConsoleBufferMaxBytes) {
+            [engine.consoleBuffer replaceBytesInRange:NSMakeRange(0, engine.consoleBuffer.length - kConsoleBufferMaxBytes)
+                                            withBytes:NULL length:0];
+        }
+    }
     id<KernEngineDelegate> delegate = engine.delegate;
     if (delegate) {
         // The callback runs on a runtime thread; the terminal view renders
@@ -828,6 +847,12 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
     }
     TXLogEngine(@"Stop requested");
     if (_api && _running) _api->request_stop();
+}
+
+- (NSData*)bufferedConsoleOutput {
+    @synchronized (self) {
+        return [self.consoleBuffer copy] ?: [NSData data];
+    }
 }
 
 - (void)sendConsoleInput:(NSData*)data {

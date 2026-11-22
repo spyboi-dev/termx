@@ -10,16 +10,24 @@
 // cannot build here); the key bytes match NewTerm's TerminalConstants
 // exactly. The shell itself lives in the guest, never on iOS: typed input
 // goes to the guest console, guest output feeds the terminal view.
+// Scrolling follows the rule every mobile terminal uses (NewTerm,
+// Blink, Termius): output follows the bottom only while the user is
+// pinned there; once they scroll up into the scrollback the view stays
+// exactly where they put it, and a floating button takes them back down.
+// The engine buffers console output from boot and the terminal replays
+// it on presentation, so the boot log and the login prompt are visible
+// even though the terminal only exists 0.7 s after the shell is ready.
 // There is no top bar and no control button on this screen at all: the
 // startup screen is the control centre, and a swipe down from the top
-// edge returns to it.
+// edge — only when already at the very top of the scrollback — returns
+// to it.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "TerminalViewController.h"
 
 #import "KernEngine.h"
 #import "vt.h"
 
-@interface TerminalViewController () <KernEngineDelegate, UITextFieldDelegate, UIGestureRecognizerDelegate>
+@interface TerminalViewController () <KernEngineDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate>
 @end
 
 // xterm 256-colour palette: 0-15 the standard colours, 16-231 the 6x6x6
@@ -67,6 +75,10 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     NSTimer *_flushTimer;
     NSLayoutConstraint *_toolbarBottom;
     CGPoint _exitPanStart; // where the top-edge exit drag began
+    BOOL _exitPanAtTop;    // scrollback already at its top when the drag began
+    UIButton *_jumpToBottomButton; // shown only while scrolled up (Blink/Termius pattern)
+    NSTimer *_repeatTimer; // arrow key repeat (NewTerm 2.4: hold to repeat)
+    NSData *_repeatData;
 }
 
 - (void)viewDidLoad {
@@ -76,6 +88,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
     _engine = [KernEngine shared];
     _engine.delegate = self;
+
+    // Replay the console output from before this screen existed: the
+    // engine's delegate is nil until here, so the boot log and the
+    // login prompt printed during boot would otherwise never reach
+    // the view and the terminal would start black.
+    NSData *backlog = [_engine bufferedConsoleOutput];
+    if (backlog.length) vt_feed(&_vt, backlog.bytes, backlog.length);
 
     // The terminal itself: NewTerm's defaults — black, #f2f2f2 text,
     // system monospace. Lines never wrap: the text container is wider
@@ -92,6 +111,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _output.textContainerInset = UIEdgeInsetsMake(6, 6, 6, 6);
     _output.autocorrectionType = UITextAutocorrectionTypeNo;
     _output.attributedText = [[NSAttributedString alloc] initWithString:@"TermX\n"];
+    _output.delegate = self; // scrollViewDidScroll: drives the jump-to-bottom button
     [self.view addSubview:_output];
 
     // Hidden field that owns the software keyboard.
@@ -181,16 +201,23 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [primary addArrangedSubview:_moreButton];
     UIView *spacer = [[UIView alloc] init];
     [primary addArrangedSubview:spacer];
-    // Butterfly arrows: left, up/down stacked, right.
-    [self addKey:primary title:@"←" bytes:"\x1B[D" length:3];
+    // Butterfly arrows: left, up/down stacked, right. The up/down pair
+    // are half-height buttons (16 pt each + 2 pt spacing = 34 pt, the
+    // row height); a full keyButton is ~29 pt tall, so two of those in
+    // a 34 pt row were compressed and their glyphs overflowed and drew
+    // on top of each other. All four arrows repeat while held.
+    [self addArrowKey:primary title:@"←" tag:0 halfHeight:NO];
     UIStackView *ud = [[UIStackView alloc] init];
     ud.axis = UILayoutConstraintAxisVertical;
     ud.spacing = 2;
-    [self addKey:ud title:@"↑" bytes:"\x1B[A" length:3];
-    [self addKey:ud title:@"↓" bytes:"\x1B[B" length:3];
+    ud.distribution = UIStackViewDistributionFillEqually;
+    [self addArrowKey:ud title:@"↑" tag:1 halfHeight:YES];
+    [self addArrowKey:ud title:@"↓" tag:2 halfHeight:YES];
     [primary addArrangedSubview:ud];
-    [self addKey:primary title:@"→" bytes:"\x1B[C" length:3];
+    [self addArrowKey:primary title:@"→" tag:3 halfHeight:NO];
     UIButton *kbd = [self keyButton:@"⌨"];
+    kbd.titleLabel.font = [UIFont monospacedSystemFontOfSize:16 weight:UIFontWeightMedium];
+    [kbd.widthAnchor constraintEqualToConstant:44].active = YES;
     [kbd addTarget:self action:@selector(onKeyboard) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:kbd];
     [rows addArrangedSubview:primary];
@@ -214,6 +241,26 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // The toolbar rides above the software keyboard when it appears.
     _toolbarBottom = [toolbar.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-4];
     _toolbarBottom.active = YES;
+
+    // Jump-to-bottom button (Blink/Termius pattern): appears only
+    // while the user has scrolled up into the scrollback, and takes
+    // them back to the live prompt. It rides just above the toolbar.
+    _jumpToBottomButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    _jumpToBottomButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [_jumpToBottomButton setTitle:@"↓ Bottom" forState:UIControlStateNormal];
+    _jumpToBottomButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    [_jumpToBottomButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    _jumpToBottomButton.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.9];
+    _jumpToBottomButton.layer.cornerRadius = 14;
+    _jumpToBottomButton.contentEdgeInsets = UIEdgeInsetsMake(4, 12, 4, 12);
+    _jumpToBottomButton.hidden = YES;
+    [_jumpToBottomButton addTarget:self action:@selector(onJumpToBottom) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_jumpToBottomButton];
+    [NSLayoutConstraint activateConstraints:@[
+        [_jumpToBottomButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [_jumpToBottomButton.bottomAnchor constraintEqualToAnchor:toolbar.topAnchor constant:-8],
+        [_jumpToBottomButton.heightAnchor constraintEqualToConstant:28],
+    ]];
 
     // Render the terminal at most every 60 ms; the guest sends a few bytes
     // at a time and redrawing on every one would thrash.
@@ -267,6 +314,69 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [row addArrangedSubview:b];
 }
 
+// Half-height arrow button for the up/down pair: two of these plus
+// the 2 pt stack spacing fit the 34 pt primary row exactly (16+2+16).
+// An 11 pt glyph fits the 16 pt height with no vertical insets.
+- (UIButton *)arrowButton:(NSString *)title {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    [b setTitle:title forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium];
+    b.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1.0];
+    b.layer.cornerRadius = 6;
+    b.contentEdgeInsets = UIEdgeInsetsMake(0, 8, 0, 8);
+    [b.heightAnchor constraintEqualToConstant:16].active = YES;
+    return b;
+}
+
+// Arrow keys by tag: 0 left, 1 up, 2 down, 3 right (xterm sequences).
+- (NSData *)arrowDataForTag:(NSInteger)tag {
+    static const char *bytes[4] = {"\x1B[D", "\x1B[A", "\x1B[B", "\x1B[C"};
+    if (tag < 0 || tag > 3) return nil;
+    return [NSData dataWithBytes:bytes[tag] length:3];
+}
+
+- (void)addArrowKey:(UIStackView *)row title:(NSString *)title tag:(NSInteger)tag halfHeight:(BOOL)halfHeight {
+    UIButton *b = halfHeight ? [self arrowButton:title] : [self keyButton:title];
+    b.tag = tag;
+    [b addTarget:self action:@selector(arrowTouchDown:) forControlEvents:UIControlEventTouchDown];
+    [b addTarget:self action:@selector(arrowTouchUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+    [row addArrangedSubview:b];
+}
+
+// Arrow key repeat (NewTerm 2.4): a tap sends once, holding repeats
+// after 0.4 s at 12 Hz, so scrolling through shell history does not
+// need a tap per line.
+- (void)arrowTouchDown:(UIButton *)sender {
+    NSData *data = [self arrowDataForTag:sender.tag];
+    if (data) [self startKeyRepeat:data];
+}
+
+- (void)arrowTouchUp:(UIButton *)sender {
+    (void)sender;
+    [self stopKeyRepeat];
+}
+
+- (void)startKeyRepeat:(NSData *)data {
+    [self stopKeyRepeat];
+    _repeatData = data;
+    [self sendKeyData:data];
+    __weak typeof(self) weakSelf = self;
+    _repeatTimer = [NSTimer scheduledTimerWithTimeInterval:0.08 repeats:YES block:^(NSTimer *t) {
+        (void)t;
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { [t invalidate]; return; }
+        [strongSelf sendKeyData:strongSelf->_repeatData];
+    }];
+    [_repeatTimer setFireDate:[NSDate dateWithTimeIntervalSinceNow:0.4]];
+}
+
+- (void)stopKeyRepeat {
+    [_repeatTimer invalidate];
+    _repeatTimer = nil;
+    _repeatData = nil;
+}
+
 - (void)setToggle:(UIButton *)button on:(BOOL)on {
     button.backgroundColor = on
         ? [UIColor colorWithRed:0.2 green:0.45 blue:0.85 alpha:1.0]
@@ -295,8 +405,10 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 }
 
 - (void)onKeyboard {
-    if (_input.isFirstResponder) [_input resignFirstResponder];
-    else [_input becomeFirstResponder];
+    // Dismiss only, never toggle back on: endEditing resigns
+    // whichever field actually owns the keyboard (the hidden _input).
+    // Tapping the terminal brings the keyboard back.
+    [self.view endEditing:YES];
 }
 
 - (void)onTapTerminal {
@@ -305,16 +417,18 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
 // The exit drag: a downward pan that began in the top strip of the
 // terminal returns to the startup screen, where Stop, Logs, Install
-// and Boot live. Ordinary scrolling starts anywhere and moves either
-// way; this needs a top-strip start and a decisive downward move.
+// and Boot live. It only fires when the scrollback is already at its
+// very top: anywhere else, a downward drag is the user scrolling
+// through the output, not asking to leave.
 - (void)onExitPan:(UIPanGestureRecognizer *)pan {
     switch (pan.state) {
         case UIGestureRecognizerStateBegan:
             _exitPanStart = [pan locationInView:_output];
+            _exitPanAtTop = _output.contentOffset.y <= 1;
             break;
         case UIGestureRecognizerStateEnded: {
             CGPoint translation = [pan translationInView:_output];
-            if (_exitPanStart.y < 44 && translation.y > 80 &&
+            if (_exitPanAtTop && _exitPanStart.y < 44 && translation.y > 80 &&
                 fabs(translation.y) > fabs(translation.x)) {
                 [self dismissViewControllerAnimated:YES completion:nil];
             }
@@ -347,7 +461,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 }
 
 - (void)kernEngineDidReceiveConsoleOutput:(NSData *)data {
-    vt_feed(&_vt, data.bytes, data.length);
+    // The runtime calls this on its own thread, but the VT (grid,
+    // scrollback and its file-static parser state in vt.c) is only
+    // ever touched on the main thread, where the flush timer also
+    // runs — feeding it from here would race the flush.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        vt_feed(&_vt, data.bytes, data.length);
+    });
 }
 
 - (UIColor *)colorForCell:(vt_cell)cell isForeground:(BOOL)isFg {
@@ -363,6 +483,21 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
 - (void)flushTerminal {
     if (!_vt.dirty) return;
+    // The 60 ms timer rebuilds the whole attributed string every
+    // flush. Setting attributedText resets the scroll position, so the
+    // old code yanked the view to the bottom on every flush and a
+    // swipe down was undone 60 ms later — "it go up again and again".
+    // The fix is the rule every mobile terminal uses: follow the
+    // bottom only while the user is already pinned there; when they
+    // have scrolled up into the scrollback, put the view back exactly
+    // where they left it. _vt.dirty is cleared here and set again by
+    // vt_feed on new output, so an idle terminal does no work at all
+    // (before this the flag was never cleared and every flush rebuilt
+    // the string forever, even with no new output).
+    _vt.dirty = 0;
+    BOOL pinned = [self isPinnedToBottom];
+    BOOL userScrolling = _output.isTracking || _output.isDragging || _output.isDecelerating;
+    CGPoint savedOffset = _output.contentOffset;
     UIFont *font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
     NSMutableAttributedString *out = [[NSMutableAttributedString alloc] init];
     // Scrollback stays plain text (vt.c keeps no colours for it).
@@ -410,13 +545,53 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         if (haveRun) [self appendRun:out text:runText cell:runCell font:font cursor:NO];
         if (r < VT_ROWS - 1) [out appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n" attributes:plain]];
     }
-    BOOL atBottom = _output.contentOffset.y + _output.bounds.size.height >=
-        _output.contentSize.height - 24;
     _output.attributedText = out;
-    if (atBottom) {
-        NSRange end = NSMakeRange(_output.attributedText.length, 0);
-        [_output scrollRangeToVisible:end];
+    [_output layoutIfNeeded]; // contentSize is current before we measure it
+    if (!userScrolling) {
+        if (pinned) [self scrollToBottomAnimated:NO];
+        else {
+            // Restore the saved offset, clamped to the new content
+            // height (a clear-screen can shrink it under the old one).
+            CGFloat maxOffset = _output.contentSize.height + _output.contentInset.bottom - _output.bounds.size.height;
+            CGFloat minY = -_output.contentInset.top;
+            CGPoint restored = savedOffset;
+            restored.y = MIN(MAX(restored.y, minY), MAX(maxOffset, minY));
+            _output.contentOffset = restored;
+        }
     }
+    [self updateJumpToBottomButton];
+}
+
+// Pinned means the last visible line is the live one: the bottom of
+// the content (including the keyboard inset) is within one line of
+// the bottom of the view. The old check ignored contentInset.bottom,
+// so with the keyboard up its "at bottom" band was ~324 pt wide and
+// almost every position counted as pinned.
+- (BOOL)isPinnedToBottom {
+    CGFloat bottomOffset = _output.contentSize.height + _output.contentInset.bottom - _output.bounds.size.height;
+    if (bottomOffset <= 0) return YES;
+    return _output.contentOffset.y >= bottomOffset - 16.0;
+}
+
+- (void)scrollToBottomAnimated:(BOOL)animated {
+    CGFloat maxOffset = _output.contentSize.height + _output.contentInset.bottom - _output.bounds.size.height;
+    CGFloat y = MAX(maxOffset, -_output.contentInset.top);
+    [_output setContentOffset:CGPointMake(_output.contentOffset.x, y) animated:animated];
+}
+
+- (void)updateJumpToBottomButton {
+    _jumpToBottomButton.hidden = [self isPinnedToBottom];
+}
+
+- (void)onJumpToBottom {
+    [self scrollToBottomAnimated:YES];
+}
+
+// UITextViewDelegate: keep the jump-to-bottom button in step with
+// where the user actually is.
+- (void)scrollViewDidScroll:(UIScrollView *)scrollView {
+    (void)scrollView;
+    [self updateJumpToBottomButton];
 }
 
 - (void)appendRun:(NSMutableAttributedString *)out text:(NSString *)text
@@ -480,24 +655,27 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 #pragma mark - Keyboard
 
 - (void)keyboardWillChange:(NSNotification *)note {
+    // Capture the pinned state before the inset changes: the
+    // keyboard showing or hiding must not move a user who scrolled
+    // up into the scrollback, and must keep a pinned user on the
+    // live line as the inset moves.
+    BOOL wasPinned = [self isPinnedToBottom];
     CGRect end = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
     CGRect inView = [self.view convertRect:end fromView:nil];
     CGFloat height = MAX(0, self.view.bounds.size.height - inView.origin.y);
     _toolbarBottom.constant = -4 - height;
+    _output.contentInset = UIEdgeInsetsMake(0, 0, height, 0);
+    _output.scrollIndicatorInsets = _output.contentInset;
     NSTimeInterval duration = [note.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
     [UIView animateWithDuration:duration animations:^{
         [self.view layoutIfNeeded];
+        if (wasPinned) [self scrollToBottomAnimated:NO];
     }];
-    _output.contentInset = UIEdgeInsetsMake(0, 0, height, 0);
-    _output.scrollIndicatorInsets = _output.contentInset;
-    if (height > 0) {
-        NSRange endRange = NSMakeRange(_output.attributedText.length, 0);
-        [_output scrollRangeToVisible:endRange];
-    }
 }
 
 - (void)dealloc {
     [_flushTimer invalidate];
+    [_repeatTimer invalidate];
     vt_free(&_vt);
 }
 

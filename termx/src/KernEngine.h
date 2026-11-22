@@ -135,4 +135,11 @@ extern NSString* const kTermXStateChanged;
 // console-output callback feeds.
 - (void)sendConsoleInput:(NSData*)data;
 
+// Console output buffered since boot (most recent 128 KiB): the
+// terminal replays this on presentation, because the engine's
+// delegate is nil until the terminal exists and the boot log and the
+// login prompt would otherwise never reach the view (they still
+// reach guest.log). Returns a copy; safe from any thread.
+- (NSData*)bufferedConsoleOutput;
+
 @end
