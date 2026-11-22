@@ -34,6 +34,11 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 @property (nonatomic, assign) BOOL bootRetryUsed;
 @property (nonatomic, assign) BOOL bootRetryScheduled;
 @property (nonatomic, strong, nullable) NSDate *autoBootDeferredSince; // first tick the guest view had no size
+// Timing diagnostic (second-launch crash, 2026-11-22): one 5 s
+// pre-boot delay per launch. Scheduled stops the 0.5 s ticks
+// arming a second delay; elapsed lets the re-entry boot.
+@property (nonatomic, assign) BOOL bootDelayScheduled;
+@property (nonatomic, assign) BOOL bootDelayElapsed;
 @property (nonatomic, strong) UIButton *eraseButton; // small destructive text button
 @property (nonatomic, strong) NSMutableArray<UIView *> *rowIcons;
 @property (nonatomic, strong) NSMutableArray<UIImageView *> *rowChecks;
@@ -618,6 +623,29 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         return;
     }
     self.autoBootDeferredSince = nil;
+    // TIMING DIAGNOSTIC (second-launch crash, 2026-11-22): hold the
+    // boot 5 s once the view has size, so a second launch spends
+    // seconds before run() like the first launch did (which spent
+    // ~54 s on the install pipeline). One delay per launch: the
+    // 0.5 s ticks keep arriving while it runs, and the scheduled
+    // flag stops them arming a second one; the elapsed flag lets
+    // the re-entry boot. (The no-size timeout branch above already
+    // waited 10 s, so it needs no extra delay.)
+    if (!self.bootDelayElapsed) {
+        if (!self.bootDelayScheduled) {
+            self.bootDelayScheduled = YES;
+            TXLogEngine(@"Boot delay: waiting 5 s before boot (timing diagnostic)");
+            TXLogFlush();
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (!strongSelf) return;
+                strongSelf.bootDelayElapsed = YES;
+                [strongSelf maybeAutoBoot];
+            });
+        }
+        return;
+    }
     self.autoBootDone = YES;
     TXLogEngine(@"Auto-boot: guest is ready, starting the engine");
     [engine bootOnView:self.guestView];

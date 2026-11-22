@@ -41,6 +41,13 @@ extern const long long kRootfsSize;       // bytes of the extracted image
 // twice a second.
 + (BOOL)guestInstalledAt:(NSString*)rootfsPath error:(NSString**)error;
 
+// Full SHA-256 of the extracted image against kRootfsSHA256, and
+// record the verified fingerprint on success. Expensive (reads
+// 1 GiB) — never on the poll timer or the main thread. The install
+// pipeline's one-time verify, and the launch re-verify in the
+// timing diagnostic (KernEngine reverifyImageForLaunch).
++ (BOOL)guestImageHashValidAt:(NSString*)rootfsPath error:(NSString**)error;
+
 // Download + verify + extract the image to rootfsPath.
 // Calls progress(0..1, step, receivedBytes, expectedBytes) on the
 // main queue. received/expected are the download byte counts while

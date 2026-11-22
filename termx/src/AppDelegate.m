@@ -51,10 +51,10 @@
 }
 
 - (void)applicationWillTerminate:(UIApplication*)application {
-    // Settle the guest's disk before the process dies (best effort,
-    // bounded — see KernEngine quiesceForTermination); the background
+    // End the guest before the process dies (best effort, bounded
+    // — see KernEngine stopGuestForTermination); the background
     // quiesce is the primary defence.
-    [[KernEngine shared] quiesceForTermination];
+    [[KernEngine shared] stopGuestForTermination];
     TXCrashLogMarkCleanShutdown();
 }
 

@@ -125,12 +125,12 @@ extern NSString* const kTermXStateChanged;
 - (void)bootOnView:(MTKView*)view;
 - (void)stopGuest;
 
-// Settle the guest's disk before the process dies (best effort,
-// bounded 3 s): the runtime's quiesce, so a terminate that arrives
-// while foregrounded does not leave a dirty data disk for the next
-// boot. The background quiesce (enterBackground) is the primary
-// defence; a force-quit never calls applicationWillTerminate at all.
-- (void)quiesceForTermination;
+// End the guest before the process dies (best effort, bounded
+// 3 s): the runtime's request_stop, so run() returns and the
+// session record ends "stopped" instead of "running" + suspended.
+// The background quiesce (enterBackground) is the primary defence;
+// a force-quit never calls applicationWillTerminate at all.
+- (void)stopGuestForTermination;
 
 // Delete the persistent data disk (the guest's saved state: installed
 // packages, files, everything). The system image is untouched. The

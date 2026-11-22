@@ -70,10 +70,18 @@ static const uint64_t kDataDiskGiB = 8;
     // foreground must call resume() before the guest can run again.
     // Only set when the settle report says the guest suspended.
     BOOL _quiesced;
+    // Timing diagnostic (second-launch crash, 2026-11-22): YES while
+    // the launch re-verify (full image hash) is still running; its
+    // completion only moves the state when this is still set, so a
+    // user Install tapped meanwhile owns the state instead.
+    BOOL _launchReverifyInFlight;
 }
 // Runs on _lifecycleQueue only: suspends the guest and settles its
 // disk (see quiesceGuestForBackground).
 - (void)quiesceGuestForBackground;
+// Timing diagnostic: full image hash on a background queue before
+// the launch declares Ready (see reverifyImageForLaunch).
+- (void)reverifyImageForLaunch;
 // Readwrite here so the console callback and the boot/install paths
 // (which run outside the @implementation) can move the phase.
 @property (nonatomic, readwrite) TXBootPhase bootPhase;
@@ -218,11 +226,29 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         // is the fix — a resume must wait for a quiesce in flight.
         _lifecycleQueue = dispatch_queue_create("app.termx.ios.lifecycle", DISPATCH_QUEUE_SERIAL);
         _quiesced = NO;
-        // Refresh the state from disk on launch: an installed guest means Ready.
+        // Refresh the state from disk on launch: an installed guest means Ready —
+        // after the launch re-verify below. TIMING DIAGNOSTIC
+        // (second-launch crash, 2026-11-22): the only remaining
+        // difference between a first launch (boots) and a second launch
+        // (dies at kernel ~0.1 s) is timing — the first launch spent
+        // ~54 s on the install pipeline before booting, the second
+        // skipped the verify via the fingerprint and booted ~1 s after
+        // process start. So ignore the fingerprint on launch: always
+        // run the full SHA-256 over the 1 GiB image before declaring
+        // Ready. That re-warms the image in the page cache and makes
+        // the second launch take seconds like the first. The cheap
+        // fingerprint check stays everywhere else (the 0.5 s poll
+        // timer must never hash 1 GiB per tick). State stays Idle
+        // with "Verifying image…" until the hash lands; the auto-boot
+        // only fires from Ready.
         BOOL installed = [self guestInstalled];
         if (installed) {
-            _state = TermXStateReady;
-            _statusText = @"Guest ready — starting the engine…";
+            _launchReverifyInFlight = YES;
+            _state = TermXStateIdle;
+            _statusText = @"Verifying image…";
+            TXLogEngine(@"Timing diagnostic: forcing a full image verify on every launch (fingerprint ignored)");
+            TXLogFlush();
+            [self reverifyImageForLaunch];
         }
         // Build marker, every launch: the commit this IPA was built
         // from plus the guest RAM, so a device log always identifies
@@ -665,25 +691,46 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
     TXLogFlush();
 }
 
-// Best effort for applicationWillTerminate: the process is about to
-// die, so try to settle the guest's disk now. Bounded wait (3 s) so
-// termination is not stalled — the first writeback is bounded at
-// 2 s, so this usually covers the disk settling even when the
-// suspend itself does not finish before the process dies. The
-// background quiesce is the primary defence (a force-quit never
-// calls applicationWillTerminate at all); this only covers a
-// terminate that arrives while foregrounded. No-op when the guest
-// is not running or is already quiesced.
-- (void)quiesceForTermination {
-    if (!_api || !_running || self.state != TermXStateRunning) return;
-    if (_quiesced) return;
-    TXLogEngine(@"Terminate: quiescing the guest so the data disk is clean");
+// Best effort for applicationWillTerminate: end the guest with a
+// full request_stop so run() returns and the session record ends
+// "stopped" instead of "running" + suspended. The terminate-path
+// quiesce (0d01a7f) settled the disk but left the session "running"
+// — quiesce suspends, it does not end the run — and the second
+// launch still died, so this is session hygiene, not a boot fix by
+// itself. request_stop is async: run() returns on its own thread.
+// Wait bounded (3 s) for _running to clear; never stall
+// termination past that. The background quiesce (enterBackground)
+// is unchanged — it is what lets a foreground return resume — and
+// a force-quit never calls applicationWillTerminate at all, so this
+// only covers a terminate that arrives while foregrounded. No-op
+// when no guest is running. If the guest was quiesced on
+// background, request_stop ends the suspended run all the same, and
+// _quiesced is cleared because there is nothing left to resume.
+- (void)stopGuestForTermination {
+    if (!_api || !_running) return;
+    TXLogEngine(@"Terminate: stopping the guest so the session ends clean");
     TXLogFlush();
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     __weak typeof(self) weakSelf = self;
     dispatch_async(_lifecycleQueue, ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (strongSelf) [strongSelf quiesceGuestForBackground];
+        if (strongSelf) {
+            strongSelf->_api->request_stop();
+            // Poll for run() returning: _running clears on the run
+            // thread when run() returns and the session ends.
+            // Bounded at 3 s so termination is never stalled.
+            NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:3.0];
+            while (strongSelf->_running && [deadline timeIntervalSinceNow] > 0) {
+                [NSThread sleepForTimeInterval:0.05];
+            }
+            if (!strongSelf->_running) {
+                strongSelf->_quiesced = NO;
+                TXLogEngine(@"Terminate: guest stopped — session ended clean");
+            } else {
+                TXLogEngine(@"Terminate: guest did not stop in 3 s — process dies with the session running");
+            }
+            TXLogFlush();
+        }
         dispatch_semaphore_signal(done);
     });
     dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)));
@@ -769,6 +816,41 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
 - (BOOL)guestInstalled {
     NSString* error = nil;
     return [GuestInstall guestInstalledAt:_rootfsPath error:&error];
+}
+
+// Timing diagnostic (second-launch crash): full SHA-256 of the
+// extracted image on every launch, on a background queue — never
+// the main thread, it reads 1 GiB. On success the state becomes
+// Ready and the normal auto-boot fires; on failure the state is
+// Failed/Image and Install is the fallback. Applies only while the
+// launch re-verify is still the thing holding the state: if the
+// user tapped Install meanwhile, the install completion owns the
+// state instead, and this completion stands down.
+- (void)reverifyImageForLaunch {
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        __strong typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        NSString* error = nil;
+        BOOL ok = [GuestInstall guestImageHashValidAt:strongSelf->_rootfsPath error:&error];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(self) strongSelf2 = weakSelf;
+            if (!strongSelf2 || !strongSelf2->_launchReverifyInFlight) return;
+            strongSelf2->_launchReverifyInFlight = NO;
+            if (ok) {
+                TXLogEngine(@"Timing diagnostic: image re-verified — guest ready");
+                strongSelf2.state = TermXStateReady;
+                strongSelf2.statusText = @"Guest ready — starting the engine…";
+            } else {
+                TXLogEngine(@"Timing diagnostic: image re-verify failed (%@)", error ?: @"?");
+                strongSelf2.bootPhase = TXBootPhaseFailed;
+                strongSelf2.failedStep = TXBootStepImage;
+                strongSelf2.state = TermXStateFailed;
+                strongSelf2.statusText = error ?: @"Guest image failed verification — reinstall";
+            }
+            TXLogFlush();
+        });
+    });
 }
 
 - (void)installGuestWithCompletion:(void (^)(BOOL, NSString*))completion {
