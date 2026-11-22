@@ -588,3 +588,28 @@ The slim image (no Docker, minimal base) is a separate choice.
 - GPL-2.0-or-later: TermX embeds the GPL runtime, so its source
   must travel with any distribution of the IPA. Terminal UI model
   is Apache-2.0 (NewTerm); see `NOTICES-NEWTERM.md`.
+
+## 2026-11-22 — second-launch crash: boot init mkdir -p
+
+Root cause, from the device logs: the 17:23 second launch ended as
+guest-panic "Attempted to kill init! exitcode=0x00000100". The
+per-run /init binds `/state/docker` and `/state/containerd` into the
+new root with `mkdir -m 0711`, no `-p`, so it fails when the
+directory already exists on the reused persistent data disk; the
+`&&` chain short-circuits and `fail()` exits /init with code 1,
+panicking the kernel at 0.232 s. First boot works because the disk
+is empty; every relaunch dies. Timing is dead (the b4fd959
+diagnostic, forced full verify plus a 5 s pre-boot delay, still
+crashed). Fix is one line in
+`tools/rootfs/boot-ramdisk/init`: `mkdir -p -m 0711`, carried in
+`patches/kernarium-boot-ramdisk-persistent-upper.patch` (commit
+6ae75e2). Framework rebuilt on the Mac workflow (run 45056732857,
+green, ~4.5 min, cache hit); new framework binary 53,621,616
+bytes, SHA-256
+`21a0e09ee5fa282ad82636bbffa4cf82d535028b459b078ee83b12cd90dadabd`,
+embedded /init carries `mkdir -p -m 0711` and
+`UML_BOOT_UPPER_KEEP`. IPA rebuilt against it (25,082,628 bytes,
+SHA-256
+`845484e52a0156ea047383ac2e9ef874b8764b1fa2a7cbb5cf52f0e9d445ed46`,
+commit 6ae75e2 in the binary). Device test pending: install, boot,
+close, relaunch — the relaunch must reach the shell.
