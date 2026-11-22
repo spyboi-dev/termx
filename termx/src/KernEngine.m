@@ -220,15 +220,108 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         // guest/session.json ("running" from boot on, then the end,
         // a kernel panic with its message). Read it before booting
         // again: after a failed run it says what the last one did.
+        // Layout (uml-session 8, 19,200 bytes, upstream
+        // darwin/runtime/session_record.hpp): memory slot 0..8192,
+        // stall slot 8192..12288, network 12288..12800, storage
+        // 12800..13056, camera 13056..14080, state 14080..19200.
+        // The old code logged only the first 2000 characters, the
+        // memory slot's head; the state (the end word) and the stall
+        // slot (vCPU stalls, thermal / power / pressure transitions)
+        // were never seen. Log the whole file, slot by slot, plus
+        // one-line summaries, and flush it to disk: the next run may
+        // kill the process, and this record is the runtime's own
+        // witness of the previous death. What the end word means:
+        // "running" = killed from outside with no further
+        // instruction (SIGKILL); "host-fault" = host fault, signal
+        // and registers in the message; "guest-panic" /
+        // "kernel-abort" = the kernel crashed; "process-exit" = the
+        // process exited while the guest ran; "failed" = run()
+        // returned an error.
         NSString* sessionPath = [_guestDir stringByAppendingPathComponent:@"session.json"];
-        NSString* record = [NSString stringWithContentsOfFile:sessionPath
-                                                      encoding:NSUTF8StringEncoding
-                                                         error:nil];
+        NSData* recordData = [NSData dataWithContentsOfFile:sessionPath];
+        NSString* record = nil;
+        if (recordData.length) {
+            record = [[NSString alloc] initWithData:recordData encoding:NSUTF8StringEncoding];
+            if (!record) record = [[NSString alloc] initWithData:recordData encoding:NSISOLatin1StringEncoding];
+        }
         if (record.length) {
-            NSString* trimmed = [record stringByTrimmingCharactersInSet:
-                                 [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if (trimmed.length > 2000) trimmed = [trimmed substringToIndex:2000];
-            TXLogEngine(@"Previous session record: %@", trimmed);
+            NSCharacterSet* pad = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+            NSString* firstLine = [[record componentsSeparatedByString:@"\n"] firstObject] ?: @"";
+            TXLogEngine(@"Previous session record: %lu bytes, layout %@", (unsigned long)recordData.length, firstLine);
+            // Slice a byte range of the record and trim its padding
+            // (slots are padded with spaces or newlines to their
+            // fixed size). Character offsets equal byte offsets:
+            // the record is printable text.
+            NSString* (^TXSessionSlice)(NSUInteger, NSUInteger) = ^NSString* (NSUInteger off, NSUInteger len) {
+                if (off >= recordData.length) return @"";
+                NSUInteger n = MIN(len, recordData.length - off);
+                NSData* sub = [recordData subdataWithRange:NSMakeRange(off, n)];
+                NSString* s = [[NSString alloc] initWithData:sub encoding:NSUTF8StringEncoding];
+                if (!s) s = [[NSString alloc] initWithData:sub encoding:NSISOLatin1StringEncoding];
+                if (!s) return @"";
+                return [s stringByTrimmingCharactersInSet:pad];
+            };
+            // Slot offsets by layout version; the pinned framework
+            // writes uml-session 8. An unrecognized layout logs the
+            // whole trimmed file as one block instead of mis-slicing.
+            NSUInteger layoutVersion = 0;
+            if ([firstLine hasPrefix:@"uml-session "]) {
+                layoutVersion = (NSUInteger)[[firstLine substringFromIndex:12] integerValue];
+            }
+            BOOL knownLayout = (layoutVersion >= 1 && layoutVersion <= 8);
+            NSUInteger memoryBytes = 8192, stallOffset = 8192, networkOffset = 12288;
+            NSUInteger storageOffset = 12800, cameraOffset = 13056, stateOffset = 14080;
+            if (layoutVersion == 7) {
+                stateOffset = 13056; cameraOffset = NSNotFound;
+            } else if (layoutVersion == 6) {
+                stateOffset = 12800; storageOffset = NSNotFound; cameraOffset = NSNotFound;
+            } else if (layoutVersion == 5) {
+                memoryBytes = 4096; stallOffset = 4096; networkOffset = 8192; stateOffset = 8704;
+                storageOffset = NSNotFound; cameraOffset = NSNotFound;
+            } else if (layoutVersion == 4) {
+                stateOffset = 12288; networkOffset = NSNotFound; storageOffset = NSNotFound; cameraOffset = NSNotFound;
+            } else if (layoutVersion >= 1 && layoutVersion <= 3) {
+                stateOffset = 8192; stallOffset = NSNotFound; networkOffset = NSNotFound;
+                storageOffset = NSNotFound; cameraOffset = NSNotFound;
+            }
+            if (!knownLayout) {
+                TXLogEngine(@"Session record (unrecognized layout, whole file):\n%@", [record stringByTrimmingCharactersInSet:pad]);
+            } else {
+                NSString* memoryText = TXSessionSlice(0, memoryBytes);
+                NSString* stallText = (stallOffset == NSNotFound) ? @"" : TXSessionSlice(stallOffset, 4096);
+                NSString* networkText = (networkOffset == NSNotFound) ? @"" : TXSessionSlice(networkOffset, 512);
+                NSString* storageText = (storageOffset == NSNotFound) ? @"" : TXSessionSlice(storageOffset, 256);
+                NSString* cameraText = (cameraOffset == NSNotFound) ? @"" : TXSessionSlice(cameraOffset, 1024);
+                NSString* stateText = TXSessionSlice(stateOffset, recordData.length - MIN(stateOffset, recordData.length));
+                if (memoryText.length) TXLogEngine(@"Session memory slot:\n%@", memoryText);
+                if (stallText.length) TXLogEngine(@"Session stall slot:\n%@", stallText);
+                if (networkText.length) TXLogEngine(@"Session network slot:\n%@", networkText);
+                if (storageText.length) TXLogEngine(@"Session storage slot:\n%@", storageText);
+                if (cameraText.length) TXLogEngine(@"Session camera slot:\n%@", cameraText);
+                if (stateText.length) TXLogEngine(@"Session state:\n%@", stateText);
+                // One-line summaries, readable at a glance.
+                NSString* memoryFirstLine = [[memoryText componentsSeparatedByString:@"\n"] firstObject] ?: @"";
+                if (memoryFirstLine.length) TXLogEngine(@"Session memory: %@", memoryFirstLine);
+                NSString* stallFirstLine = [[stallText componentsSeparatedByString:@"\n"] firstObject] ?: @"";
+                NSRange totalRange = [stallFirstLine rangeOfString:@" total "];
+                if (totalRange.location != NSNotFound) {
+                    NSString* afterTotal = [stallFirstLine substringFromIndex:totalRange.location + totalRange.length];
+                    NSString* total = [[afterTotal componentsSeparatedByString:@" "] firstObject] ?: @"?";
+                    TXLogEngine(@"Session stall: total %@ recorded", total);
+                } else if (stallFirstLine.length) {
+                    TXLogEngine(@"Session stall: %@", stallFirstLine);
+                }
+                NSString* endWord = nil, *bootWord = nil, *messageText = nil;
+                for (NSString* line in [stateText componentsSeparatedByString:@"\n"]) {
+                    if ([line hasPrefix:@"end "]) endWord = [line substringFromIndex:4];
+                    else if ([line hasPrefix:@"boot "]) bootWord = [line substringFromIndex:5];
+                    else if ([line hasPrefix:@"message "]) messageText = [line substringFromIndex:8];
+                }
+                if (endWord.length) TXLogEngine(@"Session end state: %@", endWord);
+                if (bootWord.length) TXLogEngine(@"Session boot: %@", bootWord);
+                if (messageText.length) TXLogEngine(@"Session message: %@", messageText);
+            }
+            TXLogFlush();
         } else {
             TXLogEngine(@"No previous session record");
         }
