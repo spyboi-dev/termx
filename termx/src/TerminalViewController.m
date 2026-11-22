@@ -61,11 +61,34 @@ static const uint8_t kFnBytes[12][6] = {
 };
 static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
+// The hidden field that owns the software keyboard. A plain
+// UITextField swallows the delete key when it is empty: UIKit calls
+// deleteBackward on the field instead of consulting the delegate,
+// and the default implementation has nothing to delete, so no byte
+// ever reaches the guest. This app never stores text in the field
+// (the delegate returns NO for every change), so the field is always
+// empty and backspace silently did nothing. The subclass intercepts
+// deleteBackward and reports it, so one keypress sends exactly one
+// DEL (0x7F, the Linux console erase character).
+@interface TXTerminalInputField : UITextField
+@property (nonatomic, copy) void (^onDeleteBackward)(void);
+@end
+
+@implementation TXTerminalInputField
+- (void)deleteBackward {
+    // No [super deleteBackward]: the field is intentionally kept
+    // empty, so there is nothing for super to delete, and calling it
+    // would route through the delegate's backspace branch as well and
+    // send a second DEL for the same keypress.
+    if (self.onDeleteBackward) self.onDeleteBackward();
+}
+@end
+
 @implementation TerminalViewController {
     KernEngine *_engine;
     vt_t _vt;
     UITextView *_output;
-    UITextField *_input;
+    TXTerminalInputField *_input;
     UIButton *_ctrlButton;
     UIButton *_moreButton;
     UIButton *_fnButton;
@@ -149,7 +172,12 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [self.view addSubview:_output];
 
     // Hidden field that owns the software keyboard.
-    _input = [[UITextField alloc] init];
+    _input = [[TXTerminalInputField alloc] init];
+    __weak typeof(self) weakSelf = self;
+    _input.onDeleteBackward = ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) [strongSelf sendBackspace];
+    };
     _input.delegate = self;
     _input.autocorrectionType = UITextAutocorrectionTypeNo;
     _input.autocapitalizationType = UITextAutocapitalizationTypeNone;
@@ -349,6 +377,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 - (void)sendKeyData:(NSData *)data {
     [[UIDevice currentDevice] playInputClick];
     [_engine sendConsoleInput:data];
+}
+
+// Backspace: DEL (0x7F), the Linux console erase character. One
+// place for both callers: the deleteBackward override on the empty
+// field, and the delegate's backspace branch for the (currently
+// impossible) case where the field holds text.
+- (void)sendBackspace {
+    uint8_t backspace = 0x7F;
+    [_engine sendConsoleInput:[NSData dataWithBytes:&backspace length:1]];
 }
 
 - (void)addKey:(UIStackView *)row title:(NSString *)title bytes:(const char *)bytes length:(size_t)length {
@@ -668,8 +705,10 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     replacementString:(NSString *)string {
     (void)textField;
     if (string.length == 0 && range.length == 1) {
-        uint8_t backspace = 0x7F;
-        [_engine sendConsoleInput:[NSData dataWithBytes:&backspace length:1]];
+        // Delete with text in the field (only reachable if the field
+        // ever holds text; it is normally empty, so the deleteBackward
+        // override on TXTerminalInputField is the live path).
+        [self sendBackspace];
         return NO;
     }
     if (string.length == 0) return NO;
