@@ -8,6 +8,7 @@
 #import <dlfcn.h>
 #import <fcntl.h>
 #import <limits.h>
+#import <mach/mach.h>
 #import <stdlib.h>
 #import <string.h>
 #import <sys/stat.h>
@@ -52,6 +53,11 @@ static const uint64_t kDataDiskGiB = 8;
     __strong NSString* _guestDir;
     __strong NSString* _rootfsPath;
     BOOL _dataDiskReady;
+    // Footprint sampler (diagnostic): a GCD timer logging one memory
+    // line every 100 ms until the guest is Running or the run ends.
+    // Created in startMemorySampler, cancelled in stopMemorySampler;
+    // nil when not running. Guarded by @synchronized(self).
+    dispatch_source_t _samplerTimer;
 }
 // Readwrite here so the console callback and the boot/install paths
 // (which run outside the @implementation) can move the phase.
@@ -206,6 +212,12 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         } else {
             TXLogEngine(@"No previous session record");
         }
+        // Footprint sampler (diagnostic): from launch until the guest
+        // is Running (or the run ends), so the next log alone settles
+        // whether a kill is system-wide memory pressure. Stopped by
+        // setState: on Running/Stopped/Failed; a boot retry re-starts
+        // it from bootOnView:.
+        [self startMemorySampler];
     }
     return self;
 }
@@ -324,10 +336,91 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
                 TXStateName(self.state), TXFormatBytes(TXCurrentFootprintBytes()));
 }
 
+// Footprint sampler (diagnostic, 2026-11-22): the 08:00 runs on
+// 20ec5ad died ~1 s into boot at kernel ~0.2-0.3 s with no crash
+// record, at ~61 MiB footprint against ~4 GiB per-process jetsam
+// headroom — per-process-limit jetsam is ruled out, but system-wide
+// free memory was never measured, so vm-pageshortage (system-wide
+// memory pressure) is the leading hypothesis and the Analytics
+// JetsamEvent that would name it has not arrived. This sampler
+// makes the next engine.log alone settle it: one synchronously
+// flushed line every 100 ms from app launch until the guest is
+// Running (or the run ends), with the process footprint, the
+// per-process jetsam headroom, and system-wide free memory. If the
+// last lines show a small footprint and collapsing system free
+// memory, it is vm-pageshortage; if the footprint itself spikes, the
+// cause is app-side. Cheap by design: two syscalls and one log line
+// on a background queue, never touching the boot thread; a slow log
+// flush only delays the next sample.
+- (void)sampleMemoryOnce {
+    // Process footprint + per-process jetsam headroom.
+    task_vm_info_data_t vmInfo;
+    mach_msg_type_number_t vmCount = TASK_VM_INFO_COUNT;
+    unsigned long long footprint = 0, headroom = 0;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmInfo, &vmCount) == KERN_SUCCESS) {
+        footprint = (unsigned long long)vmInfo.phys_footprint;
+        headroom = (unsigned long long)vmInfo.limit_bytes_remaining;
+    }
+    // System-wide free memory: free + inactive pages. This is the
+    // number per-process headroom cannot see: vm-pageshortage kills
+    // the foreground app when the system runs out, even while this
+    // process is small.
+    unsigned long long sysFree = 0;
+    vm_statistics64_data_t hostInfo;
+    mach_msg_type_number_t hostCount = HOST_VM_INFO64_COUNT;
+    vm_size_t pageSize = 0;
+    if (host_page_size(mach_host_self(), &pageSize) == KERN_SUCCESS &&
+        host_statistics64(mach_host_self(), HOST_VM_INFO, (host_info_t)&hostInfo, &hostCount) == KERN_SUCCESS) {
+        sysFree = (unsigned long long)(hostInfo.free_count + hostInfo.inactive_count) * (unsigned long long)pageSize;
+    }
+    TXLogEngine(@"SAMPLER footprint=%@ (%llu B) headroom=%@ (%llu B) sysfree=%@ (%llu B)",
+                TXFormatBytes(footprint), footprint,
+                TXFormatBytes(headroom), headroom,
+                TXFormatBytes(sysFree), sysFree);
+    TXLogFlush(); // synchronously on disk: a kill a millisecond later must leave this line
+}
+
+- (void)startMemorySampler {
+    @synchronized (self) {
+        if (_samplerTimer) return; // already running (e.g. boot retry)
+        dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+        _samplerTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+        if (!_samplerTimer) return;
+        __weak KernEngine *weakSelf = self;
+        dispatch_source_set_event_handler(_samplerTimer, ^{
+            KernEngine *strongSelf = weakSelf;
+            if (strongSelf) [strongSelf sampleMemoryOnce];
+        });
+        dispatch_source_set_timer(_samplerTimer,
+                                  dispatch_time(DISPATCH_TIME_NOW, 0),
+                                  (uint64_t)(100 * NSEC_PER_MSEC),
+                                  (uint64_t)(10 * NSEC_PER_MSEC));
+        dispatch_resume(_samplerTimer);
+    }
+    TXLogEngine(@"SAMPLER started (100 ms)");
+}
+
+- (void)stopMemorySampler {
+    BOOL wasRunning = NO;
+    @synchronized (self) {
+        if (_samplerTimer) {
+            wasRunning = YES;
+            dispatch_source_cancel(_samplerTimer);
+            _samplerTimer = nil;
+        }
+    }
+    if (wasRunning) TXLogEngine(@"SAMPLER stopped");
+}
+
 - (void)setState:(TermXState)state {
     if (state == _state) return;
     _state = state;
     TXLogEngine(@"State: %@ — %@", TXStateName(state), self.statusText ?: @"");
+    // The sampler's job ends when the guest is up, stopped, or
+    // failed: a failed boot's retry re-starts it from bootOnView:.
+    if (state == TermXStateRunning || state == TermXStateStopped || state == TermXStateFailed) {
+        [self stopMemorySampler];
+    }
     [[NSNotificationCenter defaultCenter] postNotificationName:kTermXStateChanged object:nil];
     id<KernEngineDelegate> delegate = self.delegate;
     if (delegate) [delegate termXEngineDidChangeState:state status:self.statusText];
@@ -692,6 +785,7 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
 }
 
 - (void)bootOnView:(MTKView*)view {
+    [self startMemorySampler]; // a failed boot stopped it; the retry re-starts it
     NSString* loadError = nil;
     if (![self loadRuntimeWithError:&loadError]) {
         self.bootPhase = TXBootPhaseFailed;
@@ -856,6 +950,7 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
 }
 
 - (void)stopGuest {
+    [self stopMemorySampler]; // clean shutdown ends the sampling window
     // Stopping a download cancels it (the background session saves
     // resume data) and goes back to Idle; stopping a running guest
     // asks the runtime to stop it.
