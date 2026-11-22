@@ -125,7 +125,26 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _output.textContainer.size = CGSizeMake(10000, CGFLOAT_MAX);
     _output.textContainerInset = UIEdgeInsetsMake(6, 6, 6, 6);
     _output.autocorrectionType = UITextAutocorrectionTypeNo;
-    _output.attributedText = [[NSAttributedString alloc] initWithString:@"TermX\n"];
+    // The text view ends at the toolbar, and the toolbar already rides
+    // above the keyboard, so the keyboard never overlaps this view and
+    // it needs no bottom inset at all. A keyboard-height inset used to
+    // be set here in keyboardWillChange:, and it created ~346 pt of
+    // phantom scrollable padding below the real content: scroll-to-
+    // bottom then landed past the last line of text, and the terminal
+    // opened black until the user swiped down. The inset is gone; the
+    // toolbar constraint is what clears the keyboard. Never re-add it:
+    // every bottom computation (pinned check, scroll-to-bottom, flush
+    // restore) reads contentInset.bottom, so any inset here shifts the
+    // "bottom" past the text by exactly that amount.
+    _output.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    _output.contentInset = UIEdgeInsetsZero;
+    _output.scrollIndicatorInsets = UIEdgeInsetsZero;
+    // Explicit attributes: a bare string renders in the text view's
+    // default colour, which is black-on-black in dark mode.
+    _output.attributedText = [[NSAttributedString alloc] initWithString:@"TermX\n" attributes:@{
+        NSFontAttributeName: [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular],
+        NSForegroundColorAttributeName: [UIColor colorWithWhite:0.92 alpha:1.0],
+    }];
     _output.delegate = self; // scrollViewDidScroll: drives the jump-to-bottom button
     [self.view addSubview:_output];
 
@@ -301,6 +320,19 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [_output addGestureRecognizer:exitPan];
 
     [self termXEngineDidChangeState:_engine.state status:_engine.statusText];
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    // First render with final geometry: the 60 ms timer will flush
+    // anyway, but this guarantees the view starts pinned to the live
+    // line (not to a stale offset from before layout) the moment it
+    // is on screen. Harmless when nothing has arrived yet: the flush
+    // returns early while the VT is clean and scroll-to-bottom is a
+    // no-op on short content.
+    [self.view layoutIfNeeded];
+    [self flushTerminal];
+    if ([self isPinnedToBottom]) [self scrollToBottomAnimated:NO];
 }
 
 - (UIButton *)keyButton:(NSString *)title {
@@ -578,10 +610,12 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 }
 
 // Pinned means the last visible line is the live one: the bottom of
-// the content (including the keyboard inset) is within one line of
-// the bottom of the view. The old check ignored contentInset.bottom,
-// so with the keyboard up its "at bottom" band was ~324 pt wide and
-// almost every position counted as pinned.
+// the content is within one line of the bottom of the view.
+// contentInset.bottom is zero by design (the toolbar clears the
+// keyboard, so the text view takes no inset — see viewDidLoad), and
+// this check reads it, so if an inset ever comes back the "bottom"
+// moves past the text by exactly that amount and the terminal opens
+// black. Keep it zero.
 - (BOOL)isPinnedToBottom {
     CGFloat bottomOffset = _output.contentSize.height + _output.contentInset.bottom - _output.bounds.size.height;
     if (bottomOffset <= 0) return YES;
@@ -670,17 +704,18 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 #pragma mark - Keyboard
 
 - (void)keyboardWillChange:(NSNotification *)note {
-    // Capture the pinned state before the inset changes: the
+    // Capture the pinned state before the layout changes: the
     // keyboard showing or hiding must not move a user who scrolled
     // up into the scrollback, and must keep a pinned user on the
-    // live line as the inset moves.
+    // live line as the toolbar moves. The text view itself takes no
+    // bottom inset — it ends at the toolbar, which already rides
+    // above the keyboard (see viewDidLoad); an inset here would only
+    // add phantom scrollable padding below the text.
     BOOL wasPinned = [self isPinnedToBottom];
     CGRect end = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
     CGRect inView = [self.view convertRect:end fromView:nil];
     CGFloat height = MAX(0, self.view.bounds.size.height - inView.origin.y);
     _toolbarBottom.constant = -4 - height;
-    _output.contentInset = UIEdgeInsetsMake(0, 0, height, 0);
-    _output.scrollIndicatorInsets = _output.contentInset;
     NSTimeInterval duration = [note.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
     [UIView animateWithDuration:duration animations:^{
         [self.view layoutIfNeeded];
