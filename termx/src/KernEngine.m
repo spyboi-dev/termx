@@ -14,9 +14,23 @@
 
 NSString* const kTermXStateChanged = @"TermXStateChanged";
 
-// The Linux guest: 1024 MiB RAM and 2 vCPUs are plenty for a shell, and
-// leave the process headroom the runtime's GPU budget wants.
-static const uint32_t kGuestMemoryMiB = 1024;
+// Build marker: the short commit this IPA was built from, passed by
+// build.sh as -DTERMX_BUILD_COMMIT="..."; logged at every launch so a
+// device log always identifies its build (the 2bbe39f crash logs had
+// no version marker, which cost a diagnosis cycle).
+#ifndef TERMX_BUILD_COMMIT
+#define TERMX_BUILD_COMMIT "nogit"
+#endif
+
+// The Linux guest: 512 MiB RAM and 2 vCPUs are plenty for a shell, and
+// leave the process headroom the runtime's GPU budget wants. 1024 MiB
+// was killed by jetsam twice in a row on device (2026-11-22, build
+// 2bbe39f): both runs died ~1 s into boot, at different kernel times,
+// with no crash record — SIGKILL while the 1 GiB of guest RAM was
+// being wired ("committed on demand and wired"). 512 MiB is the
+// runtime's minimum (pre-flight: min 512, step 64) and halves the
+// wired memory jetsam counts.
+static const uint32_t kGuestMemoryMiB = 512;
 static const uint32_t kGuestCPUs = 2;
 // The guest's persistent data disk, in GiB: one sparse file at a fixed
 // path (see dataDiskPath), created once and reused on every boot, so
@@ -169,6 +183,11 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
             _state = TermXStateReady;
             _statusText = @"Guest ready — starting the engine…";
         }
+        // Build marker, every launch: the commit this IPA was built
+        // from plus the guest RAM, so a device log always identifies
+        // its build. Runs right after the "--- App launch ---" marker.
+        TXLogEngine(@"TermX build %s · guest %u MiB RAM · %u vCPUs",
+                    TERMX_BUILD_COMMIT, kGuestMemoryMiB, kGuestCPUs);
         TXLogEngine(@"TermX engine init: state %@, guest %@",
                     TXStateName(_state), installed ? @"installed" : @"not installed");
         // The runtime records how the last guest's session ended in

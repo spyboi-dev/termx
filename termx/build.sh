@@ -64,7 +64,10 @@ rm -rf "$OUT"
 mkdir -p "$APP/Frameworks"
 
 CLANG=clang-18
-CFLAGS="-target arm64-apple-ios$MIN -isysroot $SDK -miphoneos-version-min=$MIN -fobjc-arc -O2 -Wno-deprecated-declarations -I$SRC -F$SDK/System/Library/SubFrameworks -F$SDK/System/Library/PrivateFrameworks"
+# The build marker in engine.log: the short commit of the source this
+# IPA was built from, so a device log always identifies its build.
+COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
+CFLAGS="-target arm64-apple-ios$MIN -isysroot $SDK -miphoneos-version-min=$MIN -fobjc-arc -O2 -Wno-deprecated-declarations -DTERMX_BUILD_COMMIT=\"$COMMIT\" -I$SRC -F$SDK/System/Library/SubFrameworks -F$SDK/System/Library/PrivateFrameworks"
 
 echo "== compile"
 for f in main AppDelegate TerminalViewController KernEngine GuestInstall TXCrashLog TXLog TXLogViewController TXStartupViewController; do
