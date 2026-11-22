@@ -252,7 +252,11 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
     }
     NSString* binaryPath = [frameworkPath stringByAppendingPathComponent:@"KRuntime_6_18_4K"];
     TXLogEngine(@"Loading runtime framework (dlopen): %@", binaryPath);
-    _runtimeHandle = dlopen(binaryPath.UTF8String, RTLD_NOW | RTLD_LOCAL);
+    // RTLD_GLOBAL, not RTLD_LOCAL: the kernel's ELF loader resolves
+    // its Darwin imports through dlsym(RTLD_DEFAULT), so the
+    // framework's symbols (e.g. darwin_uml_guest_shutdown) must be
+    // globally visible or the guest exits with status 126.
+    _runtimeHandle = dlopen(binaryPath.UTF8String, RTLD_NOW | RTLD_GLOBAL);
     if (!_runtimeHandle) {
         const char* why = dlerror();
         TXLogEngine(@"dlopen failed: %s", why ?: "?");
