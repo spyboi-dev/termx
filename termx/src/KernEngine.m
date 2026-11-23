@@ -101,18 +101,16 @@ static const uint64_t kDataDiskGiB = 32;
 @property (nonatomic, strong) NSMutableData *consoleBuffer;
 @end
 
-// A/B revert (2026-11-22): the console ring buffer is compiled OUT.
-// The 378db9b sampler ruled memory out (footprint 248 MiB and rising,
-// headroom 3.8 GiB, system free 1.9 GiB stable at death), and the terminal
-// theory is dead (every failing run dies at kernel 0.12-0.47 s, before the
-// terminal ever presents). The ONLY 2bbe39f code running in that window is
-// the ring-buffer append below, audited safe three times but never
-// A/B-tested. Set this to 1 to restore the buffer; 0 leaves
-// bufferedConsoleOutput always empty, which the terminal replay
-// (TerminalViewController viewDidLoad) already handles via its
-// `if (backlog.length)` guard. Guest.log and the delegate callback are
-// untouched, so the terminal still works once the guest reaches the shell.
-#define TERMX_RING_BUFFER_AB 0
+// A/B revert (2026-11-22): the console ring buffer was compiled OUT
+// while the second-launch crash was being chased. The crash turned
+// out to be the /init mkdir bug (fixed in 6ae75e2), not this buffer,
+// which was audited safe three times. Re-enabled 2026-11-23: with it
+// off, bufferedConsoleOutput is always empty, so the terminal replay
+// has nothing to show and the terminal opens on a bare placeholder
+// instead of the boot log and the login prompt. Set this to 0 to turn
+// the buffer off again; 1 keeps the most recent 128 KiB of console
+// output for the replay.
+#define TERMX_RING_BUFFER_AB 1
 
 // The console replay buffer keeps the most recent output (the boot
 // log and the login prompt are ~10-20 KiB); older bytes are dropped

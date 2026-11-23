@@ -245,10 +245,12 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _output.contentInset = UIEdgeInsetsZero;
     _output.scrollIndicatorInsets = UIEdgeInsetsZero;
     // Explicit attributes: a bare string renders in the text view's
-    // default colour, which is black-on-black in dark mode. The
-    // placeholder uses the same font and foreground as the flush
-    // renderer, so it can never drift into an unreadable colour.
-    _output.attributedText = [[NSAttributedString alloc] initWithString:@"TermX\n" attributes:@{
+    // default colour, which is black-on-black in dark mode. The view
+    // starts empty: the replay in viewDidLoad feeds the boot log and
+    // the prompt into the VT, and the flush renders it within 60 ms.
+    // It used to start with a "TermX" placeholder line, which read
+    // as the terminal showing the app name instead of a prompt.
+    _output.attributedText = [[NSAttributedString alloc] initWithString:@"" attributes:@{
         NSFontAttributeName: TXTermFont(),
         NSForegroundColorAttributeName: TXThemeForegroundColor(),
         NSParagraphStyleAttributeName: TXTermParagraphStyle(),
@@ -899,7 +901,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     BOOL wasPinned = [self isPinnedToBottom];
     CGRect end = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
     CGRect inView = [self.view convertRect:end fromView:nil];
-    CGFloat height = MAX(0, self.view.bounds.size.height - inView.origin.y);
+    // The toolbar is anchored to the safe-area bottom, but the
+    // keyboard frame runs to the screen bottom (it covers the home
+    // indicator). Counting the full keyboard height against the safe
+    // area leaves a ~34 pt gap between the toolbar and the keyboard.
+    // Count only the part of the keyboard above the safe-area bottom.
+    CGFloat safeBottom = self.view.bounds.size.height - self.view.safeAreaInsets.bottom;
+    CGFloat height = MAX(0, safeBottom - inView.origin.y);
     _toolbarBottom.constant = -4 - height;
     NSTimeInterval duration = [note.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
     [UIView animateWithDuration:duration animations:^{
