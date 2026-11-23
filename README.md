@@ -11,7 +11,7 @@ TermX is a Linux terminal for iPhone. It runs Debian on Kernarium's native Linux
 
 ## Guest
 
-Debian trixie arm64, boots straight to a shell as user `termx` (passwordless sudo). Standard Debian repos are enabled. The image is slim (171 packages); install Python, Node.js, and Docker with `apt`.
+Debian trixie arm64, boots straight to a shell as user `termx` (passwordless sudo). Standard Debian repos are enabled. The image is slim (171 packages); install Python, Node.js, and Docker with `apt`. Docker runs: `sudo docker run --rm hello-world` pulls the arm64 image and prints "Hello from Docker!".
 
 Guest image:
 [termx-debian-trixie-arm64-slim.ext4.gz](https://github.com/spyboi-dev/termx/releases/download/rootfs-20261123-slim-fix2/termx-debian-trixie-arm64-slim.ext4.gz)
@@ -45,7 +45,6 @@ The guest boots from a read-only system image, with a persistent data disk on to
 ## Limitations
 
 - Device info is incomplete: fastfetch reports the CPU as Unknown and the host as Virtual Machine, because the guest kernel does not know it runs on an Apple A16.
-- Docker has not been run in this runtime yet.
 - The app must stay in the foreground; iOS can suspend it, and the guest stops with the app.
 - Sideload only. A free Apple ID certificate expires after 7 days and must be refreshed.
 
