@@ -10,9 +10,7 @@ TermX is the first to combine a real Linux kernel with Debian and a terminal-fir
 
 - Debian trixie (arm64) with `apt`
 - Python, Node.js, git, and whatever you `apt install`
-- A persistent disk, so installs survive reboots
-- 2 GiB RAM, 32 GiB disk
-- A terminal with a key row, paste, long-press paste, and separate arrow keys
+- systemd as init
 
 ## Guest
 
