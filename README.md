@@ -4,7 +4,7 @@
 
 A real Linux terminal for iPhone, based on the native Linux kernel by Kernarium.
 
-TermX runs a Debian system on the phone. You get a shell, `apt`, and a persistent disk. Everything runs on-device.
+TermX is the first to combine a real Linux kernel with Debian and a terminal-first design on iOS. The kernel is Kernarium's native Linux kernel (mainline 6.18); TermX builds the terminal and the Debian system around it. Everything runs on-device.
 
 ## Features
 
@@ -45,7 +45,7 @@ fastfetch
 
 ## How it works
 
-TermX is based on the native Linux kernel by Kernarium (mainline 6.18). The guest is a Debian image with systemd, booted from a read-only system image with a persistent data disk on top. The UI is a native iOS terminal.
+The guest is a Debian image with systemd, booted from a read-only system image with a persistent data disk on top. The UI is a native iOS terminal.
 
 ## Limitations
 
