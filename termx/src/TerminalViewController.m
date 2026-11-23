@@ -22,13 +22,13 @@
 // edge — only when already at the very top of the scrollback — returns
 // to it.
 //
-// The look is the shared TXTheme: a refined dark background (#0D1117,
-// not pure black) with soft-white text, one 14 pt monospace font used
-// by the text view, the placeholder, and the flush renderer alike, and
-// the app teal accent on the jump-to-bottom control. xterm black as a
-// foreground renders as a dim grey (pure black text is invisible on a
-// dark background); as a background it is the theme background, so
-// black cells blend in instead of reading as holes.
+// The look is the shared TXTheme: a pure black background with
+// soft-white text, one 14 pt monospace font used by the text view, the
+// placeholder, and the flush renderer alike, and the app teal accent
+// on the jump-to-bottom control. xterm black as a foreground renders
+// as a dim grey (pure black text is invisible on a black background);
+// as a background it is pure black, so black cells blend in instead
+// of reading as holes.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "TerminalViewController.h"
 
@@ -41,13 +41,13 @@
 
 // xterm 256-colour palette: 0-15 the standard colours, 16-231 the 6x6x6
 // cube (levels 0, 95, 135, 175, 215, 255), 232-255 the grey ramp.
-// Colour 0 is the theme background, not pure black: a cell with a
-// black background must blend into the screen, not read as a hole.
+// Colour 0 is pure black, the theme background: a cell with a black
+// background must blend into the screen, not read as a hole.
 // (Colour 0 as a foreground is handled in colorForCell, which renders
-// it as a dim grey — pure black text is invisible on a dark screen.)
+// it as a dim grey — pure black text is invisible on a black screen.)
 static UIColor *XTermColor(int index) {
     static const uint8_t base[16][3] = {
-        {0x0D,0x11,0x17}, {205,0,0}, {0,205,0}, {205,205,0},
+        {0,0,0}, {205,0,0}, {0,205,0}, {205,205,0},
         {0,0,238}, {205,0,205}, {0,205,205}, {229,229,229},
         {127,127,127}, {255,0,0}, {0,255,0}, {255,255,0},
         {92,92,255}, {255,0,255}, {0,255,255}, {255,255,255}
@@ -530,6 +530,24 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     }
 }
 
+// Visible terminal width in characters: the text view's width minus
+// the text container insets, divided by the advance of one monospace
+// character at the terminal font. The guest lays out for 80 columns
+// by default, but only ~48 are visible on a 430 pt screen, so long
+// lines are cut at the right edge. The boot clear below sends this to
+// the guest with `stty cols`, so programs wrap at the edge instead of
+// being cut. Clamped to a sane range; 80 when the width is unknown.
+- (NSInteger)visibleColumns {
+    CGFloat width = _output.bounds.size.width - (_output.textContainerInset.left + _output.textContainerInset.right);
+    if (width <= 0) return 80;
+    CGFloat advance = [@"M" sizeWithAttributes:@{NSFontAttributeName: TXTermFont()}].width;
+    if (advance <= 0) return 80;
+    NSInteger cols = (NSInteger)floor(width / advance);
+    if (cols < 20) cols = 20;
+    if (cols > 200) cols = 200;
+    return cols;
+}
+
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     // Clear on boot, once: if the startup screen asked for it, wipe
@@ -541,16 +559,35 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // later never wipes scrollback.
     if (self.clearScreenOnBoot && !_didClearScreenOnBoot) {
         _didClearScreenOnBoot = YES;
-        // ED 2 through the parser: the same clear the `clear` command
-        // uses, so it empties both the visible grid and the scrollback
-        // (and homes the cursor). Feeding it here reuses that path
-        // instead of duplicating the clear.
+        // Tell the guest the visible width first: it lays out for 80
+        // columns by default, but only ~48 are visible, so long lines
+        // are cut at the right edge. `stty cols` sets the tty winsize,
+        // so programs wrap at the edge instead of being cut. The
+        // command is sent as input (bash runs it); its echo is wiped
+        // by the second clear below, so the user never sees it.
+        NSInteger cols = [self visibleColumns];
+        NSString *stty = [NSString stringWithFormat:@"stty cols %ld\n", (long)cols];
+        [_engine sendConsoleInput:[stty dataUsingEncoding:NSUTF8StringEncoding]];
+        // ED 2 through the parser now: the same clear the `clear`
+        // command uses, so it empties both the visible grid and the
+        // scrollback (and homes the cursor), and the boot log is gone
+        // at once instead of flashing for the delay below.
         static const uint8_t ed2[] = { 0x1B, '[', '2', 'J' };
         vt_feed(&_vt, ed2, sizeof(ed2));
-        // Ask the guest for a fresh prompt on the clean screen: bash
-        // prints a new prompt for the newline.
-        uint8_t nl = '\n';
-        [_engine sendConsoleInput:[NSData dataWithBytes:&nl length:1]];
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            // Second clear: wipes the `stty cols` echo, which lands
+            // after the first clear (bash echoes input as it runs).
+            // 0.3 s is plenty for a local guest to echo; without this
+            // the command would sit on the clean screen.
+            vt_feed(&strongSelf->_vt, ed2, sizeof(ed2));
+            // Ask the guest for a fresh prompt on the clean screen:
+            // bash prints a new prompt for the newline.
+            uint8_t nl = '\n';
+            [strongSelf->_engine sendConsoleInput:[NSData dataWithBytes:&nl length:1]];
+        });
     }
     // First render with final geometry: the 60 ms timer will flush
     // anyway, but this guarantees the view starts pinned to the live

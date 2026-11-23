@@ -5,20 +5,19 @@
 // black with a different text white, and the placeholder once rendered
 // black-on-black because it used the text view's default colour).
 //
-// The theme is a refined dark, not pure black: #0D1117 background with
-// #E6EDF3 text. Pure black next to near-white is harsh and makes the
-// xterm black cells read as holes; the dark blue-grey keeps the
-// contrast while the screen feels calm. The accent is the Andarium
-// teal already used on the startup screen, so the terminal's
-// jump-to-bottom control and the startup checks share one colour.
+// The theme is pure black: #000000 background with #E6EDF3 text, at
+// the user's direction (he asked for a black background, 2026-11-23).
+// xterm black as a foreground still renders as a dim grey, and colour
+// 0 in the palette is pure black too, so black-background cells blend
+// into the screen instead of reading as holes.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import <UIKit/UIKit.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
-// App background: every full-screen view.
+// App background: every full-screen view. Pure black.
 static inline UIColor *TXThemeBackgroundColor(void) {
-    return [UIColor colorWithRed:0x0D / 255.0 green:0x11 / 255.0 blue:0x17 / 255.0 alpha:1.0];
+    return [UIColor blackColor];
 }
 
 // Default terminal / log text: soft white, never pure white.
