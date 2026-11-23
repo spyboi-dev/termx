@@ -4,17 +4,17 @@
 
 A real Linux terminal for iPhone, based on the native Linux kernel by Kernarium.
 
-TermX is the first to combine a real Linux kernel with Debian and a terminal-first design on iOS. The kernel is Kernarium's native Linux kernel (mainline 6.18); TermX builds the terminal and the Debian system around it. Everything runs on-device.
+TermX is the first to combine a real Linux kernel with Debian and a terminal-first design on iOS. The kernel is Kernarium's native Linux kernel (mainline 6.18); TermX builds the terminal and the Debian system around it.
 
 ## Features
 
 - Debian trixie (arm64) with `apt`
-- Python, Node.js, git, and whatever you `apt install`
+- Install anything from the Debian archive
 - systemd as init
 
 ## Guest
 
-Debian trixie arm64, boots straight to a shell as user `termx` (passwordless sudo). Standard Debian repos are enabled, so `apt install` works. The image is slim (171 packages); Python, Node.js, and Docker are not baked in, install them with `apt` when you need them.
+Debian trixie arm64, boots straight to a shell as user `termx` (passwordless sudo). Standard Debian repos are enabled. The image is slim (171 packages); install Python, Node.js, and Docker with `apt` when you need them.
 
 Guest image:
 [termx-debian-trixie-arm64-slim.ext4.gz](https://github.com/spyboi-dev/termx/releases/download/rootfs-20261123-slim-fix2/termx-debian-trixie-arm64-slim.ext4.gz)
@@ -43,18 +43,18 @@ fastfetch
 
 ## How it works
 
-The guest is a Debian image with systemd, booted from a read-only system image with a persistent data disk on top. The UI is a native iOS terminal.
+The guest boots from a read-only system image, with a persistent data disk on top. The UI is a native iOS terminal.
 
 ## Limitations
 
 - Device info is incomplete: fastfetch reports the CPU as Unknown and the host as Virtual Machine, because the guest kernel does not know it runs on an Apple A16.
-- Docker is config-plausible but has not been run in this runtime yet.
+- Docker has not been run in this runtime yet.
 - The app must stay in the foreground; iOS can suspend it, and the guest stops with the app.
 - Sideload only. A free Apple ID certificate expires after 7 days and must be refreshed.
 
 ## Build from source
 
-Build on Linux with clang-18 and ld64.lld-18 against the iOS 26.5 SDK. The Linux runtime framework `KRuntime_6_18_4K` has to be built on a Mac first, because upstream Kernarium refuses non-Apple hosts.
+Build on Linux with clang-18 and ld64.lld-18 against the iOS 26.5 SDK. The runtime framework `KRuntime_6_18_4K` must be built on a Mac first; upstream Kernarium only builds on Apple hosts.
 
 ```sh
 git clone https://github.com/imxieyi/Kernarium
