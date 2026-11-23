@@ -2,7 +2,7 @@
 
 [![License: GPL v2](https://img.shields.io/badge/License-GPL_v2-blue.svg)](LICENSE-GPL-2.0)
 
-TermX is a Linux terminal for iPhone. It runs Debian on Kernarium's native Linux kernel (mainline 6.18), with a terminal-first interface.
+TermX is a Linux terminal for iPhone. It runs Debian on Kernarium's native Linux kernel (mainline 6.18).
 
 ## Features
 
