@@ -42,6 +42,13 @@ static void vt_clear_grid(vt_t *vt) {
         for (int c = 0; c < VT_COLS; c++) vt_blank_cell(vt, r, c);
 }
 
+/* Free every scrollback line and forget them, keeping the allocated
+ * array so the next scroll does not reallocate from scratch. */
+static void vt_clear_scrollback(vt_t *vt) {
+    for (int i = 0; i < vt->scrollback_count; i++) free(vt->scrollback[i]);
+    vt->scrollback_count = 0;
+}
+
 static void vt_put_cell(vt_t *vt, int row, int col, uint32_t ch) {
     if (row < 0 || row >= VT_ROWS || col < 0 || col >= VT_COLS) return;
     vt->grid[row][col].ch = ch;
@@ -148,13 +155,27 @@ static void vt_csi(vt_t *vt, uint8_t final) {
         break;
     case 'J':
         n = vt_param(vt, 0, 0);
-        if (n == 2 || n == 3) {
-            vt_clear_grid(vt);
-            vt->cx = 0; vt->cy = 0;
-        } else if (n == 0) {
+        if (n == 0) {
             for (int i = vt->cx; i < VT_COLS; i++) vt_blank_cell(vt, vt->cy, i);
             for (int i = vt->cy + 1; i < VT_ROWS; i++)
                 for (int j = 0; j < VT_COLS; j++) vt_blank_cell(vt, i, j);
+        } else if (n == 1) {
+            /* From the start of the screen to the cursor, inclusive. */
+            for (int i = 0; i <= vt->cx; i++) vt_blank_cell(vt, vt->cy, i);
+            for (int i = 0; i < vt->cy; i++)
+                for (int j = 0; j < VT_COLS; j++) vt_blank_cell(vt, i, j);
+        } else if (n == 2) {
+            /* Whole visible screen, cursor home — and the scrollback
+             * too. This terminal renders scrollback inline above the
+             * grid in the same text view, so leaving it would keep
+             * the old output on screen after a clear (the `clear`
+             * command sends ESC[H ESC[2J). */
+            vt_clear_grid(vt);
+            vt_clear_scrollback(vt);
+            vt->cx = 0; vt->cy = 0;
+        } else if (n == 3) {
+            /* xterm extension: clear the scrollback only. */
+            vt_clear_scrollback(vt);
         }
         break;
     case 'K':
@@ -251,7 +272,7 @@ void vt_feed(vt_t *vt, const uint8_t *bytes, size_t len) {
                 P.state = VT_CHARSET;
             } else if (b == '7') { vt->saved_cx = vt->cx; vt->saved_cy = vt->cy; P.state = VT_GROUND; }
             else if (b == '8') { vt->cx = vt->saved_cx; vt->cy = vt->saved_cy; P.state = VT_GROUND; }
-            else if (b == 'c') { vt_clear_grid(vt); P.cur_fg = -1; P.cur_bg = -1; P.cur_bold = 0; vt->cx = 0; vt->cy = 0; vt->dirty = 1; P.state = VT_GROUND; }
+            else if (b == 'c') { vt_clear_grid(vt); vt_clear_scrollback(vt); P.cur_fg = -1; P.cur_bg = -1; P.cur_bold = 0; vt->cx = 0; vt->cy = 0; vt->dirty = 1; P.state = VT_GROUND; }
             else if (b == '=' || b == '>') { P.state = VT_GROUND; }
             else { P.state = VT_GROUND; }
             break;
