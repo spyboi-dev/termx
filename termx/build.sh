@@ -1,8 +1,6 @@
 #!/bin/bash
 # TermX build: Objective-C UIKit app on the Kernarium Linux runtime, built
-# on Linux with clang-18 + ld64.lld-18 against the iOS 26.5 SDK, the same
-# way SPYTube native and CrateTerm are built (see
-# ~/workspace/spytube-ios/native/build26.sh).
+# on Linux with clang-18 + ld64.lld-18 against the iOS 26.5 SDK.
 #
 # The runtime is NOT compiled here: upstream's CMake refuses non-Apple
 # hosts and the whole chain needs Xcode. The app dlopen()s the Linux

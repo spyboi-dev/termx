@@ -2,11 +2,7 @@
 
 <img src="icon.png" width="128" alt="TermX icon">
 
-A real Linux terminal for iPhone. No jailbreak, no server. A Debian system runs on your phone, and you get a shell.
-
-## What it is
-
-TermX runs a real Debian Linux guest on iOS. The guest is a full system: `apt`, Python, Node.js, git, and anything else you install. It is not a remote shell and not an emulator front end. The Linux kernel runs on the phone itself.
+TermX is a Linux terminal for iPhone. It runs a Debian system on the phone, with a shell, `apt`, and a persistent disk.
 
 ## What you get
 
@@ -22,17 +18,15 @@ The Linux kernel is mainline 6.18, running as a User-mode Linux guest through th
 
 ## Status
 
-In development. Not stable yet, and there is no release. Expect rough edges.
+In development. No release yet.
 
 ## Install
 
 Sideload the IPA with SideStore, AltStore, or LiveContainer. You need a developer certificate or a sideloading setup. iOS 27 or later.
 
-No release is published yet. Builds are shared as development IPAs while the app is stabilizing.
-
 ## Build
 
-The app is built on Linux with clang-18 and ld64.lld-18 against the iOS 26.5 SDK. The runtime framework is not built here: upstream Kernarium refuses non-Apple hosts, so the Linux framework `KRuntime_6_18_4K` has to be built on a Mac first.
+Build on Linux with clang-18 and ld64.lld-18 against the iOS 26.5 SDK. The Linux runtime framework `KRuntime_6_18_4K` has to be built on a Mac first, because upstream Kernarium refuses non-Apple hosts.
 
 ```sh
 git clone https://github.com/imxieyi/Kernarium
