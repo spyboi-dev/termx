@@ -7,12 +7,11 @@ TermX is a Linux terminal for iPhone. It runs Debian on Kernarium's native Linux
 ## Features
 
 - Debian trixie (arm64) with `apt`
-- Install anything from the Debian archive
 - systemd as init
 
 ## Guest
 
-Debian trixie arm64, boots straight to a shell as user `termx` (passwordless sudo). Standard Debian repos are enabled. The image is slim (171 packages); install Python, Node.js, and Docker with `apt` when you need them.
+Debian trixie arm64, boots straight to a shell as user `termx` (passwordless sudo). Standard Debian repos are enabled. The image is slim (171 packages); install Python, Node.js, and Docker with `apt`.
 
 Guest image:
 [termx-debian-trixie-arm64-slim.ext4.gz](https://github.com/spyboi-dev/termx/releases/download/rootfs-20261123-slim-fix2/termx-debian-trixie-arm64-slim.ext4.gz)
@@ -72,6 +71,5 @@ That produces `build/TermX.ipa`, an ad-hoc signed IPA. Your installer re-signs t
 
 GPL-2.0-or-later (`LICENSE-GPL-2.0`). TermX derives from
 [imxieyi/Kernarium](https://github.com/imxieyi/Kernarium) (GPL-2.0).
-Embedding the GPL runtime makes TermX a GPL-2.0-or-later derivative:
-source travels with it. See `PORT-NOTE.md` for the full derivation story.
+Embedding the GPL runtime makes TermX a GPL-2.0-or-later derivative, and the source is included. See `PORT-NOTE.md` for the derivation.
 Terminal UI notices are in `NOTICES-NEWTERM.md`.
