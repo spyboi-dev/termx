@@ -4,13 +4,15 @@
 #import "KernEngine.h"
 #import "TXLog.h"
 #import "TXLogViewController.h"
+#import "TXTheme.h"
 #import "TerminalViewController.h"
 #import <MetalKit/MetalKit.h>
 
 // Andarium's teal, as in the screenshot: the dot, the "Starting"
-// text, the in-progress detail, and the done check circles.
+// text, the in-progress detail, and the done check circles. It is
+// the app accent (TXThemeAccentColor), shared with the terminal.
 static UIColor *TXStartupTeal(void) {
-    return [UIColor colorWithRed:0x2A / 255.0 green:0xB3 / 255.0 blue:0xA3 / 255.0 alpha:1.0];
+    return TXThemeAccentColor();
 }
 
 typedef NS_ENUM(NSInteger, TXStartupRowState) {
@@ -60,7 +62,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor blackColor];
+    self.view.backgroundColor = TXThemeBackgroundColor();
     self.startTime = [NSDate date];
     self.rowIcons = [NSMutableArray array];
     self.rowChecks = [NSMutableArray array];
@@ -207,7 +209,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     UIScrollView *scroll = [[UIScrollView alloc] init];
     scroll.translatesAutoresizingMaskIntoConstraints = NO;
     // Opaque: the guest framebuffer behind this screen is never seen.
-    scroll.backgroundColor = [UIColor blackColor];
+    scroll.backgroundColor = TXThemeBackgroundColor();
     [self.view addSubview:scroll];
     [scroll addSubview:stack];
     [NSLayoutConstraint activateConstraints:@[
@@ -506,7 +508,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     if (failed && failedStep == TXBootStepStartup) {
         [self setRow:TXBootStepStartup state:TXStartupRowFailed detail:status];
     } else if (engine.state == TermXStateRunning) {
-        [self setRow:TXBootStepStartup state:TXStartupRowDone detail:@"Shell ready · logged in as termux"];
+        [self setRow:TXBootStepStartup state:TXStartupRowDone detail:@"Shell ready · logged in as termx"];
     } else if (engine.state == TermXStateBooting) {
         // The live phase, in teal: "Starts services" once init is
         // running, the engine status before that.

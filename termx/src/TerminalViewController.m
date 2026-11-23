@@ -2,9 +2,9 @@
 //
 // The terminal screen follows NewTerm 3's model (hbang/NewTerm, Apache-2.0):
 // a scrolling line-based terminal, 80x25, xterm-256color, system monospace
-// font, black background, and the keyboard toolbar above the software
-// keyboard: Ctrl (toggle), Esc, Tab, More (toggle) and butterfly arrows on
-// the primary row; Home, End, PgUp, PgDn, Del and Fn (toggle) on the
+// font, and the keyboard toolbar above the software keyboard: Ctrl
+// (toggle), Esc, Tab, More (toggle), Paste, and butterfly arrows on the
+// primary row; Home, End, PgUp, PgDn, Del and Fn (toggle) on the
 // secondary row; F1-F12 on a horizontally scrolling Fn row. The VT
 // emulation is our own vt.c (NewTerm uses SwiftTerm, which is Swift and
 // cannot build here); the key bytes match NewTerm's TerminalConstants
@@ -21,10 +21,19 @@
 // startup screen is the control centre, and a swipe down from the top
 // edge — only when already at the very top of the scrollback — returns
 // to it.
+//
+// The look is the shared TXTheme: a refined dark background (#0D1117,
+// not pure black) with soft-white text, one 14 pt monospace font used
+// by the text view, the placeholder, and the flush renderer alike, and
+// the app teal accent on the jump-to-bottom control. xterm black as a
+// foreground renders as a dim grey (pure black text is invisible on a
+// dark background); as a background it is the theme background, so
+// black cells blend in instead of reading as holes.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "TerminalViewController.h"
 
 #import "KernEngine.h"
+#import "TXTheme.h"
 #import "vt.h"
 
 @interface TerminalViewController () <KernEngineDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate>
@@ -32,9 +41,13 @@
 
 // xterm 256-colour palette: 0-15 the standard colours, 16-231 the 6x6x6
 // cube (levels 0, 95, 135, 175, 215, 255), 232-255 the grey ramp.
+// Colour 0 is the theme background, not pure black: a cell with a
+// black background must blend into the screen, not read as a hole.
+// (Colour 0 as a foreground is handled in colorForCell, which renders
+// it as a dim grey — pure black text is invisible on a dark screen.)
 static UIColor *XTermColor(int index) {
     static const uint8_t base[16][3] = {
-        {0,0,0}, {205,0,0}, {0,205,0}, {205,205,0},
+        {0x0D,0x11,0x17}, {205,0,0}, {0,205,0}, {205,205,0},
         {0,0,238}, {205,0,205}, {0,205,205}, {229,229,229},
         {127,127,127}, {255,0,0}, {0,255,0}, {255,255,0},
         {92,92,255}, {255,0,255}, {0,255,255}, {255,255,255}
@@ -50,6 +63,22 @@ static UIColor *XTermColor(int index) {
         r = g = b = (uint8_t)(8 + (index - 232) * 10);
     }
     return [UIColor colorWithRed:r / 255.0 green:g / 255.0 blue:b / 255.0 alpha:1.0];
+}
+
+// The one paragraph style for terminal text: 2 pt of line spacing so
+// dense shell output breathes. It is built once and shared by the
+// scrollback attributes and every grid run — a spacing set in only
+// one place would make the two halves of the screen sit on different
+// baselines.
+static NSParagraphStyle *TXTermParagraphStyle(void) {
+    static NSParagraphStyle *style = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableParagraphStyle *para = [[NSMutableParagraphStyle alloc] init];
+        para.lineSpacing = 2;
+        style = [para copy];
+    });
+    return style;
 }
 
 static const uint8_t kFnBytes[12][6] = {
@@ -106,7 +135,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor blackColor];
+    self.view.backgroundColor = TXThemeBackgroundColor();
     vt_init(&_vt);
 
     _engine = [KernEngine shared];
@@ -134,16 +163,17 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         }
     }
 
-    // The terminal itself: NewTerm's defaults — black, #f2f2f2 text,
-    // system monospace. Lines never wrap: the text container is wider
-    // than the screen, so long lines scroll horizontally. It starts
-    // at the top of the screen: there is no bar above it any more.
+    // The terminal itself: the shared theme — refined dark background,
+    // soft-white text, the one 14 pt monospace font. Lines never wrap:
+    // the text container is wider than the screen, so long lines scroll
+    // horizontally. It starts at the top of the screen: there is no bar
+    // above it any more.
     _output = [[UITextView alloc] init];
     _output.translatesAutoresizingMaskIntoConstraints = NO;
     _output.editable = NO;
     _output.selectable = YES;
-    _output.backgroundColor = [UIColor blackColor];
-    _output.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
+    _output.backgroundColor = TXThemeBackgroundColor();
+    _output.font = TXTermFont();
     _output.textContainer.lineBreakMode = NSLineBreakByClipping;
     _output.textContainer.size = CGSizeMake(10000, CGFLOAT_MAX);
     _output.textContainerInset = UIEdgeInsetsMake(6, 6, 6, 6);
@@ -163,10 +193,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _output.contentInset = UIEdgeInsetsZero;
     _output.scrollIndicatorInsets = UIEdgeInsetsZero;
     // Explicit attributes: a bare string renders in the text view's
-    // default colour, which is black-on-black in dark mode.
+    // default colour, which is black-on-black in dark mode. The
+    // placeholder uses the same font and foreground as the flush
+    // renderer, so it can never drift into an unreadable colour.
     _output.attributedText = [[NSAttributedString alloc] initWithString:@"TermX\n" attributes:@{
-        NSFontAttributeName: [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular],
-        NSForegroundColorAttributeName: [UIColor colorWithWhite:0.92 alpha:1.0],
+        NSFontAttributeName: TXTermFont(),
+        NSForegroundColorAttributeName: TXThemeForegroundColor(),
+        NSParagraphStyleAttributeName: TXTermParagraphStyle(),
     }];
     _output.delegate = self; // scrollViewDidScroll: drives the jump-to-bottom button
     [self.view addSubview:_output];
@@ -204,7 +237,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIStackView *fnStack = [[UIStackView alloc] init];
     fnStack.translatesAutoresizingMaskIntoConstraints = NO;
     fnStack.axis = UILayoutConstraintAxisHorizontal;
-    fnStack.spacing = 6;
+    fnStack.spacing = 5;
     [_fnRow addSubview:fnStack];
     for (int i = 0; i < 12; i++) {
         NSString *title = [NSString stringWithFormat:@"f%d", i + 1];
@@ -230,7 +263,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _secondaryRow = [[UIStackView alloc] init];
     _secondaryRow.translatesAutoresizingMaskIntoConstraints = NO;
     _secondaryRow.axis = UILayoutConstraintAxisHorizontal;
-    _secondaryRow.spacing = 6;
+    _secondaryRow.spacing = 5;
     [self addKey:_secondaryRow title:@"home" bytes:"\x1B[H" length:3];
     [self addKey:_secondaryRow title:@"end" bytes:"\x1B[F" length:3];
     UIView *sp1 = [[UIView alloc] init];
@@ -248,11 +281,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _secondaryRow.hidden = YES;
     [rows addArrangedSubview:_secondaryRow];
 
-    // Primary row: Ctrl Esc Tab More ... butterfly arrows.
+    // Primary row: Ctrl Esc Tab More Paste ... butterfly arrows.
+    // The row holds ten keys on a phone, so the gaps are tight (5 pt)
+    // and the key insets are slim — with the old 10 pt insets the row
+    // overflowed a 430 pt screen once Paste joined it, and the stack
+    // view squeezed the titles.
     UIStackView *primary = [[UIStackView alloc] init];
     primary.translatesAutoresizingMaskIntoConstraints = NO;
     primary.axis = UILayoutConstraintAxisHorizontal;
-    primary.spacing = 6;
+    primary.spacing = 5;
     _ctrlButton = [self keyButton:@"ctrl"];
     [_ctrlButton addTarget:self action:@selector(onCtrl) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:_ctrlButton];
@@ -309,13 +346,14 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
     // Jump-to-bottom button (Blink/Termius pattern): appears only
     // while the user has scrolled up into the scrollback, and takes
-    // them back to the live prompt. It rides just above the toolbar.
+    // them back to the live prompt. It rides just above the toolbar,
+    // in the app teal so it reads as part of TermX, not a system pill.
     _jumpToBottomButton = [UIButton buttonWithType:UIButtonTypeSystem];
     _jumpToBottomButton.translatesAutoresizingMaskIntoConstraints = NO;
     [_jumpToBottomButton setTitle:@"↓ Bottom" forState:UIControlStateNormal];
     _jumpToBottomButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     [_jumpToBottomButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    _jumpToBottomButton.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.9];
+    _jumpToBottomButton.backgroundColor = [TXThemeAccentColor() colorWithAlphaComponent:0.95];
     _jumpToBottomButton.layer.cornerRadius = 14;
     _jumpToBottomButton.contentEdgeInsets = UIEdgeInsetsMake(4, 12, 4, 12);
     _jumpToBottomButton.hidden = YES;
@@ -373,7 +411,9 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     b.titleLabel.font = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightMedium];
     b.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1.0];
     b.layer.cornerRadius = 7;
-    b.contentEdgeInsets = UIEdgeInsetsMake(6, 10, 6, 10);
+    // Slim horizontal insets: the primary row holds ten keys, and
+    // 10 pt insets overflowed a 430 pt screen once Paste joined it.
+    b.contentEdgeInsets = UIEdgeInsetsMake(6, 7, 6, 7);
     return b;
 }
 
@@ -568,11 +608,17 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 - (UIColor *)colorForCell:(vt_cell)cell isForeground:(BOOL)isFg {
     int16_t index = isFg ? cell.fg : cell.bg;
     if (index < 0) {
-        return isFg ? [UIColor colorWithRed:0xF2 / 255.0 green:0xF2 / 255.0 blue:0xF2 / 255.0 alpha:1.0]
-                    : [UIColor blackColor];
+        return isFg ? TXThemeForegroundColor() : TXThemeBackgroundColor();
     }
     // Bold text in colours 0-7 renders as the bright variant, as xterm does.
     if (isFg && cell.bold && index < 8) index += 8;
+    if (index == 0 && isFg) {
+        // xterm black as a foreground is invisible on a dark
+        // background, so render it as a dim grey. (As a background it
+        // falls through to XTermColor, whose colour 0 is the theme
+        // background, so the cell blends into the screen.)
+        return [UIColor colorWithWhite:0.45 alpha:1.0];
+    }
     return XTermColor((int)index);
 }
 
@@ -593,12 +639,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     BOOL pinned = [self isPinnedToBottom];
     BOOL userScrolling = _output.isTracking || _output.isDragging || _output.isDecelerating;
     CGPoint savedOffset = _output.contentOffset;
-    UIFont *font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
+    UIFont *font = TXTermFont();
     NSMutableAttributedString *out = [[NSMutableAttributedString alloc] init];
     // Scrollback stays plain text (vt.c keeps no colours for it).
     NSDictionary *plain = @{
         NSFontAttributeName: font,
-        NSForegroundColorAttributeName: [UIColor colorWithWhite:0.92 alpha:1.0],
+        NSForegroundColorAttributeName: TXThemeForegroundColor(),
+        NSParagraphStyleAttributeName: TXTermParagraphStyle(),
     };
     for (int i = 0; i < _vt.scrollback_count; i++) {
         NSString *line = [NSString stringWithUTF8String:_vt.scrollback[i]];
@@ -696,8 +743,10 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     if (text.length == 0) return;
     UIColor *fg, *bg;
     if (cursor) {
-        fg = [UIColor blackColor];
-        bg = [UIColor colorWithWhite:0.92 alpha:1.0];
+        // The block cursor: light block, theme-dark glyph, so it
+        // reads on the refined dark background.
+        fg = TXThemeBackgroundColor();
+        bg = TXThemeForegroundColor();
     } else {
         fg = [self colorForCell:cell isForeground:YES];
         bg = [self colorForCell:cell isForeground:NO];
@@ -706,6 +755,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         NSFontAttributeName: font,
         NSForegroundColorAttributeName: fg,
         NSBackgroundColorAttributeName: bg,
+        NSParagraphStyleAttributeName: TXTermParagraphStyle(),
     };
     [out appendAttributedString:[[NSAttributedString alloc] initWithString:text attributes:attrs]];
 }

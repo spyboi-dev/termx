@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "TXLogViewController.h"
 #import "TXLog.h"
+#import "TXTheme.h"
 
 @interface TXLogViewController ()
 @property (nonatomic, strong) UITextView *logTextView;
@@ -14,7 +15,7 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Logs";
-    self.view.backgroundColor = [UIColor blackColor];
+    self.view.backgroundColor = TXThemeBackgroundColor();
 
     UILabel *header = [[UILabel alloc] init];
     header.font = [UIFont boldSystemFontOfSize:17];
@@ -23,8 +24,8 @@
     header.translatesAutoresizingMaskIntoConstraints = NO;
 
     self.logTextView = [[UITextView alloc] init];
-    self.logTextView.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
-    self.logTextView.textColor = [UIColor colorWithRed:0xF2 / 255.0 green:0xF2 / 255.0 blue:0xF2 / 255.0 alpha:1.0];
+    self.logTextView.font = TXTermFont();
+    self.logTextView.textColor = TXThemeForegroundColor();
     self.logTextView.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1.0];
     self.logTextView.layer.cornerRadius = 18;
     self.logTextView.layer.masksToBounds = YES;
