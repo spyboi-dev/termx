@@ -113,10 +113,36 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 }
 @end
 
+// The terminal text view. A non-editable but selectable UITextView
+// shows the iOS edit menu on long-press, but as a non-editable view
+// it offers no Paste — so a long-press on the terminal text gave no
+// way to paste, unlike any other input box. This subclass adds Paste
+// (Copy and Select All keep working through super, which already
+// offers them for selectable text): the menu appears on a long-press
+// over the visible terminal text, and Paste sends the clipboard to
+// the guest exactly like the Paste button. The view controller
+// supplies the handler, which also refocuses the hidden input field
+// so the keyboard comes back — the long-press moves first-responder
+// status to this view, which shows no keyboard.
+@interface TXTerminalTextView : UITextView
+@property (nonatomic, copy) void (^pasteHandler)(void);
+@end
+
+@implementation TXTerminalTextView
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    if (action == @selector(paste:)) return YES;
+    return [super canPerformAction:action withSender:sender];
+}
+
+- (void)paste:(id)sender {
+    if (self.pasteHandler) self.pasteHandler();
+}
+@end
+
 @implementation TerminalViewController {
     KernEngine *_engine;
     vt_t _vt;
-    UITextView *_output;
+    TXTerminalTextView *_output;
     TXTerminalInputField *_input;
     UIButton *_ctrlButton;
     UIButton *_moreButton;
@@ -168,7 +194,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // the text container is wider than the screen, so long lines scroll
     // horizontally. It starts at the top of the screen: there is no bar
     // above it any more.
-    _output = [[UITextView alloc] init];
+    _output = [[TXTerminalTextView alloc] init];
     _output.translatesAutoresizingMaskIntoConstraints = NO;
     _output.editable = NO;
     _output.selectable = YES;
@@ -212,6 +238,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         if (strongSelf) [strongSelf sendBackspace];
     };
     _input.delegate = self;
+    // Long-press Paste on the terminal text: same as the Paste button
+    // (clipboard as-is, empty clipboard is a no-op), then refocus the
+    // hidden field so the keyboard comes back after the menu dismisses.
+    _output.pasteHandler = ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf onPaste];
+        [strongSelf->_input becomeFirstResponder];
+    };
     _input.autocorrectionType = UITextAutocorrectionTypeNo;
     _input.autocapitalizationType = UITextAutocapitalizationTypeNone;
     _input.returnKeyType = UIReturnKeyDefault;
