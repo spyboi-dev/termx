@@ -36,13 +36,14 @@ extern const long long kRootfsSize;       // bytes of the extracted image
 
 // Cheap: true when rootfsPath exists, has the expected size, and
 // either matches the fingerprint recorded when the pipeline last
-// hash-verified it, or is a read-only file that passes the ext4
-// superblock-magic check. Never re-hashes on every call — the
-// startup screen polls this twice a second. A version difference
-// is NOT a failure: an older release that is a valid ext4 image
-// counts as installed and boots; the update is offered separately.
-// Only a file that cannot be a guest image at all (wrong size, or
-// not ext4) returns NO with a "damaged" error.
+// hash-verified it, or passes the ext4 superblock-magic check
+// (whatever its permission bits — the pre-flight repairs them).
+// Never re-hashes on every call — the startup screen polls this
+// twice a second. A version difference is NOT a failure: an older
+// release that is a valid ext4 image counts as installed and boots;
+// the update is offered separately. Only a file that cannot be a
+// guest image at all (wrong size, or not ext4) returns NO with a
+// "damaged" error.
 + (BOOL)guestInstalledAt:(NSString*)rootfsPath error:(NSString**)error;
 
 // Cheap: the hash recorded in the fingerprint for this exact file,

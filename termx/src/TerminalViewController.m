@@ -88,6 +88,51 @@ static NSParagraphStyle *TXTermParagraphStyle(void) {
     return style;
 }
 
+// Lossy UTF-8 decode: valid sequences decode normally, each invalid
+// byte becomes U+FFFD (replacement character) and is skipped. A guest
+// can emit raw bytes (Latin-1, a binary dump), so a scrollback line
+// is not always valid UTF-8 — stringWithUTF8String returns nil for
+// the whole line, and the old flush skipped it, so the line vanished
+// and every line below it shifted up. This never returns nil for a
+// non-NULL input and never skips a byte: a truncated multi-byte
+// sequence degrades to one U+FFFD per byte. (The && short-circuits
+// keep the p[1]/p[2]/p[3] reads inside the string: a continuation
+// check fails on the NUL terminator before the next byte is read.)
+static NSString *TXLossyUTF8String(const char *cstr) {
+    if (!cstr) return @"";
+    NSMutableString *out = [NSMutableString string];
+    const uint8_t *p = (const uint8_t *)cstr;
+    while (*p) {
+        uint8_t b = *p;
+        if (b < 0x80) {
+            [out appendFormat:@"%C", (unichar)b];
+            p++;
+        } else if (b >= 0xC2 && b <= 0xDF && (p[1] & 0xC0) == 0x80) {
+            uint32_t cp = ((b & 0x1F) << 6) | (p[1] & 0x3F);
+            [out appendFormat:@"%C", (unichar)cp];
+            p += 2;
+        } else if (b >= 0xE0 && b <= 0xEF && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 &&
+                   !(b == 0xE0 && p[1] < 0xA0) && !(b == 0xED && p[1] > 0x9F)) {
+            // Valid 3-byte sequence (rejects overlongs and surrogates).
+            uint32_t cp = ((b & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+            [out appendFormat:@"%C", (unichar)cp];
+            p += 3;
+        } else if (b >= 0xF0 && b <= 0xF4 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80 &&
+                   !(b == 0xF0 && p[1] < 0x90) && !(b == 0xF4 && p[1] > 0x8F)) {
+            // Valid 4-byte sequence (rejects overlongs and > U+10FFFF).
+            uint32_t cp = ((b & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+            cp -= 0x10000;
+            unichar pair[2] = { (unichar)(0xD800 + (cp >> 10)), (unichar)(0xDC00 + (cp & 0x3FF)) };
+            [out appendString:[NSString stringWithCharacters:pair length:2]];
+            p += 4;
+        } else {
+            [out appendString:@"\uFFFD"];
+            p++;
+        }
+    }
+    return [out copy];
+}
+
 static const uint8_t kFnBytes[12][6] = {
     {0x1B, 'O', 'P'}, {0x1B, 'O', 'Q'}, {0x1B, 'O', 'R'}, {0x1B, 'O', 'S'},
     {0x1B, '[', '1', '5', '~'}, {0x1B, '[', '1', '7', '~'},
@@ -133,6 +178,11 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 // status to this view, which shows no keyboard.
 @interface TXTerminalTextView : UITextView
 @property (nonatomic, copy) void (^pasteHandler)(void);
+// Scroll offset at the instant the finger landed, recorded in
+// touchesBegan (before the finger moves). The exit-pan gesture only
+// reaches Began after movement, so by then a drag that started
+// slightly scrolled may already be at offset 0.
+@property (nonatomic, assign) CGFloat touchDownContentOffsetY;
 @end
 
 @implementation TXTerminalTextView
@@ -143,6 +193,11 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
 - (void)paste:(id)sender {
     if (self.pasteHandler) self.pasteHandler();
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    self.touchDownContentOffsetY = self.contentOffset.y;
+    [super touchesBegan:touches withEvent:event];
 }
 @end
 
@@ -159,6 +214,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIScrollView *_fnRow;
     NSTimer *_flushTimer;
     NSLayoutConstraint *_toolbarBottom;
+    BOOL _didClearScreenOnBoot; // clear-on-boot already done for this terminal instance
     CGPoint _exitPanStart; // where the top-edge exit drag began
     BOOL _exitPanAtTop;    // scrollback already at its top when the drag began
     UIButton *_jumpToBottomButton; // shown only while scrolled up (Blink/Termius pattern)
@@ -476,6 +532,26 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
+    // Clear on boot, once: if the startup screen asked for it, wipe
+    // the boot log from the display and ask the guest for a fresh
+    // prompt, so the user opens on a clean prompt instead of the
+    // systemd boot log. The log itself is not lost: it stays in
+    // guest.log and engine.log. Only once per terminal instance, and
+    // only when clearScreenOnBoot is YES — returning to the terminal
+    // later never wipes scrollback.
+    if (self.clearScreenOnBoot && !_didClearScreenOnBoot) {
+        _didClearScreenOnBoot = YES;
+        // ED 2 through the parser: the same clear the `clear` command
+        // uses, so it empties both the visible grid and the scrollback
+        // (and homes the cursor). Feeding it here reuses that path
+        // instead of duplicating the clear.
+        static const uint8_t ed2[] = { 0x1B, '[', '2', 'J' };
+        vt_feed(&_vt, ed2, sizeof(ed2));
+        // Ask the guest for a fresh prompt on the clean screen: bash
+        // prints a new prompt for the newline.
+        uint8_t nl = '\n';
+        [_engine sendConsoleInput:[NSData dataWithBytes:&nl length:1]];
+    }
     // First render with final geometry: the 60 ms timer will flush
     // anyway, but this guarantees the view starts pinned to the live
     // line (not to a stale offset from before layout) the moment it
@@ -515,8 +591,12 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 // Backspace: DEL (0x7F), the Linux console erase character. One
 // place for both callers: the deleteBackward override on the empty
 // field, and the delegate's backspace branch for the (currently
-// impossible) case where the field holds text.
+// impossible) case where the field holds text. Backspace is not a
+// letter, so the delegate's Ctrl+letter path never runs for it:
+// release a latched Ctrl here, or it would stay latched and turn the
+// next typed letter into a control byte.
 - (void)sendBackspace {
+    if (_ctrlLatched) [self onCtrl];
     uint8_t backspace = 0x7F;
     [_engine sendConsoleInput:[NSData dataWithBytes:&backspace length:1]];
 }
@@ -616,10 +696,35 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
 // Paste: the clipboard text goes to the guest exactly as if typed,
 // newlines included. An empty clipboard is a no-op (nil.length is 0).
+// The guest tty input buffer is 4096 bytes, so a paste larger than
+// that loses its tail if it goes in one write: split it into 1 KiB
+// chunks, one per run-loop turn, so the line discipline drains
+// between writes. The Ctrl latch releases once, on the first chunk,
+// the way sendKeyData does for a key button — not once per chunk.
 - (void)onPaste {
     NSString *text = [UIPasteboard generalPasteboard].string;
     if (text.length == 0) return;
-    [self sendKeyData:[text dataUsingEncoding:NSUTF8StringEncoding]];
+    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data.length) return;
+    if (_ctrlLatched) [self onCtrl];
+    [[UIDevice currentDevice] playInputClick];
+    [self sendPasteChunk:data offset:0];
+}
+
+// One 1 KiB chunk of a paste, then the next chunk on the next
+// run-loop turn (dispatch_async on the main queue). Sending the whole
+// paste in one write overflows the guest tty's 4096-byte input buffer.
+- (void)sendPasteChunk:(NSData *)data offset:(NSUInteger)offset {
+    if (offset >= data.length) return;
+    NSUInteger len = MIN(1024, data.length - offset);
+    [_engine sendConsoleInput:[data subdataWithRange:NSMakeRange(offset, len)]];
+    if (offset + len < data.length) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (strongSelf) [strongSelf sendPasteChunk:data offset:offset + len];
+        });
+    }
 }
 
 - (void)onKeyboard {
@@ -642,7 +747,12 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     switch (pan.state) {
         case UIGestureRecognizerStateBegan:
             _exitPanStart = [pan locationInView:_output];
-            _exitPanAtTop = _output.contentOffset.y <= 1;
+            // Read the offset recorded at touch-down (touchesBegan on
+            // the text view), not the live offset: the pan only
+            // reaches Began after the finger moved, so a drag that
+            // started slightly scrolled can already be at offset 0
+            // by now and would wrongly count as starting at the top.
+            _exitPanAtTop = _output.touchDownContentOffsetY <= 1;
             break;
         case UIGestureRecognizerStateEnded: {
             CGPoint translation = [pan translationInView:_output];
@@ -728,6 +838,12 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _vt.dirty = 0;
     BOOL pinned = [self isPinnedToBottom];
     CGPoint savedOffset = _output.contentOffset;
+    // Setting attributedText clears any active text selection, so the
+    // user cannot copy while output streams: save it (as an NSRange,
+    // which survives the rebuild) and restore it afterwards, clamped
+    // to the new text length.
+    NSRange savedSelection = _output.selectedRange;
+    BOOL hadSelection = savedSelection.length > 0;
     UIFont *font = TXTermFont();
     NSMutableAttributedString *out = [[NSMutableAttributedString alloc] init];
     // Scrollback stays plain text (vt.c keeps no colours for it).
@@ -738,20 +854,24 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     };
     for (int i = 0; i < _vt.scrollback_count; i++) {
         NSString *line = [NSString stringWithUTF8String:_vt.scrollback[i]];
-        if (!line) continue;
+        // A line that is not valid UTF-8 must still render: fall
+        // back to the lossy decode (U+FFFD for bad bytes) instead of
+        // skipping the line, or it vanishes and the lines below shift.
+        if (!line) line = TXLossyUTF8String(_vt.scrollback[i]);
+        if (!line) line = @"";
         [out appendAttributedString:[[NSAttributedString alloc] initWithString:[line stringByAppendingString:@"\n"] attributes:plain]];
     }
     // The grid renders with per-cell colours, grouped into runs.
     for (int r = 0; r < VT_ROWS; r++) {
         int last = VT_COLS - 1;
         while (last >= 0 && _vt.grid[r][last].ch == 0) last--;
-        if (r == _vt.cy && _vt.cx > last) last = _vt.cx; // keep the cursor cell
+        if (r == _vt.cy && _vt.cx > last && _vt.cursor_visible) last = _vt.cx; // keep the cursor cell
         NSMutableString *runText = [NSMutableString string];
         vt_cell runCell = _vt.grid[r][0];
         BOOL haveRun = NO;
         for (int c = 0; c <= last; c++) {
             vt_cell cell = _vt.grid[r][c];
-            BOOL isCursor = (r == _vt.cy && c == _vt.cx);
+            BOOL isCursor = (r == _vt.cy && c == _vt.cx && _vt.cursor_visible);
             if (haveRun && (cell.fg != runCell.fg || cell.bg != runCell.bg ||
                             cell.bold != runCell.bold || isCursor)) {
                 [self appendRun:out text:runText cell:runCell font:font cursor:NO];
@@ -778,6 +898,16 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     }
     _output.attributedText = out;
     [_output layoutIfNeeded]; // contentSize is current before we measure it
+    if (hadSelection) {
+        // Restore the selection, clamped to the new text length (new
+        // output can grow it, a clear-screen can shrink it under the
+        // old range).
+        NSUInteger len = out.length;
+        NSRange restored = savedSelection;
+        if (restored.location > len) restored.location = len;
+        if (restored.location + restored.length > len) restored.length = len - restored.location;
+        _output.selectedRange = restored;
+    }
     if (pinned) [self scrollToBottomAnimated:NO];
     else {
         // Restore the saved offset, clamped to the new content
@@ -861,9 +991,19 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     }
     if (string.length == 0) return NO;
     if ([string isEqualToString:@"\n"]) {
-        // NewTerm sends carriage return, not line feed.
-        uint8_t cr = '\r';
-        [_engine sendConsoleInput:[NSData dataWithBytes:&cr length:1]];
+        // NewTerm sends carriage return, not line feed — unless Ctrl
+        // is latched, in which case Return is Ctrl-J (line feed,
+        // 0x0A) and the latch releases. Without this the newline
+        // branch returns before the Ctrl check below, so Ctrl stays
+        // latched and the next typed letter becomes a control byte.
+        if (_ctrlLatched) {
+            uint8_t lf = 0x0A;
+            [_engine sendConsoleInput:[NSData dataWithBytes:&lf length:1]];
+            [self onCtrl];
+        } else {
+            uint8_t cr = '\r';
+            [_engine sendConsoleInput:[NSData dataWithBytes:&cr length:1]];
+        }
         return NO;
     }
     if (_ctrlLatched) {

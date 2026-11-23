@@ -17,4 +17,13 @@
 #import <UIKit/UIKit.h>
 
 @interface TerminalViewController : UIViewController
+// When YES, the first time the terminal appears it clears the boot
+// log from the display (grid and scrollback) and asks the guest for
+// a fresh prompt, so the user opens on a clean prompt instead of the
+// systemd boot log. The log itself is not lost: it stays in
+// guest.log and engine.log. The startup screen sets this YES only
+// for the first presentation after a boot, and NO when the user
+// returns via the Terminal button, so returning never wipes
+// scrollback.
+@property (nonatomic, assign) BOOL clearScreenOnBoot;
 @end

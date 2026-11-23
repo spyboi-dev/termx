@@ -46,6 +46,14 @@ typedef struct {
     int scrollback_count;
     int scrollback_cap;
     int dirty; /* grid or scrollback changed since last render. */
+    int pending_wrap; /* cursor past the last column: wrap on the next
+                         printable char instead of at once (deferred
+                         wrap, as xterm does). */
+    int scroll_top, scroll_bottom; /* DECSTBM region, 0-based inclusive. */
+    vt_cell alt_grid[VT_ROWS][VT_COLS]; /* saved main screen for CSI ?1049h. */
+    int alt_cx, alt_cy; /* saved main cursor for CSI ?1049h. */
+    int in_alt; /* on the alternate screen (CSI ?1049h / ?1047h). */
+    int cursor_visible; /* CSI ?25h / ?25l; the view reads this. */
 } vt_t;
 
 void vt_init(vt_t *vt);

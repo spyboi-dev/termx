@@ -117,7 +117,12 @@ NSString *TXLogGuestLogPath(void) {
 // Keep a log file from growing forever: once it passes 512 KB,
 // keep only the last 256 KB, starting at a line boundary.
 // Byte-based, so a chunk of non-UTF-8 console output cannot defeat
-// it. Runs on TXLogQueue only.
+// it. Runs on TXLogQueue only. The rewrite is in place, never by
+// rename: TXCrashLog holds an open fd to this path, and an atomic
+// write (temp file + rename) swaps the inode out from under it, so
+// the crash handler's next write goes to the old unlinked inode and
+// is lost. Truncating and writing through the same path keeps the
+// inode, so the crash fd stays valid.
 static void TXLogCapFileToTail(NSString *path) {
     NSData *data = [NSData dataWithContentsOfFile:path];
     if (!data || data.length <= 512 * 1024) return;
@@ -126,7 +131,11 @@ static void TXLogCapFileToTail(NSString *path) {
     while (keepFrom < data.length && bytes[keepFrom] != '\n') keepFrom++;
     if (keepFrom < data.length) keepFrom++; // skip the newline itself
     NSData *tail = [data subdataWithRange:NSMakeRange(keepFrom, data.length - keepFrom)];
-    [tail writeToFile:path atomically:YES];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) return;
+    [fh truncateFileAtOffset:0];
+    [fh writeData:tail];
+    [fh closeFile];
 }
 
 // The file write itself: queue-confined. Creates the directory,

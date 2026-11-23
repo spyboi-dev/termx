@@ -12,6 +12,8 @@
 #import <stdlib.h>
 #import <string.h>
 #import <sys/stat.h>
+#import <sys/sysctl.h>
+#import <unistd.h>
 
 NSString* const kTermXStateChanged = @"TermXStateChanged";
 
@@ -23,23 +25,28 @@ NSString* const kTermXStateChanged = @"TermXStateChanged";
 #define TERMX_BUILD_COMMIT "nogit"
 #endif
 
-// The Linux guest: 2 GiB RAM and 2 vCPUs. The iPhone 15 Plus has
-// 6 GiB, and the 100 ms footprint sampler (2026-11-22) showed about
-// 3.8-4.0 GiB of per-process headroom at the moment of death, so
-// 2 GiB leaves safe headroom. 512 MiB was the old value, set when
-// 1024 MiB was suspected of being killed by jetsam twice in a row
-// (2026-11-22, build 2bbe39f); the later sampler proved those deaths
-// were the /init mkdir panic, not jetsam, so the 512 MiB cut is no
-// longer needed. 2048 satisfies the pre-flight (min 512, step 64).
-static const uint32_t kGuestMemoryMiB = 2048;
+// The Linux guest: 2 vCPUs, and as much RAM as iOS gives the app
+// minus a 1 GiB reserve for iOS and the app itself (see
+// TXComputeGuestMemoryMiB). The iPhone 15 Plus has 6 GiB, so the
+// guest gets 5 GiB there. 2048 is the default until the first boot
+// computes it, and the floor: a smaller device never gets less.
+// The value must satisfy the pre-flight (min 512, step 64), so the
+// computation rounds down to a 64 MiB step. 512 MiB was the old
+// fixed value, set when 1024 MiB was suspected of being killed by
+// jetsam twice in a row (2026-11-22, build 2bbe39f); the later
+// sampler proved those deaths were the /init mkdir panic, not
+// jetsam, so the 512 MiB cut is no longer needed.
+static uint32_t kGuestMemoryMiB = 2048;
 static const uint32_t kGuestCPUs = 2;
 // The guest's persistent data disk, in GiB: one sparse file at a fixed
 // path (see dataDiskPath), created once and reused on every boot, so
-// the 32 GiB is capacity, not allocated size — the file only grows as
-// the guest writes, like Andarium's "628 MiB of 8 GiB". 32 GiB is the
-// size a new disk gets; an existing disk keeps whatever size it was
-// created at until the user erases it (see createDataDiskIfNeeded).
-static const uint64_t kDataDiskGiB = 32;
+// the size is capacity, not allocated size — the file only grows as
+// the guest writes, like Andarium's "628 MiB of 8 GiB". The size a
+// new disk gets comes from the user setting (+dataDiskGiB, default
+// 2 GiB, stored in NSUserDefaults); an existing disk keeps whatever
+// size it was created at until the user erases it (see
+// createDataDiskIfNeeded).
+static const uint64_t kDefaultDataDiskGiB = 2;
 
 @interface KernEngine () {
     const kernarium_runtime_api* _api;
@@ -99,6 +106,11 @@ static const uint64_t kDataDiskGiB = 32;
 // bufferedConsoleOutput). Appended on the runtime thread, read on
 // the main thread, so every access is under @synchronized(self).
 @property (nonatomic, strong) NSMutableData *consoleBuffer;
+// Rolling tail for the console marker search (see ConsoleOutput):
+// the last 64 bytes of the previous chunk, prepended to the current
+// chunk for the marker search only. Written and read on the runtime
+// thread, so every access is under @synchronized(self).
+@property (nonatomic, strong) NSMutableData *consoleMarkerTail;
 @end
 
 // A/B revert (2026-11-22): the console ring buffer was compiled OUT
@@ -152,7 +164,34 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         // from its own timer, so no main-queue hop is needed here.
         [delegate kernEngineDidReceiveConsoleOutput:data];
     }
-    NSString* text = [[NSString alloc] initWithBytes:buffer length:length encoding:NSUTF8StringEncoding];
+    // Rolling tail for the marker search: the runtime delivers
+    // console output a few bytes at a time, and a marker can straddle
+    // two chunks ("login: " split as "log" + "in: "). Searching each
+    // chunk alone misses it, so the app stays in Booting forever and
+    // the terminal never presents. Keep the last 64 bytes of the
+    // previous chunk and prepend them for the search only — the
+    // delegate callback and the log above already got exactly this
+    // chunk. 64 bytes is more than the longest marker (30 bytes), so
+    // any straddled marker is whole in the joined text.
+    NSData *joinedData = nil;
+    @synchronized (engine) {
+        if (engine.consoleMarkerTail.length) {
+            NSMutableData *joined = [NSMutableData dataWithData:engine.consoleMarkerTail];
+            [joined appendData:data];
+            joinedData = joined;
+        }
+        NSUInteger tailLen = MIN((NSUInteger)64, data.length);
+        engine.consoleMarkerTail = [[data subdataWithRange:NSMakeRange(data.length - tailLen, tailLen)] mutableCopy];
+    }
+    NSString* text = nil;
+    if (joinedData) {
+        text = [[NSString alloc] initWithBytes:joinedData.bytes length:joinedData.length encoding:NSUTF8StringEncoding];
+    }
+    if (!text) {
+        // No tail, or the join split a multi-byte character: fall back
+        // to this chunk alone (the old behaviour).
+        text = [[NSString alloc] initWithBytes:buffer length:length encoding:NSUTF8StringEncoding];
+    }
     if (!text) return;
     if ([text containsString:@"UML_BOOT_ERROR:"]) {
         engine.failedStep = (engine.bootPhase == TXBootPhaseServices)
@@ -174,7 +213,7 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         if ([text containsString:@"login: "]) {
             engine.bootPhase = TXBootPhaseReady;
             engine.state = TermXStateRunning;
-            engine.statusText = @"Debian shell — logged in as termux";
+            engine.statusText = @"Debian shell — logged in as termx";
         }
     }
 }
@@ -186,6 +225,23 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{ s = [[KernEngine alloc] init]; });
     return s;
+}
+
+// Data disk size setting (NSUserDefaults "termx.dataDiskGiB", in
+// GiB, default 2): the size a NEW data disk gets. The startup screen
+// offers a picker that writes it through +setDataDiskGiB:. A stored
+// 0 (never set, or explicitly cleared) means the default; a negative
+// value is invalid and also means the default. An existing disk is
+// never resized by this setting — it keeps its size until erased
+// (see createDataDiskIfNeededWithError:).
++ (uint64_t)dataDiskGiB {
+    NSInteger stored = [[NSUserDefaults standardUserDefaults] integerForKey:@"termx.dataDiskGiB"];
+    if (stored <= 0) return kDefaultDataDiskGiB;
+    return (uint64_t)stored;
+}
+
++ (void)setDataDiskGiB:(uint64_t)giB {
+    [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)giB forKey:@"termx.dataDiskGiB"];
 }
 
 - (instancetype)init {
@@ -374,12 +430,10 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         } else {
             TXLogEngine(@"No previous session record");
         }
-        // Footprint sampler (diagnostic): from launch until the guest
-        // is Running (or the run ends), so the next log alone settles
-        // whether a kill is system-wide memory pressure. Stopped by
-        // setState: on Running/Stopped/Failed; a boot retry re-starts
-        // it from bootOnView:.
-        [self startMemorySampler];
+        // No sampler here: it is started by bootOnView: for the boot
+        // window only. Starting it in init would log every 100 ms
+        // forever on a fresh install (Idle), where there is no boot
+        // to watch, and drain the battery.
     }
     return self;
 }
@@ -579,8 +633,13 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
     _state = state;
     TXLogEngine(@"State: %@ — %@", TXStateName(state), self.statusText ?: @"");
     // The sampler's job ends when the guest is up, stopped, or
-    // failed: a failed boot's retry re-starts it from bootOnView:.
-    if (state == TermXStateRunning || state == TermXStateStopped || state == TermXStateFailed) {
+    // failed — and when the state leaves the boot window for Idle
+    // or Ready: on a fresh install (Idle) there is no boot to watch,
+    // and on Ready the boot has not started yet, so the sampler
+    // would otherwise log every 100 ms forever. A failed boot's
+    // retry re-starts it from bootOnView:.
+    if (state == TermXStateRunning || state == TermXStateStopped || state == TermXStateFailed ||
+        state == TermXStateIdle || state == TermXStateReady) {
         [self stopMemorySampler];
     }
     [[NSNotificationCenter defaultCenter] postNotificationName:kTermXStateChanged object:nil];
@@ -623,11 +682,12 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
 
 - (unsigned long long)storageTotalBytes {
     // The actual file size, not the constant: an install that kept
-    // its older 8 GiB disk must report 8 GiB, not the 32 GiB a new
-    // disk gets. A missing disk reports the size a new one will get.
+    // its older 8 GiB disk must report 8 GiB, not the size a new
+    // disk gets. A missing disk reports the size a new one will get
+    // (the user setting, default 2 GiB).
     struct stat st;
     if (stat(_dataDiskPath.UTF8String, &st) == 0) return (unsigned long long)st.st_size;
-    return (unsigned long long)kDataDiskGiB << 30;
+    return (unsigned long long)[KernEngine dataDiskGiB] << 30;
 }
 
 - (BOOL)dataDiskReady {
@@ -745,9 +805,6 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
 }
 
 - (void)enterBackground {
-    // Hold the guest GPU while backgrounded: iOS revokes the GPU within
-    // seconds, and the runtime must not submit work while it is gone.
-    if (_api && _running) _api->set_gpu_hold(1);
     // Quiesce the guest so the next launch does not find a dirty data
     // disk. The reboot crash (2026-11-22): TermX never stopped the
     // guest when the user left the app, so every restart was a
@@ -766,6 +823,13 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
     // never the main thread — a quiesce can block ~20 s — under a
     // background task so iOS gives it the time.
     if (!_api || !_running || self.state != TermXStateRunning) return;
+    // Hold the guest GPU while backgrounded: iOS revokes the GPU within
+    // seconds, and the runtime must not submit work while it is gone.
+    // Only once the state check above has passed: a mid-boot guest
+    // gets no quiesce, so it must get no hold either. A hold set
+    // before the check would survive a boot that then fails while
+    // backgrounded, and the retry would boot with the GPU held.
+    _api->set_gpu_hold(1);
     __block UIBackgroundTaskIdentifier bgTask = UIBackgroundTaskInvalid;
     __block BOOL bgTaskEnded = NO;
     // End the background task exactly once, on the main queue, from
@@ -812,7 +876,11 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
             TXLogFlush();
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (strongSelf->_api && strongSelf->_running) strongSelf->_api->set_gpu_hold(0);
+            // Release unconditionally (guard only on _api): a boot
+            // that failed while backgrounded leaves _running NO, and
+            // gating on _running would skip the release and leave
+            // the retry booting with the GPU held.
+            if (strongSelf->_api) strongSelf->_api->set_gpu_hold(0);
         });
     });
 }
@@ -961,7 +1029,10 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
 - (BOOL)createDataDiskIfNeededWithError:(NSString**)error {
     NSFileManager* fm = [NSFileManager defaultManager];
     NSDictionary* attrs = [fm attributesOfItemAtPath:_dataDiskPath error:nil];
-    off_t size = (off_t)kDataDiskGiB << 30;
+    // The size a NEW disk gets comes from the user setting (default
+    // 2 GiB). An existing disk is reused at its own size below and
+    // never resized by this setting.
+    off_t size = (off_t)[KernEngine dataDiskGiB] << 30;
     if (attrs) {
         // Reuse whatever disk is already there, whatever its size.
         // An existing install keeps its disk (8 GiB from before this
@@ -981,6 +1052,10 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
     BOOL ok = ftruncate(fd, size) == 0;
     close(fd);
     if (!ok) {
+        // Remove the empty/partial file: if it stays, the next boot
+        // "reuses" it (the pre-flight only checks it is a regular
+        // file) and fails the same way again, forever.
+        unlink(_dataDiskPath.UTF8String);
         if (error) *error = @"could not size the data disk";
         return NO;
     }
@@ -1187,7 +1262,37 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
     return YES;
 }
 
+// Guest RAM from the device: all of physical memory except a 1 GiB
+// reserve for iOS and the app itself, with a 2 GiB floor. Read once
+// per boot (bootOnView: sets kGuestMemoryMiB from this before the
+// pre-flight). Rounded down to a 64 MiB step, which the runtime
+// requires (see the pre-flight). Falls back to 2 GiB if the sysctl
+// fails, which is the old fixed value.
+static uint32_t TXComputeGuestMemoryMiB(void) {
+    uint64_t memsize = 0;
+    size_t len = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) != 0 || memsize == 0) {
+        return 2048;
+    }
+    uint64_t physicalMiB = memsize >> 20;
+    uint64_t guestMiB = (physicalMiB > 1024) ? (physicalMiB - 1024) : 0;
+    guestMiB = (guestMiB / 64) * 64; // round down to a 64 MiB step
+    if (guestMiB < 2048) guestMiB = 2048;
+    return (uint32_t)guestMiB;
+}
+
 - (void)bootOnView:(MTKView*)view {
+    // Guest RAM from the device (see TXComputeGuestMemoryMiB): set it
+    // before the pre-flight, which validates it, and before the boot
+    // struct is built. The value is the same on every boot (physical
+    // memory does not change), so recomputing on a retry is harmless.
+    kGuestMemoryMiB = TXComputeGuestMemoryMiB();
+    TXLogEngine(@"Guest RAM: %u MiB (device physical memory minus 1 GiB reserve)", kGuestMemoryMiB);
+    // Clear any GPU hold left over from a backgrounded boot that
+    // failed: the retry must boot with the GPU free. (The hold is
+    // released unconditionally in enterForeground, so this only
+    // covers a path that never came back to the foreground.)
+    if (_api) _api->set_gpu_hold(0);
     [self startMemorySampler]; // a failed boot stopped it; the retry re-starts it
     NSString* loadError = nil;
     if (![self loadRuntimeWithError:&loadError]) {
@@ -1291,7 +1396,8 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
     self.state = TermXStateBooting;
     self.statusText = @"Booting Debian…";
     TXLogEngine(@"Boot started: %ux%u display, %u vCPUs, %u MiB RAM, data disk %llu GiB",
-                bootWidth, bootHeight, kGuestCPUs, kGuestMemoryMiB, kDataDiskGiB);
+                bootWidth, bootHeight, kGuestCPUs, kGuestMemoryMiB,
+                (unsigned long long)(self.storageTotalBytes >> 30));
     _running = YES;
     // run() blocks until the guest stops, so it owns its own thread.
     // A Linux guest has no boot_completed signal: the console callback

@@ -9,6 +9,7 @@ enum {
     VT_ESC,
     VT_CSI,
     VT_OSC,
+    VT_OSC_ESC, /* ESC seen inside OSC: next byte decides ST or not. */
     VT_CHARSET,
 };
 
@@ -40,6 +41,10 @@ static void vt_blank_cell(vt_t *vt, int row, int col) {
 static void vt_clear_grid(vt_t *vt) {
     for (int r = 0; r < VT_ROWS; r++)
         for (int c = 0; c < VT_COLS; c++) vt_blank_cell(vt, r, c);
+    /* Clearing the grid resets the scroll region to the full screen
+     * (ESC c and ED 2 both come through here). */
+    vt->scroll_top = 0;
+    vt->scroll_bottom = VT_ROWS - 1;
 }
 
 /* Free every scrollback line and forget them, keeping the allocated
@@ -58,11 +63,13 @@ static void vt_put_cell(vt_t *vt, int row, int col, uint32_t ch) {
 }
 
 static void vt_scroll_up(vt_t *vt) {
-    /* Top line leaves the grid into scrollback. */
+    /* Top line of the scroll region leaves the grid into scrollback;
+     * only rows inside [scroll_top, scroll_bottom] move. Lines outside
+     * the region are untouched. */
     char *line = NULL;
     size_t len = 0, cap = 0;
     for (int c = 0; c < VT_COLS; c++) {
-        uint32_t ch = vt->grid[0][c].ch;
+        uint32_t ch = vt->grid[vt->scroll_top][c].ch;
         char buf[4];
         int n = 0;
         if (ch == 0) buf[n++] = ' ';
@@ -104,25 +111,39 @@ static void vt_scroll_up(vt_t *vt) {
         }
     }
     vt->scrollback[vt->scrollback_count++] = line;
-    memmove(vt->grid[0], vt->grid[1], sizeof(vt_cell) * VT_COLS * (VT_ROWS - 1));
-    for (int c = 0; c < VT_COLS; c++) vt_blank_cell(vt, VT_ROWS - 1, c);
+    memmove(vt->grid[vt->scroll_top], vt->grid[vt->scroll_top + 1],
+            sizeof(vt_cell) * VT_COLS * (vt->scroll_bottom - vt->scroll_top));
+    for (int c = 0; c < VT_COLS; c++) vt_blank_cell(vt, vt->scroll_bottom, c);
 }
 
 static void vt_newline(vt_t *vt) {
+    vt->pending_wrap = 0;
     vt->cx = 0;
-    if (vt->cy == VT_ROWS - 1) vt_scroll_up(vt);
-    else vt->cy++;
+    if (vt->cy == vt->scroll_bottom) vt_scroll_up(vt);
+    else if (vt->cy < VT_ROWS - 1) vt->cy++;
+    /* cy below the region and already on the last row: stay put. */
 }
 
 static void vt_put_char(vt_t *vt, uint32_t ch) {
-    if (ch == '\r') { vt->cx = 0; return; }
+    if (ch == '\r') { vt->cx = 0; vt->pending_wrap = 0; return; }
     if (ch == '\n') { vt_newline(vt); return; }
-    if (ch == '\b') { if (vt->cx > 0) vt->cx--; return; }
-    if (ch == '\t') { vt->cx = (vt->cx + 8) & ~7; if (vt->cx >= VT_COLS) vt_newline(vt); return; }
+    if (ch == '\b') { if (vt->cx > 0) vt->cx--; vt->pending_wrap = 0; return; }
+    if (ch == '\t') {
+        /* A tab is a cursor move, so it clears a pending wrap; without
+         * this the tab's own newline plus the wrap would skip a line. */
+        vt->pending_wrap = 0;
+        vt->cx = (vt->cx + 8) & ~7; if (vt->cx >= VT_COLS) vt_newline(vt); return;
+    }
     if (ch < 0x20 || ch == 0x7F) return;
+    /* Deferred wrap: a full 80-column line sets pending_wrap instead
+     * of wrapping at once, so the cursor stays on the last column
+     * until the next printable char (which wraps first). A CR, LF,
+     * backspace, tab, or CSI cursor move in between cancels it, so
+     * the cursor never lands on the wrong line. */
+    if (vt->pending_wrap) { vt_newline(vt); vt->pending_wrap = 0; }
     vt_put_cell(vt, vt->cy, vt->cx, ch);
     vt->cx++;
-    if (vt->cx >= VT_COLS) vt_newline(vt);
+    if (vt->cx >= VT_COLS) vt->pending_wrap = 1;
 }
 
 static int vt_param(vt_t *vt, int i, int def) {
@@ -130,6 +151,29 @@ static int vt_param(vt_t *vt, int i, int def) {
     if (i >= P.nparams) return def;
     int v = P.params[i];
     return v == 0 ? def : v;
+}
+
+/* Map an RGB triple to the nearest xterm 256-colour index. The cube
+ * (16-231) uses levels 0, 95, 135, 175, 215, 255 per channel; the
+ * grey ramp (232-255) is 8 + 10*i. Whichever is closer wins. */
+static int vt_rgb_to_256(int r, int g, int b) {
+    static const int levels[6] = {0, 95, 135, 175, 215, 255};
+    int r6 = 0, g6 = 0, b6 = 0;
+    for (int i = 0; i < 6; i++) {
+        if (abs(r - levels[i]) < abs(r - levels[r6])) r6 = i;
+        if (abs(g - levels[i]) < abs(g - levels[g6])) g6 = i;
+        if (abs(b - levels[i]) < abs(b - levels[b6])) b6 = i;
+    }
+    int cr = levels[r6], cg = levels[g6], cb = levels[b6];
+    int dcube = (r - cr) * (r - cr) + (g - cg) * (g - cg) + (b - cb) * (b - cb);
+    int avg = (r + g + b) / 3;
+    int gr = (avg - 8 + 5) / 10;
+    if (gr < 0) gr = 0;
+    if (gr > 23) gr = 23;
+    int grey = 8 + gr * 10;
+    int dgrey = (r - grey) * (r - grey) + (g - grey) * (g - grey) + (b - grey) * (b - grey);
+    if (dgrey < dcube) return 232 + gr;
+    return 16 + 36 * r6 + 6 * g6 + b6;
 }
 
 static void vt_csi(vt_t *vt, uint8_t final) {
@@ -140,18 +184,21 @@ static void vt_csi(vt_t *vt, uint8_t final) {
         if (r < 0) r = 0; if (r >= VT_ROWS) r = VT_ROWS - 1;
         if (c < 0) c = 0; if (c >= VT_COLS) c = VT_COLS - 1;
         vt->cy = r; vt->cx = c;
+        vt->pending_wrap = 0;
         break;
-    case 'A': vt->cy -= vt_param(vt, 0, 1); if (vt->cy < 0) vt->cy = 0; break;
-    case 'B': vt->cy += vt_param(vt, 0, 1); if (vt->cy >= VT_ROWS) vt->cy = VT_ROWS - 1; break;
-    case 'C': vt->cx += vt_param(vt, 0, 1); if (vt->cx >= VT_COLS) vt->cx = VT_COLS - 1; break;
-    case 'D': vt->cx -= vt_param(vt, 0, 1); if (vt->cx < 0) vt->cx = 0; break;
+    case 'A': vt->cy -= vt_param(vt, 0, 1); if (vt->cy < 0) vt->cy = 0; vt->pending_wrap = 0; break;
+    case 'B': vt->cy += vt_param(vt, 0, 1); if (vt->cy >= VT_ROWS) vt->cy = VT_ROWS - 1; vt->pending_wrap = 0; break;
+    case 'C': vt->cx += vt_param(vt, 0, 1); if (vt->cx >= VT_COLS) vt->cx = VT_COLS - 1; vt->pending_wrap = 0; break;
+    case 'D': vt->cx -= vt_param(vt, 0, 1); if (vt->cx < 0) vt->cx = 0; vt->pending_wrap = 0; break;
     case 'G': case '`':
         c = vt_param(vt, 0, 1) - 1;
         vt->cx = c < 0 ? 0 : (c >= VT_COLS ? VT_COLS - 1 : c);
+        vt->pending_wrap = 0;
         break;
     case 'd':
         r = vt_param(vt, 0, 1) - 1;
         vt->cy = r < 0 ? 0 : (r >= VT_ROWS ? VT_ROWS - 1 : r);
+        vt->pending_wrap = 0;
         break;
     case 'J':
         n = vt_param(vt, 0, 0);
@@ -173,6 +220,7 @@ static void vt_csi(vt_t *vt, uint8_t final) {
             vt_clear_grid(vt);
             vt_clear_scrollback(vt);
             vt->cx = 0; vt->cy = 0;
+            vt->pending_wrap = 0;
         } else if (n == 3) {
             /* xterm extension: clear the scrollback only. */
             vt_clear_scrollback(vt);
@@ -207,16 +255,72 @@ static void vt_csi(vt_t *vt, uint8_t final) {
                         else P.cur_bg = (int16_t)c;
                     }
                     i += 2;
+                } else if (i + 4 < P.nparams && P.params[i + 1] == 2) {
+                    /* Truecolor 38;2;r;g;b / 48;2;r;g;b: the grid
+                     * only stores xterm 256-colour indices, so map
+                     * the RGB to the nearest cube or grey entry. The
+                     * r, g, b values are consumed here (i += 4) so
+                     * they are not misread as separate SGR codes. */
+                    int r = P.params[i + 2], g = P.params[i + 3], b = P.params[i + 4];
+                    if (r >= 0 && r <= 255 && g >= 0 && g <= 255 && b >= 0 && b <= 255) {
+                        int c = vt_rgb_to_256(r, g, b);
+                        if (p == 38) P.cur_fg = (int16_t)c;
+                        else P.cur_bg = (int16_t)c;
+                    }
+                    i += 4;
                 }
             }
             else if (p == 39) P.cur_fg = -1;
             else if (p == 49) P.cur_bg = -1;
         }
         break;
-    case 's': vt->saved_cx = vt->cx; vt->saved_cy = vt->cy; break;
-    case 'u': vt->cx = vt->saved_cx; vt->cy = vt->saved_cy; break;
-    case 'h': case 'l': case 'r':
+    case 's': vt->saved_cx = vt->cx; vt->saved_cy = vt->cy; vt->pending_wrap = 0; break;
+    case 'u': vt->cx = vt->saved_cx; vt->cy = vt->saved_cy; vt->pending_wrap = 0; break;
+    case 'h':
+        if (P.priv) {
+            int mode = vt_param(vt, 0, 0);
+            if (mode == 25) {
+                /* CSI ?25h: show the cursor. */
+                vt->cursor_visible = 1;
+            } else if ((mode == 1049 || mode == 1047) && !vt->in_alt) {
+                /* Alternate screen: save the main screen and its
+                 * cursor, clear the grid, start at the top. */
+                memcpy(vt->alt_grid, vt->grid, sizeof vt->grid);
+                vt->alt_cx = vt->cx; vt->alt_cy = vt->cy;
+                vt_clear_grid(vt);
+                vt->cx = 0; vt->cy = 0;
+                vt->pending_wrap = 0;
+                vt->in_alt = 1;
+            }
+        }
         break;
+    case 'l':
+        if (P.priv) {
+            int mode = vt_param(vt, 0, 0);
+            if (mode == 25) {
+                /* CSI ?25l: hide the cursor. */
+                vt->cursor_visible = 0;
+            } else if ((mode == 1049 || mode == 1047) && vt->in_alt) {
+                /* Back to the main screen: restore what ?1049h saved. */
+                memcpy(vt->grid, vt->alt_grid, sizeof vt->grid);
+                vt->cx = vt->alt_cx; vt->cy = vt->alt_cy;
+                vt->pending_wrap = 0;
+                vt->in_alt = 0;
+            }
+        }
+        break;
+    case 'r': {
+        /* DECSTBM: CSI top;bottom r, 1-based, defaults to the full
+         * screen. The scroll region is inclusive on both ends. */
+        int top = vt_param(vt, 0, 1) - 1;
+        int bottom = vt_param(vt, 1, VT_ROWS) - 1;
+        if (top < 0) top = 0; if (top >= VT_ROWS) top = VT_ROWS - 1;
+        if (bottom < 0) bottom = 0; if (bottom >= VT_ROWS) bottom = VT_ROWS - 1;
+        if (top > bottom) { top = 0; bottom = VT_ROWS - 1; }
+        vt->scroll_top = top;
+        vt->scroll_bottom = bottom;
+        break;
+    }
     default:
         break;
     }
@@ -228,6 +332,11 @@ void vt_init(vt_t *vt) {
     P.cur = -1;
     P.cur_fg = -1;
     P.cur_bg = -1;
+    /* memset zeroes scroll_top (0, correct) but scroll_bottom needs
+     * the last row, and the cursor starts visible. pending_wrap and
+     * in_alt start at 0, which memset already gives them. */
+    vt->scroll_bottom = VT_ROWS - 1;
+    vt->cursor_visible = 1;
     /* memset leaves every cell's fg/bg at 0 (palette black); default is -1. */
     for (int r = 0; r < VT_ROWS; r++)
         for (int c = 0; c < VT_COLS; c++) {
@@ -272,7 +381,7 @@ void vt_feed(vt_t *vt, const uint8_t *bytes, size_t len) {
                 P.state = VT_CHARSET;
             } else if (b == '7') { vt->saved_cx = vt->cx; vt->saved_cy = vt->cy; P.state = VT_GROUND; }
             else if (b == '8') { vt->cx = vt->saved_cx; vt->cy = vt->saved_cy; P.state = VT_GROUND; }
-            else if (b == 'c') { vt_clear_grid(vt); vt_clear_scrollback(vt); P.cur_fg = -1; P.cur_bg = -1; P.cur_bold = 0; vt->cx = 0; vt->cy = 0; vt->dirty = 1; P.state = VT_GROUND; }
+            else if (b == 'c') { vt_clear_grid(vt); vt_clear_scrollback(vt); P.cur_fg = -1; P.cur_bg = -1; P.cur_bold = 0; vt->cx = 0; vt->cy = 0; vt->pending_wrap = 0; vt->cursor_visible = 1; vt->dirty = 1; P.state = VT_GROUND; }
             else if (b == '=' || b == '>') { P.state = VT_GROUND; }
             else { P.state = VT_GROUND; }
             break;
@@ -305,6 +414,14 @@ void vt_feed(vt_t *vt, const uint8_t *bytes, size_t len) {
             break;
         case VT_OSC:
             if (b == 0x07) P.state = VT_GROUND;
+            else if (b == 0x1B) P.state = VT_OSC_ESC;
+            break;
+        case VT_OSC_ESC:
+            /* ESC inside OSC: only backslash completes the ST
+             * terminator (both bytes are swallowed, nothing is
+             * passed to output). Anything else is just OSC content. */
+            if (b == '\\') P.state = VT_GROUND;
+            else P.state = VT_OSC;
             break;
         case VT_CHARSET:
             P.state = VT_GROUND;

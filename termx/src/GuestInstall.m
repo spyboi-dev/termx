@@ -295,6 +295,17 @@ static TXRootfsDownload* s_activeDownload = nil;
             return;
         }
         TXLogEngine(@"Download hash OK");
+        // Extract to a side file, not the live image: the installed
+        // image keeps booting until the new one is verified, and a
+        // failed update leaves it untouched instead of deleting a
+        // working image and failing halfway (the 2026-11-23 lesson:
+        // an update must never brick a setup that already works).
+        // A stale .new from a killed earlier pipeline is removed
+        // first, before the free-space check below, so the check
+        // counts the up-to-1 GiB it frees instead of failing on
+        // space the stale file is sitting on.
+        NSString* newPath = [rootfsPath stringByAppendingString:@".new"];
+        [fm removeItemAtPath:newPath error:nil];
         // gzPath provably exists here: it was just hashed above (or the
         // download delegate just moved the file there), so this read is
         // real — and the helper fails open if the measurement ever fails.
@@ -316,16 +327,6 @@ static TXRootfsDownload* s_activeDownload = nil;
         // to write it. A crash a millisecond later must leave the
         // true phase, not the last line the queues happened to flush.
         dispatch_sync(dispatch_get_main_queue(), ^{ TXLogFlush(); });
-        // Extract to a side file, not the live image: the installed
-        // image keeps booting until the new one is verified, and a
-        // failed update leaves it untouched instead of deleting a
-        // working image and failing halfway (the 2026-11-23 lesson:
-        // an update must never brick a setup that already works).
-        // A stale .new from a killed earlier pipeline is truncated
-        // by the gunzip below; drop it first so the free-space
-        // check above stays honest.
-        NSString* newPath = [rootfsPath stringByAppendingString:@".new"];
-        [fm removeItemAtPath:newPath error:nil];
         NSString* extractError = nil;
         if (![GuestInstall gunzipFile:gzPath to:newPath error:&extractError]) {
             TXLogEngine(@"Extract failed: %@", extractError ?: @"?");
@@ -638,17 +639,23 @@ static NSString* const kVerifiedRootfsKey = @"app.termx.ios.verified-rootfs";
     return YES;
 }
 
-// Cheap by design: exists + size + read-only bit, then the recorded
-// fingerprint or the ext4 magic. NEVER a hash here — this runs on
-// the startup screen's 0.5 s poll timer and on engine init, and a
-// full SHA-256 of 1 GiB on every tick is the "Verifying image" loop.
-// The only full hashes are the pipeline's one-time verify
-// (guestImageHashValidAt:) and the launch update check, which runs
-// once on a background queue and never blocks booting.
+// Cheap by design: exists + size, then the recorded fingerprint
+// or the ext4 magic (whatever the permission bits). NEVER a hash
+// here — this runs on the startup screen's 0.5 s poll timer and on
+// engine init, and a full SHA-256 of 1 GiB on every tick is the
+// "Verifying image" loop. The only full hashes are the pipeline's
+// one-time verify (guestImageHashValidAt:) and the launch update
+// check, which runs once on a background queue and never blocks
+// booting.
 // A version difference is NOT a failure: an older release that is
 // a valid ext4 image boots exactly like the current one, and the
 // update is offered separately. Only a file that cannot be a guest
 // image at all — wrong size, or not ext4 — is damaged.
+// Size and filesystem are checked before the permission bits: a
+// right-size ext4 image is a valid guest image whatever its bits
+// are — an iCloud restore, for example, resets them to 0644, and
+// the pre-flight chmods them back to 0444 before booting — so
+// rejecting it here would only force a needless 116 MB reinstall.
 + (BOOL)guestInstalledAt:(NSString*)rootfsPath error:(NSString**)error {
     NSFileManager* fm = [NSFileManager defaultManager];
     NSDictionary* attrs = [fm attributesOfItemAtPath:rootfsPath error:nil];
@@ -663,17 +670,17 @@ static NSString* const kVerifiedRootfsKey = @"app.termx.ios.verified-rootfs";
     // This exact file was already hash-verified: the verdict stands,
     // whatever release it was verified as.
     if ([self verifiedFingerprintMatchesPath:rootfsPath attrs:attrs]) return YES;
-    // Not yet verified by this build, or the file changed since it
-    // was: a half-extracted file still carries write bits, so it is
-    // not installed — and hashing it would only waste a second.
+    // Read-only, no fingerprint: an image installed by an older
+    // build, or an older release. If it is a real ext4 image it
+    // boots, whatever its permission bits are; only a file that is
+    // not ext4 at all is damaged.
+    if ([self imageLooksLikeExt4At:rootfsPath]) return YES;
+    // Not ext4: a half-extracted file still carries write bits, so
+    // it is not installed — and hashing it would only waste a second.
     if ([attrs filePosixPermissions] & 0222) {
         if (error) *error = @"guest image is not verified — reinstall";
         return NO;
     }
-    // Read-only, no fingerprint: an image installed by an older
-    // build, or an older release. If it is a real ext4 image it
-    // boots; only a file that is not ext4 at all is damaged.
-    if ([self imageLooksLikeExt4At:rootfsPath]) return YES;
     if (error) *error = @"guest image is damaged — reinstall";
     return NO;
 }

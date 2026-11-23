@@ -154,6 +154,14 @@ extern NSString* const kTermXStateChanged;
 // the guest's saved state is broken.
 - (BOOL)eraseDataDiskWithError:(NSString**)error;
 
+// Data disk size setting: the size in GiB a NEW data disk gets.
+// Stored in NSUserDefaults under "termx.dataDiskGiB", default 2.
+// The startup screen offers a picker that writes it through
+// +setDataDiskGiB:. An existing disk is never resized by this
+// setting — it keeps its size until erased.
++ (uint64_t)dataDiskGiB;
++ (void)setDataDiskGiB:(uint64_t)giB;
+
 // Console I/O: bytes to the guest's ttyS0, and the entry point the
 // console-output callback feeds.
 - (void)sendConsoleInput:(NSData*)data;
