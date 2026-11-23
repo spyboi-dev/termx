@@ -71,21 +71,26 @@ static const uint64_t kDataDiskGiB = 8;
     // Only set when the settle report says the guest suspended.
     BOOL _quiesced;
     // Timing diagnostic (second-launch crash, 2026-11-22): YES while
-    // the launch re-verify (full image hash) is still running; its
-    // completion only moves the state when this is still set, so a
-    // user Install tapped meanwhile owns the state instead.
-    BOOL _launchReverifyInFlight;
+    // the launch update check (full image hash, only when the
+    // fingerprint cannot answer) is still running; its completion
+    // only sets the flag when this is still set, so a user Install
+    // tapped meanwhile owns the state instead.
+    BOOL _launchUpdateCheckInFlight;
 }
 // Runs on _lifecycleQueue only: suspends the guest and settles its
 // disk (see quiesceGuestForBackground).
 - (void)quiesceGuestForBackground;
-// Timing diagnostic: full image hash on a background queue before
-// the launch declares Ready (see reverifyImageForLaunch).
-- (void)reverifyImageForLaunch;
+// Launch update check: settles whether the installed image is this
+// build's release, on a background queue (see
+// checkForImageUpdateForLaunch). It never blocks booting: the state
+// is Ready from the cheap installed check, and this only sets
+// updateAvailable.
+- (void)checkForImageUpdateForLaunch;
 // Readwrite here so the console callback and the boot/install paths
 // (which run outside the @implementation) can move the phase.
 @property (nonatomic, readwrite) TXBootPhase bootPhase;
 @property (nonatomic, readwrite) NSInteger failedStep;
+@property (nonatomic, readwrite) BOOL updateAvailable;
 @property (nonatomic, readwrite) int64_t downloadReceived;
 @property (nonatomic, readwrite) int64_t downloadExpected;
 // Console output buffered since boot for the terminal's replay (see
@@ -226,29 +231,27 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         // is the fix — a resume must wait for a quiesce in flight.
         _lifecycleQueue = dispatch_queue_create("app.termx.ios.lifecycle", DISPATCH_QUEUE_SERIAL);
         _quiesced = NO;
-        // Refresh the state from disk on launch: an installed guest means Ready —
-        // after the launch re-verify below. TIMING DIAGNOSTIC
-        // (second-launch crash, 2026-11-22): the only remaining
-        // difference between a first launch (boots) and a second launch
-        // (dies at kernel ~0.1 s) is timing — the first launch spent
-        // ~54 s on the install pipeline before booting, the second
-        // skipped the verify via the fingerprint and booted ~1 s after
-        // process start. So ignore the fingerprint on launch: always
-        // run the full SHA-256 over the 1 GiB image before declaring
-        // Ready. That re-warms the image in the page cache and makes
-        // the second launch take seconds like the first. The cheap
-        // fingerprint check stays everywhere else (the 0.5 s poll
-        // timer must never hash 1 GiB per tick). State stays Idle
-        // with "Verifying image…" until the hash lands; the auto-boot
-        // only fires from Ready.
+        // Refresh the state from disk on launch: an installed guest means Ready.
+        // A version difference is an update, not a failure: the
+        // installed image boots as-is, whatever release it is, so
+        // Ready is declared at once from the cheap installed check
+        // and the terminal is never blocked on the update check
+        // below. TIMING DIAGNOSTIC (second-launch crash, 2026-11-22):
+        // the launch still runs a full SHA-256 over the 1 GiB image
+        // when the fingerprint cannot answer which release it is —
+        // that re-warms the image in the page cache and makes the
+        // second launch take seconds like the first — but it only
+        // sets the update flag now; it can no longer fail the boot.
+        // The 5 s pre-boot delay in the startup screen is the other
+        // half of the diagnostic and is unchanged.
         BOOL installed = [self guestInstalled];
         if (installed) {
-            _launchReverifyInFlight = YES;
-            _state = TermXStateIdle;
-            _statusText = @"Verifying image…";
-            TXLogEngine(@"Timing diagnostic: forcing a full image verify on every launch (fingerprint ignored)");
+            _state = TermXStateReady;
+            _statusText = @"Guest ready — starting the engine…";
+            _launchUpdateCheckInFlight = YES;
+            TXLogEngine(@"Launch: guest installed, ready to boot; checking for an image update in the background");
             TXLogFlush();
-            [self reverifyImageForLaunch];
+            [self checkForImageUpdateForLaunch];
         }
         // Build marker, every launch: the commit this IPA was built
         // from plus the guest RAM, so a device log always identifies
@@ -818,39 +821,54 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
     return [GuestInstall guestInstalledAt:_rootfsPath error:&error];
 }
 
-// Timing diagnostic (second-launch crash): full SHA-256 of the
-// extracted image on every launch, on a background queue — never
-// the main thread, it reads 1 GiB. On success the state becomes
-// Ready and the normal auto-boot fires; on failure the state is
-// Failed/Image and Install is the fallback. Applies only while the
-// launch re-verify is still the thing holding the state: if the
-// user tapped Install meanwhile, the install completion owns the
-// state instead, and this completion stands down.
-- (void)reverifyImageForLaunch {
+// Launch update check (timing diagnostic, 2026-11-22): settles
+// whether the installed image is this build's release, on a
+// background queue — never the main thread, it reads 1 GiB. It
+// never moves the state: the boot is already under way from Ready,
+// and this only sets updateAvailable. Applies only while the launch
+// check is still the thing holding the flag: if the user tapped
+// Install meanwhile, the install completion owns the flag instead,
+// and this completion stands down.
+- (void)checkForImageUpdateForLaunch {
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         __strong typeof(self) strongSelf = weakSelf;
         if (!strongSelf) return;
-        NSString* error = nil;
-        BOOL ok = [GuestInstall guestImageHashValidAt:strongSelf->_rootfsPath error:&error];
+        // Cheap first: the fingerprint recorded by the install
+        // pipeline carries the hash it verified. A recorded hash
+        // answers the question with no 1 GiB hash at all — equal
+        // means current, different means an older release.
+        NSString* recordedHash = [GuestInstall installedImageVerifiedHashAt:strongSelf->_rootfsPath];
+        BOOL answered = recordedHash != nil;
+        BOOL current = answered && [recordedHash isEqualToString:kRootfsSHA256];
+        if (!answered) {
+            // No fingerprint hash to answer from (image installed by
+            // an older build, or the fingerprint predates the hash
+            // field): one full hash settles it, and on success the
+            // fingerprint is re-recorded with the hash, so the next
+            // launch answers cheaply. A mismatch is an older
+            // release — an update — never a failure.
+            NSString* error = nil;
+            current = [GuestInstall guestImageHashValidAt:strongSelf->_rootfsPath error:&error];
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(self) strongSelf2 = weakSelf;
-            if (!strongSelf2 || !strongSelf2->_launchReverifyInFlight) return;
-            strongSelf2->_launchReverifyInFlight = NO;
-            if (ok) {
-                TXLogEngine(@"Timing diagnostic: image re-verified — guest ready");
-                strongSelf2.state = TermXStateReady;
-                strongSelf2.statusText = @"Guest ready — starting the engine…";
-            } else {
-                TXLogEngine(@"Timing diagnostic: image re-verify failed (%@)", error ?: @"?");
-                strongSelf2.bootPhase = TXBootPhaseFailed;
-                strongSelf2.failedStep = TXBootStepImage;
-                strongSelf2.state = TermXStateFailed;
-                strongSelf2.statusText = error ?: @"Guest image failed verification — reinstall";
-            }
+            if (!strongSelf2 || !strongSelf2->_launchUpdateCheckInFlight) return;
+            strongSelf2->_launchUpdateCheckInFlight = NO;
+            strongSelf2.updateAvailable = !current;
+            TXLogEngine(@"Image update check: installed image is %@",
+                        current ? @"the current release" : @"an older release — update available");
             TXLogFlush();
         });
     });
+}
+
+// The update flag is a state of its own: the startup screen reads
+// it on every refresh, so a change must notify like a state change.
+- (void)setUpdateAvailable:(BOOL)updateAvailable {
+    if (_updateAvailable == updateAvailable) return;
+    _updateAvailable = updateAvailable;
+    [[NSNotificationCenter defaultCenter] postNotificationName:kTermXStateChanged object:nil];
 }
 
 - (void)installGuestWithCompletion:(void (^)(BOOL, NSString*))completion {
@@ -879,6 +897,9 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
             strongSelf.bootPhase = TXBootPhaseIdle;
             strongSelf.state = TermXStateReady;
             strongSelf.statusText = @"Guest ready — starting the engine…";
+            // The install just put this build's release in: no
+            // update is available any more.
+            strongSelf.updateAvailable = NO;
             // Distinct from the pipeline's "Install complete: guest
             // image verified" line: that one is the pipeline finishing,
             // this one is the completion reaching the engine. The two
@@ -1174,11 +1195,15 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
         TXLogEngine(@"Canonicalized boot paths: rootfs %@ -> %@, overlay %@ -> %@",
                     oldRootfs, _rootfsPath, oldDataDisk, _dataDiskPath);
     }
-    if (![self guestInstalled]) {
+    NSString* installError = nil;
+    if (![GuestInstall guestInstalledAt:_rootfsPath error:&installError]) {
         self.bootPhase = TXBootPhaseFailed;
         self.failedStep = TXBootStepImage;
         self.state = TermXStateFailed;
-        self.statusText = @"Guest is not installed — tap Install first";
+        // The exact reason: absent ("not installed"), or genuinely
+        // damaged. A version difference never reaches here — an
+        // older valid image counts as installed and boots.
+        self.statusText = installError ?: @"Guest is not installed — tap Install first";
         return;
     }
     _dataDiskReady = NO;

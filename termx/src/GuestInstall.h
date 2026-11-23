@@ -36,16 +36,34 @@ extern const long long kRootfsSize;       // bytes of the extracted image
 
 // Cheap: true when rootfsPath exists, has the expected size, and
 // either matches the fingerprint recorded when the pipeline last
-// hash-verified it, or hashes to kRootfsSHA256 on a one-time check.
-// Never re-hashes on every call — the startup screen polls this
-// twice a second.
+// hash-verified it, or is a read-only file that passes the ext4
+// superblock-magic check. Never re-hashes on every call — the
+// startup screen polls this twice a second. A version difference
+// is NOT a failure: an older release that is a valid ext4 image
+// counts as installed and boots; the update is offered separately.
+// Only a file that cannot be a guest image at all (wrong size, or
+// not ext4) returns NO with a "damaged" error.
 + (BOOL)guestInstalledAt:(NSString*)rootfsPath error:(NSString**)error;
 
+// Cheap: the hash recorded in the fingerprint for this exact file,
+// or nil when no fingerprint (or no hash field in it) answers for
+// it. Lets the launch update check tell an older release from the
+// current one without hashing 1 GiB.
++ (nullable NSString*)installedImageVerifiedHashAt:(NSString*)rootfsPath;
+
+// Cheap: true when the installed image is already this build's
+// release (its fingerprint hash equals kRootfsSHA256). The install
+// skip check: only a current image is skipped.
++ (BOOL)installedImageIsCurrentReleaseAt:(NSString*)rootfsPath;
+
 // Full SHA-256 of the extracted image against kRootfsSHA256, and
-// record the verified fingerprint on success. Expensive (reads
-// 1 GiB) — never on the poll timer or the main thread. The install
-// pipeline's one-time verify, and the launch re-verify in the
-// timing diagnostic (KernEngine reverifyImageForLaunch).
+// record the verified fingerprint (with the hash) on success.
+// Expensive (reads 1 GiB) — never on the poll timer or the main
+// thread. The install pipeline's one-time verify, and the launch
+// update check (KernEngine checkForImageUpdateForLaunch), which
+// uses it only when the fingerprint cannot answer. A failure here
+// is a genuinely damaged file, so the error says damaged — never
+// "hash mismatch".
 + (BOOL)guestImageHashValidAt:(NSString*)rootfsPath error:(NSString**)error;
 
 // Download + verify + extract the image to rootfsPath.

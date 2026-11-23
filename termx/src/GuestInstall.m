@@ -19,7 +19,11 @@
 + (BOOL)guestImageHashValidAt:(NSString*)rootfsPath error:(NSString**)error;
 + (NSDictionary*)verifiedRootfsFingerprint;
 + (BOOL)verifiedFingerprintMatchesPath:(NSString*)path attrs:(NSDictionary*)attrs;
-+ (void)recordVerifiedFingerprintForPath:(NSString*)path attrs:(NSDictionary*)attrs;
++ (void)recordVerifiedFingerprintForPath:(NSString*)path attrs:(NSDictionary*)attrs hash:(NSString*)hash;
+// Cheap: the ext4 superblock magic (0xEF53 at offset 1080), so a
+// read-only image with no fingerprint can still prove it is a real
+// filesystem without a 1 GiB hash.
++ (BOOL)imageLooksLikeExt4At:(NSString*)path;
 @end
 
 // Guest image: Debian trixie arm64 MINIMAL (slim), built 2026-11-21
@@ -31,10 +35,13 @@
 // NOTE: these four constants are the SLIM image (release
 // rootfs-20261123-slim). The local filename kRootfsName is deliberately
 // UNCHANGED from the old full image: the slim image replaces the full
-// one at the same path, so a phone holding the full image sees a
-// size/hash mismatch, treats it as "reinstall", and swaps cleanly.
-// The persistent data disk (termx-data.ext4) is a separate file and is
-// never touched by the image switch.
+// one at the same path. A phone holding an older image does NOT fail:
+// a version difference is an update, not corruption — the installed
+// image boots as-is (see guestInstalledAt:) and the new one is
+// offered as an Update. Only a genuinely damaged image (wrong size,
+// not ext4, or a fresh download that fails its hash) asks for a
+// reinstall. The persistent data disk (termx-data.ext4) is a separate
+// file and is never touched by the image switch.
 NSString* const kRootfsURL =
     @"https://github.com/spyboi-dev/termx/releases/download/rootfs-20261123-slim/termx-debian-trixie-arm64-slim.ext4.gz";
 NSString* const kRootfsName = @"termx-debian-trixie-arm64.ext4";
@@ -284,7 +291,7 @@ static TXRootfsDownload* s_activeDownload = nil;
         if (!FileHasHash(gzPath, kRootfsGzSHA256, @"Verifying download")) {
             TXLogEngine(@"Download hash mismatch — archive discarded");
             [fm removeItemAtPath:gzPath error:nil];
-            [self finish:NO error:@"download hash mismatch — the file may be corrupt, try again"];
+            [self finish:NO error:@"the download is damaged — try again"];
             return;
         }
         TXLogEngine(@"Download hash OK");
@@ -309,8 +316,18 @@ static TXRootfsDownload* s_activeDownload = nil;
         // to write it. A crash a millisecond later must leave the
         // true phase, not the last line the queues happened to flush.
         dispatch_sync(dispatch_get_main_queue(), ^{ TXLogFlush(); });
+        // Extract to a side file, not the live image: the installed
+        // image keeps booting until the new one is verified, and a
+        // failed update leaves it untouched instead of deleting a
+        // working image and failing halfway (the 2026-11-23 lesson:
+        // an update must never brick a setup that already works).
+        // A stale .new from a killed earlier pipeline is truncated
+        // by the gunzip below; drop it first so the free-space
+        // check above stays honest.
+        NSString* newPath = [rootfsPath stringByAppendingString:@".new"];
+        [fm removeItemAtPath:newPath error:nil];
         NSString* extractError = nil;
-        if (![GuestInstall gunzipFile:gzPath to:rootfsPath error:&extractError]) {
+        if (![GuestInstall gunzipFile:gzPath to:newPath error:&extractError]) {
             TXLogEngine(@"Extract failed: %@", extractError ?: @"?");
             [self finish:NO error:extractError];
             return;
@@ -322,15 +339,31 @@ static TXRootfsDownload* s_activeDownload = nil;
         // The pipeline's own one-time verify, not guestInstalledAt:
         // the just-extracted file still carries write bits until the
         // chmod below, and guestInstalledAt treats that as unverified.
-        if (![GuestInstall guestImageHashValidAt:rootfsPath error:&verifyError]) {
+        if (![GuestInstall guestImageHashValidAt:newPath error:&verifyError]) {
             TXLogEngine(@"Image verification failed: %@", verifyError ?: @"?");
-            [fm removeItemAtPath:rootfsPath error:nil];
+            [fm removeItemAtPath:newPath error:nil];
             [self finish:NO error:verifyError ?: @"image verification failed"];
             return;
         }
         // The runtime requires a read-only image: no write bits at all.
         NSDictionary* attrs = @{NSFilePosixPermissions : @(0444)};
-        [fm setAttributes:attrs ofItemAtPath:rootfsPath error:nil];
+        [fm setAttributes:attrs ofItemAtPath:newPath error:nil];
+        // Swap only now that the new image is verified: the old image
+        // is removed and the new one moved into its place (same
+        // directory, so the move is a rename). The fingerprint was
+        // recorded for the .new path by the verify above; re-record
+        // it for the final path with the known-good hash, so the
+        // cheap installed check answers from it from now on.
+        [fm removeItemAtPath:rootfsPath error:nil];
+        NSError* swapError = nil;
+        if (![fm moveItemAtPath:newPath toPath:rootfsPath error:&swapError]) {
+            TXLogEngine(@"Image swap failed: %@", swapError.localizedDescription ?: @"?");
+            [fm removeItemAtPath:newPath error:nil];
+            [self finish:NO error:@"could not install the new image — the old image is still in place"];
+            return;
+        }
+        NSDictionary* finalAttrs = [fm attributesOfItemAtPath:rootfsPath error:nil];
+        if (finalAttrs) [GuestInstall recordVerifiedFingerprintForPath:rootfsPath attrs:finalAttrs hash:kRootfsSHA256];
         TXLogEngine(@"Install complete: guest image verified");
         [self reportProgress:1.0 step:@"Guest ready"];
         [self finish:YES error:nil];
@@ -343,7 +376,10 @@ static TXRootfsDownload* s_activeDownload = nil;
     [fm createDirectoryAtPath:guestDir withIntermediateDirectories:YES attributes:nil error:nil];
     NSString* tmpDir = NSTemporaryDirectory();
     self.gzPath = [tmpDir stringByAppendingPathComponent:@"kterm-rootfs.ext4.gz"];
-    [fm removeItemAtPath:self.rootfsPath error:nil];
+    // The installed image is NOT deleted here: the pipeline extracts
+    // to a side file and swaps it in only after the new image is
+    // verified, so a failed or cancelled update leaves the working
+    // image in place (see runPipelineFromGz).
     self.received = 0;
     self.expected = 0;
     self.lastLoggedPercent = -1;
@@ -505,13 +541,19 @@ didCompleteWithError:(NSError*)error {
 
 // Verified-image fingerprint: once the install pipeline has SHA-256'd
 // the extracted image, the verdict is remembered in NSUserDefaults as
-// the file's path, size and modification date. guestInstalledAt —
-// called on the startup screen's 0.5 s poll timer — then answers from
-// that fingerprint with a stat call, instead of re-hashing 1 GiB
-// every tick (which is what looped "Verifying image" once a second
-// forever after the 10:30 install). The fingerprint only counts for
-// the exact file it was recorded for: any size or mtime change voids
-// it and forces one fresh hash, which then records a new fingerprint.
+// the file's path, size, modification date AND the hash it verified
+// as. guestInstalledAt — called on the startup screen's 0.5 s poll
+// timer — then answers from that fingerprint with a stat call,
+// instead of re-hashing 1 GiB every tick (which is what looped
+// "Verifying image" once a second forever after the 10:30 install).
+// The fingerprint only counts for the exact file it was recorded
+// for: any size or mtime change voids it. The recorded hash is what
+// tells an older release from the current one without hashing: a
+// fingerprint hash that differs from kRootfsSHA256 means the image
+// is an older release — an update is available, not a failure.
+// Fingerprints recorded before the hash field existed (older builds)
+// carry no hash; the launch update check settles those with one
+// full hash and the fingerprint is then re-recorded with it.
 static NSString* const kVerifiedRootfsKey = @"app.termx.ios.verified-rootfs";
 
 @implementation GuestInstall
@@ -531,33 +573,82 @@ static NSString* const kVerifiedRootfsKey = @"app.termx.ios.verified-rootfs";
     return [mtime isEqualToDate:[attrs fileModificationDate]];
 }
 
-+ (void)recordVerifiedFingerprintForPath:(NSString*)path attrs:(NSDictionary*)attrs {
-    NSDictionary* fp = @{@"path": path,
-                         @"size": @([attrs fileSize]),
-                         @"mtime": [attrs fileModificationDate]};
++ (void)recordVerifiedFingerprintForPath:(NSString*)path attrs:(NSDictionary*)attrs hash:(NSString*)hash {
+    NSMutableDictionary* fp = [NSMutableDictionary dictionaryWithDictionary:
+        @{@"path": path,
+          @"size": @([attrs fileSize]),
+          @"mtime": [attrs fileModificationDate]}];
+    if ([hash isKindOfClass:[NSString class]] && hash.length) fp[@"sha256"] = hash;
     [[NSUserDefaults standardUserDefaults] setObject:fp forKey:kVerifiedRootfsKey];
+}
+
+// The hash this exact file was verified as, from its fingerprint —
+// or nil when no fingerprint (or no hash field in it) answers for
+// this file. Cheap: a stat plus a defaults read, never a hash.
++ (NSString*)installedImageVerifiedHashAt:(NSString*)rootfsPath {
+    NSDictionary* attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:rootfsPath error:nil];
+    if (!attrs) return nil;
+    if (![self verifiedFingerprintMatchesPath:rootfsPath attrs:attrs]) return nil;
+    NSString* hash = [self verifiedRootfsFingerprint][@"sha256"];
+    return [hash isKindOfClass:[NSString class]] ? hash : nil;
+}
+
+// Cheap: is the installed image already this build's release? Only
+// the fingerprint's recorded hash can answer without hashing 1 GiB.
++ (BOOL)installedImageIsCurrentReleaseAt:(NSString*)rootfsPath {
+    NSString* hash = [self installedImageVerifiedHashAt:rootfsPath];
+    return hash != nil && [hash isEqualToString:kRootfsSHA256];
+}
+
+// The ext4 superblock magic 0xEF53 at offset 1080 (1024-byte boot
+// sector + 56 bytes into the superblock), little-endian. A two-byte
+// pread: the cheap proof a read-only image with no fingerprint is a
+// real ext4 filesystem, not a truncated or foreign file.
++ (BOOL)imageLooksLikeExt4At:(NSString*)path {
+    NSFileHandle* handle = [NSFileHandle fileHandleForReadingAtPath:path];
+    if (!handle) return NO;
+    @try {
+        [handle seekToFileOffset:1080];
+        NSData* magic = [handle readDataOfLength:2];
+        [handle closeFile];
+        if (magic.length != 2) return NO;
+        const uint8_t* b = (const uint8_t*)magic.bytes;
+        return b[0] == 0x53 && b[1] == 0xEF;
+    } @catch (NSException* exception) {
+        return NO;
+    }
 }
 
 // The pipeline's one-time verify: full SHA-256 of the extracted
 // image, run once after extraction. On success the fingerprint is
-// recorded, so every later guestInstalledAt call is a stat.
+// recorded (with the hash), so every later guestInstalledAt call is
+// a stat. A failure here is a genuinely damaged fresh download, so
+// the error says damaged — never "hash mismatch": a version
+// difference is not corruption, and this function only ever runs
+// against the file the pipeline just extracted for this release.
 + (BOOL)guestImageHashValidAt:(NSString*)rootfsPath error:(NSString**)error {
-    if (!FileHasHash(rootfsPath, kRootfsSHA256, @"Verifying image")) {
-        if (error) *error = @"guest image hash mismatch — reinstall";
+    NSError* hashError = nil;
+    NSString* hash = SHA256OfFile(rootfsPath, @"Verifying image", &hashError);
+    if (!hash || ![hash isEqualToString:kRootfsSHA256]) {
+        if (error) *error = @"the guest image is damaged — reinstall";
         return NO;
     }
     NSDictionary* attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:rootfsPath error:nil];
-    if (attrs) [self recordVerifiedFingerprintForPath:rootfsPath attrs:attrs];
+    if (attrs) [self recordVerifiedFingerprintForPath:rootfsPath attrs:attrs hash:hash];
     return YES;
 }
 
 // Cheap by design: exists + size + read-only bit, then the recorded
-// fingerprint. NEVER a hash here — this runs on the startup screen's
-// 0.5 s poll timer and on engine init, and a full SHA-256 of 1 GiB
-// on every tick is the "Verifying image" loop. The only full hashes
-// are the pipeline's one-time verify (guestImageHashValidAt:) and the
-// single legacy hash below, for an image installed by a build that
-// predates the fingerprint.
+// fingerprint or the ext4 magic. NEVER a hash here — this runs on
+// the startup screen's 0.5 s poll timer and on engine init, and a
+// full SHA-256 of 1 GiB on every tick is the "Verifying image" loop.
+// The only full hashes are the pipeline's one-time verify
+// (guestImageHashValidAt:) and the launch update check, which runs
+// once on a background queue and never blocks booting.
+// A version difference is NOT a failure: an older release that is
+// a valid ext4 image boots exactly like the current one, and the
+// update is offered separately. Only a file that cannot be a guest
+// image at all — wrong size, or not ext4 — is damaged.
 + (BOOL)guestInstalledAt:(NSString*)rootfsPath error:(NSString**)error {
     NSFileManager* fm = [NSFileManager defaultManager];
     NSDictionary* attrs = [fm attributesOfItemAtPath:rootfsPath error:nil];
@@ -566,10 +657,11 @@ static NSString* const kVerifiedRootfsKey = @"app.termx.ios.verified-rootfs";
         return NO;
     }
     if (kRootfsSize > 0 && [attrs fileSize] != kRootfsSize) {
-        if (error) *error = @"guest image has the wrong size — reinstall";
+        if (error) *error = @"guest image is damaged (wrong size) — reinstall";
         return NO;
     }
-    // This exact file was already hash-verified: the verdict stands.
+    // This exact file was already hash-verified: the verdict stands,
+    // whatever release it was verified as.
     if ([self verifiedFingerprintMatchesPath:rootfsPath attrs:attrs]) return YES;
     // Not yet verified by this build, or the file changed since it
     // was: a half-extracted file still carries write bits, so it is
@@ -578,9 +670,12 @@ static NSString* const kVerifiedRootfsKey = @"app.termx.ios.verified-rootfs";
         if (error) *error = @"guest image is not verified — reinstall";
         return NO;
     }
-    // Legacy image (installed before fingerprints existed), or a file
-    // that changed after verification: one full hash, then remember it.
-    return [self guestImageHashValidAt:rootfsPath error:error];
+    // Read-only, no fingerprint: an image installed by an older
+    // build, or an older release. If it is a real ext4 image it
+    // boots; only a file that is not ext4 at all is damaged.
+    if ([self imageLooksLikeExt4At:rootfsPath]) return YES;
+    if (error) *error = @"guest image is damaged — reinstall";
+    return NO;
 }
 
 // Streaming gunzip of src (.gz) to dst, in heap chunks: memory stays
@@ -646,9 +741,12 @@ static NSString* const kVerifiedRootfsKey = @"app.termx.ios.verified-rootfs";
 + (void)installGuestToOnQueue:(NSString*)rootfsPath
                      progress:(void (^)(double, NSString*, int64_t, int64_t))progress
                    completion:(void (^)(BOOL, NSString*))completion {
-    NSString* error = nil;
-    if ([self guestInstalledAt:rootfsPath error:&error]) {
-        TXLogEngine(@"Install skipped: guest image already verified");
+    // Skip only when the installed image is already this build's
+    // release. An older valid image is NOT skipped: Install (and
+    // Update) means "get the current image", and the pipeline swaps
+    // it in only after the new one verifies.
+    if ([self installedImageIsCurrentReleaseAt:rootfsPath]) {
+        TXLogEngine(@"Install skipped: guest image is already the current release");
         if (completion) completion(YES, nil);
         return;
     }

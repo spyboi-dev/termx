@@ -19,7 +19,8 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     TXStartupRowPending, // not started yet: dim hollow circle
     TXStartupRowActive,  // running now: spinner, detail in teal
     TXStartupRowDone,    // really finished: teal check
-    TXStartupRowFailed   // failed: red outline, reason in red
+    TXStartupRowFailed,  // failed: red outline, reason in red
+    TXStartupRowUpdate   // done, but a newer image is available: teal check, detail in teal
 };
 
 @interface TXStartupViewController ()
@@ -51,6 +52,12 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 @property (nonatomic, strong) NSDate *startTime;
 @property (nonatomic, assign) BOOL terminalPresented; // shown once per Running state
 @property (nonatomic, assign) BOOL presentAfterLogCloses;
+// Update flow: YES once the user tapped Update while the guest was
+// running and the guest was asked to stop; the install starts when
+// the state actually reaches Stopped (see maybeStartPendingUpdate).
+// The pipeline replaces the image file, which must never happen
+// under a running guest.
+@property (nonatomic, assign) BOOL updateAfterStop;
 // Download rate: bytes and time of the last poll tick, so the
 // "MB/s" figure is measured, not guessed.
 @property (nonatomic, assign) int64_t lastReceived;
@@ -373,10 +380,13 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     // install finished while backgrounded.
     [self maybeAutoBoot];
     [self maybeScheduleBootRetry];
+    [self maybeStartPendingUpdate];
 }
 
 // The one button follows the engine state, and only the state:
 // Install when nothing is installed (or the last step failed),
+// Update when a newer image is available and the guest is stopped
+// (or running — tapping it stops the guest first, then installs),
 // Start when the guest is installed but powered off, disabled with
 // the live phase while something is in flight. The boot itself is
 // automatic (see maybeAutoBoot) — there is no Boot button to tap.
@@ -390,7 +400,11 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             self.actionButton.enabled = YES;
             break;
         case TermXStateStopped:
-            [self.actionButton setTitle:@"Start" forState:UIControlStateNormal];
+            if (engine.updateAvailable) {
+                [self.actionButton setTitle:@"Update" forState:UIControlStateNormal];
+            } else {
+                [self.actionButton setTitle:@"Start" forState:UIControlStateNormal];
+            }
             self.actionButton.enabled = YES;
             break;
         case TermXStateReady:
@@ -406,8 +420,13 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             self.actionButton.enabled = NO;
             break;
         case TermXStateRunning:
-            [self.actionButton setTitle:@"Running" forState:UIControlStateNormal];
-            self.actionButton.enabled = NO;
+            if (engine.updateAvailable) {
+                [self.actionButton setTitle:@"Update" forState:UIControlStateNormal];
+                self.actionButton.enabled = YES;
+            } else {
+                [self.actionButton setTitle:@"Running" forState:UIControlStateNormal];
+                self.actionButton.enabled = NO;
+            }
             break;
     }
     self.eraseButton.enabled = (engine.state != TermXStateDownloading &&
@@ -467,11 +486,18 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     NSInteger failedStep = engine.failedStep;
     NSString *status = engine.statusText ?: @"";
 
-    // System image.
+    // System image. A version difference is an update, never a
+    // failure: the row stays done (the installed image is valid and
+    // booting) and says an update is available in teal. Only a
+    // genuinely damaged image fails this row.
     if (failed && failedStep == TXBootStepImage) {
         [self setRow:TXBootStepImage state:TXStartupRowFailed detail:status];
     } else if ([engine guestInstalled]) {
-        [self setRow:TXBootStepImage state:TXStartupRowDone detail:engine.imageDetail];
+        if (engine.updateAvailable) {
+            [self setRow:TXBootStepImage state:TXStartupRowUpdate detail:@"Update available"];
+        } else {
+            [self setRow:TXBootStepImage state:TXStartupRowDone detail:engine.imageDetail];
+        }
     } else if (engine.state == TermXStateDownloading) {
         [self setRow:TXBootStepImage state:TXStartupRowActive detail:[self downloadDetail]];
     } else {
@@ -560,6 +586,18 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             spinner.hidden = YES;
             title.textColor = [UIColor whiteColor];
             detailLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+            break;
+        case TXStartupRowUpdate:
+            // The image is fine (teal check, like Done) — but a
+            // newer one exists, so the detail says so in teal.
+            // Never red, never a failure: this is a normal state.
+            icon.backgroundColor = TXStartupTeal();
+            icon.layer.borderWidth = 0;
+            check.hidden = NO;
+            [spinner stopAnimating];
+            spinner.hidden = YES;
+            title.textColor = [UIColor whiteColor];
+            detailLabel.textColor = TXStartupTeal();
             break;
         case TXStartupRowActive:
             icon.backgroundColor = [UIColor clearColor];
@@ -701,6 +739,27 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     });
 }
 
+// The pending Update: the user tapped Update while the guest was
+// running, and the guest has now actually stopped. Install the new
+// image now — the pipeline replaces the image file, which is only
+// safe once the guest is off. If the stop itself failed instead,
+// drop the pending update: the user can tap Update again.
+- (void)maybeStartPendingUpdate {
+    if (!self.updateAfterStop) return;
+    KernEngine *engine = [KernEngine shared];
+    if (engine.state == TermXStateStopped) {
+        self.updateAfterStop = NO;
+        self.autoBootDone = NO;
+        self.bootRetryUsed = NO;
+        self.bootRetryScheduled = NO;
+        TXLogEngine(@"Update: guest stopped, installing the new image");
+        [engine installGuestWithCompletion:nil];
+    } else if (engine.state == TermXStateFailed) {
+        self.updateAfterStop = NO;
+        TXLogEngine(@"Update: the guest failed to stop — update cancelled, tap Update to try again");
+    }
+}
+
 // Present the terminal once the shell is really ready. A short
 // beat at full green first, so the user sees every check done. If
 // the log screen is open on top, wait until it closes instead of
@@ -730,6 +789,27 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 
 - (void)actionTapped {
     KernEngine *engine = [KernEngine shared];
+    if (engine.updateAvailable &&
+        (engine.state == TermXStateRunning || engine.state == TermXStateStopped)) {
+        // Update: fetch this build's image and swap it in for the
+        // next boot. The data disk is untouched — only the live
+        // shell session ends — and a failed update leaves the
+        // installed image in place (the pipeline swaps only after
+        // the new image verifies). When the guest is running it
+        // must stop first; the install starts from the poll tick
+        // once the state actually reaches Stopped.
+        if (engine.state == TermXStateRunning) {
+            self.updateAfterStop = YES;
+            TXLogEngine(@"Update: stopping the guest first");
+            [engine stopGuest];
+            return;
+        }
+        self.autoBootDone = NO;
+        self.bootRetryUsed = NO;
+        self.bootRetryScheduled = NO;
+        [engine installGuestWithCompletion:nil];
+        return;
+    }
     if (engine.state == TermXStateStopped) {
         // The guest is installed but powered off: start it. A manual
         // start earns a fresh automatic retry if this boot fails.

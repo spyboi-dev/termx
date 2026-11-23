@@ -110,7 +110,17 @@ extern NSString* const kTermXStateChanged;
 
 + (instancetype)shared;
 
-// True when the rootfs image exists and its SHA-256 matches the build.
+// YES when the installed image is a valid older release and a
+// newer one is published: the app boots the installed image and
+// offers the new one as an Update, never a failure. Set by the
+// background launch update check; cleared by a successful install.
+// Changes post kTermXStateChanged so the startup screen refreshes.
+@property (nonatomic, readonly) BOOL updateAvailable;
+
+// True when a valid rootfs image exists on disk — any release. A
+// version difference is an update, not a failure: the image boots
+// as-is. Only a file that cannot be a guest image at all (wrong
+// size, not ext4) counts as not installed.
 - (BOOL)guestInstalled;
 
 // Download the Debian image, verify it (SHA-256 of the archive and of
