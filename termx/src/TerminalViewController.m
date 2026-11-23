@@ -548,6 +548,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 // being cut. Clamped to a sane range; 80 when the width is unknown.
 - (NSInteger)visibleColumns {
     CGFloat width = _output.bounds.size.width - (_output.textContainerInset.left + _output.textContainerInset.right);
+    // Fall back to the screen width if the text view has no size yet
+    // (viewDidAppear can fire before the first layout on a cold
+    // launch): without it the fallback is 80, the stty sets 80, and
+    // nothing changes — the lines stay cut.
+    if (width <= 0) {
+        width = [UIScreen mainScreen].bounds.size.width - (_output.textContainerInset.left + _output.textContainerInset.right);
+    }
     if (width <= 0) return 80;
     CGFloat advance = [@"M" sizeWithAttributes:@{NSFontAttributeName: TXTermFont()}].width;
     if (advance <= 0) return 80;
@@ -570,12 +577,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         _didClearScreenOnBoot = YES;
         // Tell the guest the visible width first: it lays out for 80
         // columns by default, but only ~48 are visible, so long lines
-        // are cut at the right edge. `stty cols` sets the tty winsize,
-        // so programs wrap at the edge instead of being cut. The
-        // command is sent as input (bash runs it); its echo is wiped
-        // by the second clear below, so the user never sees it.
+        // are cut at the right edge. `stty cols` sets the tty winsize
+        // (what TIOCGWINSZ reads), and exporting COLUMNS covers the
+        // programs that read the variable instead of the winsize —
+        // fastfetch was still laying out for 80 after the stty alone,
+        // so both are set. The command is sent as input (bash runs
+        // it); its echo is wiped by the second clear below, so the
+        // user never sees it.
         NSInteger cols = [self visibleColumns];
-        NSString *stty = [NSString stringWithFormat:@"stty cols %ld\n", (long)cols];
+        NSString *stty = [NSString stringWithFormat:@"stty cols %ld; export COLUMNS=%ld\n", (long)cols, (long)cols];
         [_engine sendConsoleInput:[stty dataUsingEncoding:NSUTF8StringEncoding]];
         // ED 2 through the parser now: the same clear the `clear`
         // command uses, so it empties both the visible grid and the
