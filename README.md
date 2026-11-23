@@ -2,9 +2,7 @@
 
 [![License: GPL v2](https://img.shields.io/badge/License-GPL_v2-blue.svg)](LICENSE-GPL-2.0)
 
-A real Linux terminal for iPhone, based on the native Linux kernel by Kernarium.
-
-TermX is the first to combine a real Linux kernel with Debian and a terminal-first design on iOS. The kernel is Kernarium's native Linux kernel (mainline 6.18); TermX builds the terminal and the Debian system around it.
+TermX is a Linux terminal for iPhone. It runs Debian on Kernarium's native Linux kernel (mainline 6.18), with a terminal-first interface.
 
 ## Features
 
