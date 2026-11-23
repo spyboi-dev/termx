@@ -12,7 +12,7 @@ TermX is a Linux terminal for iPhone. It runs a Debian system on the phone, with
 
 ## How it works
 
-The Linux kernel is mainline 6.18, running as a User-mode Linux guest through the [Kernarium](https://github.com/imxieyi/Kernarium) runtime. The guest is a Debian image with systemd, booted from a read-only system image with a persistent data disk on top. The UI is a native iOS terminal, modeled on NewTerm.
+The Linux kernel is mainline 6.18, running as a User-mode Linux guest through the [Kernarium](https://github.com/imxieyi/Kernarium) runtime. The guest is a Debian image with systemd, booted from a read-only system image with a persistent data disk on top. The UI is a native iOS terminal.
 
 ## Status
 
