@@ -23,21 +23,23 @@ NSString* const kTermXStateChanged = @"TermXStateChanged";
 #define TERMX_BUILD_COMMIT "nogit"
 #endif
 
-// The Linux guest: 512 MiB RAM and 2 vCPUs are plenty for a shell, and
-// leave the process headroom the runtime's GPU budget wants. 1024 MiB
-// was killed by jetsam twice in a row on device (2026-11-22, build
-// 2bbe39f): both runs died ~1 s into boot, at different kernel times,
-// with no crash record — SIGKILL while the 1 GiB of guest RAM was
-// being wired ("committed on demand and wired"). 512 MiB is the
-// runtime's minimum (pre-flight: min 512, step 64) and halves the
-// wired memory jetsam counts.
-static const uint32_t kGuestMemoryMiB = 512;
+// The Linux guest: 2 GiB RAM and 2 vCPUs. The iPhone 15 Plus has
+// 6 GiB, and the 100 ms footprint sampler (2026-11-22) showed about
+// 3.8-4.0 GiB of per-process headroom at the moment of death, so
+// 2 GiB leaves safe headroom. 512 MiB was the old value, set when
+// 1024 MiB was suspected of being killed by jetsam twice in a row
+// (2026-11-22, build 2bbe39f); the later sampler proved those deaths
+// were the /init mkdir panic, not jetsam, so the 512 MiB cut is no
+// longer needed. 2048 satisfies the pre-flight (min 512, step 64).
+static const uint32_t kGuestMemoryMiB = 2048;
 static const uint32_t kGuestCPUs = 2;
 // The guest's persistent data disk, in GiB: one sparse file at a fixed
 // path (see dataDiskPath), created once and reused on every boot, so
-// the 8 GiB is capacity, not allocated size — the file only grows as
-// the guest writes, like Andarium's "628 MiB of 8 GiB".
-static const uint64_t kDataDiskGiB = 8;
+// the 32 GiB is capacity, not allocated size — the file only grows as
+// the guest writes, like Andarium's "628 MiB of 8 GiB". 32 GiB is the
+// size a new disk gets; an existing disk keeps whatever size it was
+// created at until the user erases it (see createDataDiskIfNeeded).
+static const uint64_t kDataDiskGiB = 32;
 
 @interface KernEngine () {
     const kernarium_runtime_api* _api;
@@ -622,6 +624,11 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
 }
 
 - (unsigned long long)storageTotalBytes {
+    // The actual file size, not the constant: an install that kept
+    // its older 8 GiB disk must report 8 GiB, not the 32 GiB a new
+    // disk gets. A missing disk reports the size a new one will get.
+    struct stat st;
+    if (stat(_dataDiskPath.UTF8String, &st) == 0) return (unsigned long long)st.st_size;
     return (unsigned long long)kDataDiskGiB << 30;
 }
 
@@ -753,7 +760,7 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
     // 0.19-0.32 s, and the session record said end "running", stall
     // total 0, memory healthy). The resident variant keeps the guest
     // RAM in the process and writes no hibernation image (a plain
-    // quiesce writes up to 512 MiB to TMPDIR on every backgrounding,
+    // quiesce writes up to 2 GiB to TMPDIR on every backgrounding,
     // and a fresh run() discards stale hibernation images anyway);
     // the disk settling is identical. Only when the guest is fully
     // up: a mid-boot guest cannot suspend, and the quiesce would burn
@@ -946,7 +953,7 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
 // Create the persistent data disk if it does not exist yet; reuse it
 // otherwise. The path must name no spaces, quotes, commas or colons
 // (the runtime names it on the kernel command line); Documents/guest
-// is safe. The file is sparse (ftruncate), so an 8 GiB disk costs
+// is safe. The file is sparse (ftruncate), so a 32 GiB disk costs
 // nothing until the guest writes, and it is excluded from backup: a
 // multi-gigabyte guest disk must never ride along in an iCloud backup.
 // The stock upstream boot-ramdisk /init formats the upper layer on
@@ -958,15 +965,15 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
     NSDictionary* attrs = [fm attributesOfItemAtPath:_dataDiskPath error:nil];
     off_t size = (off_t)kDataDiskGiB << 30;
     if (attrs) {
-        if ([attrs fileSize] == (unsigned long long)size) {
-            TXLogEngine(@"Reusing data disk: %@ used of %@",
-                        TXFormatBytes(self.storageUsedBytes),
-                        TXFormatBytes(self.storageTotalBytes));
-            return YES;
-        }
-        TXLogEngine(@"Data disk has the wrong size (%@) — recreating it",
-                    TXFormatBytes([attrs fileSize]));
-        [fm removeItemAtPath:_dataDiskPath error:nil];
+        // Reuse whatever disk is already there, whatever its size.
+        // An existing install keeps its disk (8 GiB from before this
+        // build) until the user erases it: deleting it here to resize
+        // would wipe every installed package and file. Only a missing
+        // disk is created, at the current size.
+        TXLogEngine(@"Reusing data disk: %@ used of %@",
+                    TXFormatBytes(self.storageUsedBytes),
+                    TXFormatBytes(self.storageTotalBytes));
+        return YES;
     }
     int fd = open(_dataDiskPath.UTF8String, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {

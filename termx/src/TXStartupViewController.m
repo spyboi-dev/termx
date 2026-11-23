@@ -543,7 +543,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     } else if (engine.state == TermXStateBooting) {
         [self setRow:TXBootStepStorage state:TXStartupRowActive detail:@"Opening data disk…"];
     } else {
-        [self setRow:TXBootStepStorage state:TXStartupRowPending detail:@"8 GiB data disk · persists across boots"];
+        [self setRow:TXBootStepStorage state:TXStartupRowPending detail:@"32 GiB data disk · persists across boots"];
     }
 
     // Startup.

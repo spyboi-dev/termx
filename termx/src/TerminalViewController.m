@@ -3,10 +3,10 @@
 // The terminal screen follows NewTerm 3's model (hbang/NewTerm, Apache-2.0):
 // a scrolling line-based terminal, 80x25, xterm-256color, system monospace
 // font, and the keyboard toolbar above the software keyboard: Ctrl
-// (toggle), Esc, Tab, More (toggle), Paste, and butterfly arrows on the
-// primary row; Home, End, PgUp, PgDn, Del and Fn (toggle) on the
-// secondary row; F1-F12 on a horizontally scrolling Fn row. The VT
-// emulation is our own vt.c (NewTerm uses SwiftTerm, which is Swift and
+// (toggle), Esc, Tab, More (toggle), Paste, and four separate arrow
+// keys on the primary row; Home, End, PgUp, PgDn, Del and Fn (toggle)
+// on the secondary row; F1-F12 on a horizontally scrolling Fn row.
+// The VT emulation is our own vt.c (NewTerm uses SwiftTerm, which is Swift and
 // cannot build here); the key bytes match NewTerm's TerminalConstants
 // exactly. The shell itself lives in the guest, never on iOS: typed input
 // goes to the guest console, guest output feeds the terminal view.
@@ -76,6 +76,13 @@ static NSParagraphStyle *TXTermParagraphStyle(void) {
     dispatch_once(&once, ^{
         NSMutableParagraphStyle *para = [[NSMutableParagraphStyle alloc] init];
         para.lineSpacing = 2;
+        // Clip, never wrap: the layout manager takes the paragraph
+        // style's line-break mode over the text container's, and the
+        // default is word-wrapping — so a container set to Clipping
+        // still wrapped at the view width on device (fastfetch's
+        // two-column lines interleaved). With Clipping here too, a
+        // long line is one visual line that scrolls horizontally.
+        para.lineBreakMode = NSLineBreakByClipping;
         style = [para copy];
     });
     return style;
@@ -192,12 +199,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // The terminal itself: the shared theme — refined dark background,
     // soft-white text, the one 14 pt monospace font. Lines never wrap:
     // the text container is wider than the screen, so long lines scroll
-    // horizontally. That only holds because widthTracksTextView is NO
-    // below: UITextView otherwise resets a tracking container to the
-    // view's width on every layout, and lines then wrap at ~50 columns
-    // on a phone — the guest lays its output out for an 80-column tty,
-    // so a wrapped line splits a two-column layout (fastfetch's
-    // logo/info, apt's progress bars) and the halves interleave.
+    // horizontally. That takes three layers, because 1b01285's single
+    // widthTracksTextView = NO did not hold on device and fastfetch
+    // still wrapped at ~48 columns: tracking OFF before the size is
+    // set, the paragraph style's line-break mode is Clipping too
+    // (the layout manager prefers it over the container's, and its
+    // default is word-wrapping), and viewDidLayoutSubviews re-asserts
+    // the 10000 pt width on every layout. A wrapped line splits a
+    // two-column layout (fastfetch's logo/info, apt's progress bars)
+    // and the halves interleave, so the wrap must never happen.
     // It starts at the top of the screen: there is no bar above it
     // any more.
     _output = [[TXTerminalTextView alloc] init];
@@ -207,11 +217,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _output.backgroundColor = TXThemeBackgroundColor();
     _output.font = TXTermFont();
     _output.textContainer.lineBreakMode = NSLineBreakByClipping;
-    _output.textContainer.size = CGSizeMake(10000, CGFLOAT_MAX);
     // Do not let the container track the view width (see above): with
     // tracking on, the 10000 pt width is thrown away on layout and
     // every long line wraps at the screen edge instead of scrolling.
+    // Set tracking OFF *before* the size: setting the size while
+    // tracking is still on lets the next layout throw it away, and
+    // 1b01285 (size first, tracking off after) did not hold on device
+    // — fastfetch still wrapped at ~48 columns.
     _output.textContainer.widthTracksTextView = NO;
+    _output.textContainer.size = CGSizeMake(10000, CGFLOAT_MAX);
     // A real margin, not the old 6 pt: the text sat flush against the
     // screen edges. 12 pt each side, 8 pt above, 6 pt below the text.
     _output.textContainerInset = UIEdgeInsetsMake(8, 12, 6, 12);
@@ -296,11 +310,17 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         }] forControlEvents:UIControlEventTouchUpInside];
         [fnStack addArrangedSubview:b];
     }
+    // Pin to the content layout guide, not the frame: the twelve
+    // F-keys are wider than the screen (~462 pt), so pinning to the
+    // frame forced the stack to the scroll view's width and squeezed
+    // every key. Pinned to the content guide the stack sizes to its
+    // buttons and the row scrolls horizontally, which is what the
+    // scroll view is for.
     [NSLayoutConstraint activateConstraints:@[
-        [fnStack.leadingAnchor constraintEqualToAnchor:_fnRow.leadingAnchor constant:6],
-        [fnStack.trailingAnchor constraintEqualToAnchor:_fnRow.trailingAnchor constant:-6],
-        [fnStack.topAnchor constraintEqualToAnchor:_fnRow.topAnchor],
-        [fnStack.bottomAnchor constraintEqualToAnchor:_fnRow.bottomAnchor],
+        [fnStack.leadingAnchor constraintEqualToAnchor:_fnRow.contentLayoutGuide.leadingAnchor constant:6],
+        [fnStack.trailingAnchor constraintEqualToAnchor:_fnRow.contentLayoutGuide.trailingAnchor constant:-6],
+        [fnStack.topAnchor constraintEqualToAnchor:_fnRow.contentLayoutGuide.topAnchor],
+        [fnStack.bottomAnchor constraintEqualToAnchor:_fnRow.contentLayoutGuide.bottomAnchor],
         [fnStack.heightAnchor constraintEqualToConstant:34],
     ]];
     _fnRow.hidden = YES;
@@ -328,15 +348,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _secondaryRow.hidden = YES;
     [rows addArrangedSubview:_secondaryRow];
 
-    // Primary row: Ctrl Esc Tab More Paste ... butterfly arrows.
-    // The row holds ten keys on a phone, so the gaps are tight (5 pt)
+    // Primary row: Ctrl Esc Tab More Paste ... four separate arrows.
+    // The row holds ten keys on a phone, so the gaps are tight (4 pt)
     // and the key insets are slim — with the old 10 pt insets the row
     // overflowed a 430 pt screen once Paste joined it, and the stack
     // view squeezed the titles.
     UIStackView *primary = [[UIStackView alloc] init];
     primary.translatesAutoresizingMaskIntoConstraints = NO;
     primary.axis = UILayoutConstraintAxisHorizontal;
-    primary.spacing = 5;
+    primary.spacing = 4;
     _ctrlButton = [self keyButton:@"ctrl"];
     [_ctrlButton addTarget:self action:@selector(onCtrl) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:_ctrlButton];
@@ -350,20 +370,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [primary addArrangedSubview:pasteButton];
     UIView *spacer = [[UIView alloc] init];
     [primary addArrangedSubview:spacer];
-    // Butterfly arrows: left, up/down stacked, right. The up/down pair
-    // are half-height buttons (16 pt each + 2 pt spacing = 34 pt, the
-    // row height); a full keyButton is ~29 pt tall, so two of those in
-    // a 34 pt row were compressed and their glyphs overflowed and drew
-    // on top of each other. All four arrows repeat while held.
-    [self addArrowKey:primary title:@"←" tag:0 halfHeight:NO];
-    UIStackView *ud = [[UIStackView alloc] init];
-    ud.axis = UILayoutConstraintAxisVertical;
-    ud.spacing = 2;
-    ud.distribution = UIStackViewDistributionFillEqually;
-    [self addArrowKey:ud title:@"↑" tag:1 halfHeight:YES];
-    [self addArrowKey:ud title:@"↓" tag:2 halfHeight:YES];
-    [primary addArrangedSubview:ud];
-    [self addArrowKey:primary title:@"→" tag:3 halfHeight:NO];
+    // Arrows: four separate full-height buttons, left up down right,
+    // each the same size and style as the other keys and each with
+    // its own touch target. They used to share one stacked container
+    // (up over down, half-height each), which read as a single button
+    // and was too small to tap reliably. All four repeat while held.
+    [self addArrowKey:primary title:@"←" tag:0];
+    [self addArrowKey:primary title:@"↑" tag:1];
+    [self addArrowKey:primary title:@"↓" tag:2];
+    [self addArrowKey:primary title:@"→" tag:3];
     UIButton *kbd = [self keyButton:@"⌨"];
     kbd.titleLabel.font = [UIFont monospacedSystemFontOfSize:16 weight:UIFontWeightMedium];
     [kbd.widthAnchor constraintEqualToConstant:44].active = YES;
@@ -418,6 +433,12 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         (void)t;
         [self flushTerminal];
     }];
+    // The flush must run while the user holds a key (tracking mode),
+    // or output would not render until the finger lifts. It is added
+    // to the common modes so it fires during tracking; flushTerminal
+    // itself refuses to rebuild while the user is dragging, so the
+    // scroll is never disturbed.
+    [[NSRunLoop mainRunLoop] addTimer:_flushTimer forMode:NSRunLoopCommonModes];
 
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(keyboardWillChange:)
                                                  name:UIKeyboardWillChangeFrameNotification object:nil];
@@ -436,6 +457,19 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [_output addGestureRecognizer:exitPan];
 
     [self termXEngineDidChangeState:_engine.state status:_engine.statusText];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    // Re-assert the wide text container on every layout. 1b01285 set
+    // widthTracksTextView = NO, but fastfetch still wrapped on device,
+    // so something in layout resets the container to the view width;
+    // this puts it back to 10000 pt before the next flush renders.
+    // The guard breaks the loop: setting the size triggers one more
+    // layout, which sees 10000 and does nothing.
+    if (_output.textContainer.size.width != 10000) {
+        _output.textContainer.size = CGSizeMake(10000, CGFLOAT_MAX);
+    }
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -466,6 +500,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
 - (void)sendKeyData:(NSData *)data {
     [[UIDevice currentDevice] playInputClick];
+    // A key button is not a letter: if Ctrl is latched and the user
+    // taps Esc, Tab, an arrow, Paste or an F-key instead of typing,
+    // release the latch here, or it would leak into the next typed
+    // character and turn it into a control byte the user never asked
+    // for. (Typing a letter goes through the text-field delegate,
+    // not here, so the Ctrl+letter path is untouched.)
+    if (_ctrlLatched) [self onCtrl];
     [_engine sendConsoleInput:data];
 }
 
@@ -488,21 +529,6 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [row addArrangedSubview:b];
 }
 
-// Half-height arrow button for the up/down pair: two of these plus
-// the 2 pt stack spacing fit the 34 pt primary row exactly (16+2+16).
-// An 11 pt glyph fits the 16 pt height with no vertical insets.
-- (UIButton *)arrowButton:(NSString *)title {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.translatesAutoresizingMaskIntoConstraints = NO;
-    [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium];
-    b.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1.0];
-    b.layer.cornerRadius = 6;
-    b.contentEdgeInsets = UIEdgeInsetsMake(0, 8, 0, 8);
-    [b.heightAnchor constraintEqualToConstant:16].active = YES;
-    return b;
-}
-
 // Arrow keys by tag: 0 left, 1 up, 2 down, 3 right (xterm sequences).
 - (NSData *)arrowDataForTag:(NSInteger)tag {
     static const char *bytes[4] = {"\x1B[D", "\x1B[A", "\x1B[B", "\x1B[C"};
@@ -510,8 +536,12 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     return [NSData dataWithBytes:bytes[tag] length:3];
 }
 
-- (void)addArrowKey:(UIStackView *)row title:(NSString *)title tag:(NSInteger)tag halfHeight:(BOOL)halfHeight {
-    UIButton *b = halfHeight ? [self arrowButton:title] : [self keyButton:title];
+// An arrow key: a full-height keyButton like every other key, with
+// its own touch target and hold-to-repeat. The up and down keys used
+// to be half-height buttons sharing one stacked container, which
+// read as a single button.
+- (void)addArrowKey:(UIStackView *)row title:(NSString *)title tag:(NSInteger)tag {
+    UIButton *b = [self keyButton:title];
     b.tag = tag;
     [b addTarget:self action:@selector(arrowTouchDown:) forControlEvents:UIControlEventTouchDown];
     [b addTarget:self action:@selector(arrowTouchUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
@@ -542,6 +572,10 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         if (!strongSelf) { [t invalidate]; return; }
         [strongSelf sendKeyData:strongSelf->_repeatData];
     }];
+    // The timer must fire while the button is held: a hold puts the
+    // run loop in tracking mode, and a timer in the default mode
+    // never fires there, so hold-to-repeat silently sent once.
+    [[NSRunLoop mainRunLoop] addTimer:_repeatTimer forMode:NSRunLoopCommonModes];
     [_repeatTimer setFireDate:[NSDate dateWithTimeIntervalSinceNow:0.4]];
 }
 
@@ -671,6 +705,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
 - (void)flushTerminal {
     if (!_vt.dirty) return;
+    // Do not rebuild while the user is dragging or the view is still
+    // decelerating: setting attributedText resets the scroll position,
+    // and rebuilding mid-drag would yank the view. The dirty flag
+    // stays set, so the next tick after the drag renders the output.
+    // (The timer is in the common modes so it fires during a key
+    // hold; a drag is the only time a flush is skipped.)
+    if (_output.isTracking || _output.isDragging || _output.isDecelerating) return;
     // The 60 ms timer rebuilds the whole attributed string every
     // flush. Setting attributedText resets the scroll position, so the
     // old code yanked the view to the bottom on every flush and a
@@ -684,7 +725,6 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // the string forever, even with no new output).
     _vt.dirty = 0;
     BOOL pinned = [self isPinnedToBottom];
-    BOOL userScrolling = _output.isTracking || _output.isDragging || _output.isDecelerating;
     CGPoint savedOffset = _output.contentOffset;
     UIFont *font = TXTermFont();
     NSMutableAttributedString *out = [[NSMutableAttributedString alloc] init];
@@ -736,17 +776,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     }
     _output.attributedText = out;
     [_output layoutIfNeeded]; // contentSize is current before we measure it
-    if (!userScrolling) {
-        if (pinned) [self scrollToBottomAnimated:NO];
-        else {
-            // Restore the saved offset, clamped to the new content
-            // height (a clear-screen can shrink it under the old one).
-            CGFloat maxOffset = _output.contentSize.height + _output.contentInset.bottom - _output.bounds.size.height;
-            CGFloat minY = -_output.contentInset.top;
-            CGPoint restored = savedOffset;
-            restored.y = MIN(MAX(restored.y, minY), MAX(maxOffset, minY));
-            _output.contentOffset = restored;
-        }
+    if (pinned) [self scrollToBottomAnimated:NO];
+    else {
+        // Restore the saved offset, clamped to the new content
+        // height (a clear-screen can shrink it under the old one).
+        CGFloat maxOffset = _output.contentSize.height + _output.contentInset.bottom - _output.bounds.size.height;
+        CGFloat minY = -_output.contentInset.top;
+        CGPoint restored = savedOffset;
+        restored.y = MIN(MAX(restored.y, minY), MAX(maxOffset, minY));
+        _output.contentOffset = restored;
     }
     [self updateJumpToBottomButton];
 }

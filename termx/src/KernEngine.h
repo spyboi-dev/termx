@@ -89,7 +89,7 @@ extern NSString* const kTermXStateChanged;
 @property (nonatomic, readonly) unsigned long long storageTotalBytes;
 
 // Fixed guest facts for the startup screen's row details.
-@property (nonatomic, readonly) NSString* kernelDetail;  // "6.18.60 · 2 vCPUs · 512 MiB RAM"
+@property (nonatomic, readonly) NSString* kernelDetail;  // "6.18.60 · 2 vCPUs · 2 GiB RAM"
 @property (nonatomic, readonly) NSString* imageDetail;   // "trixie · read-only"
 @property (nonatomic, readonly) BOOL dataDiskReady;      // data disk exists for this boot
 
