@@ -289,7 +289,7 @@ static TXRootfsDownload* s_activeDownload = nil;
     dispatch_async(TXInstallPipelineQueue(), ^{
         [self reportProgress:0.6 step:@"Verifying the download…"];
         if (!FileHasHash(gzPath, kRootfsGzSHA256, @"Verifying download")) {
-            TXLogEngine(@"Download hash mismatch — archive discarded");
+            TXLogEngine(@"Download failed its hash check — archive discarded");
             [fm removeItemAtPath:gzPath error:nil];
             [self finish:NO error:@"the download is damaged — try again"];
             return;
@@ -623,9 +623,9 @@ static NSString* const kVerifiedRootfsKey = @"app.termx.ios.verified-rootfs";
 // image, run once after extraction. On success the fingerprint is
 // recorded (with the hash), so every later guestInstalledAt call is
 // a stat. A failure here is a genuinely damaged fresh download, so
-// the error says damaged — never "hash mismatch": a version
-// difference is not corruption, and this function only ever runs
-// against the file the pipeline just extracted for this release.
+// the error says damaged: a version difference is not corruption,
+// and this function only ever runs against the file the pipeline
+// just extracted for this release.
 + (BOOL)guestImageHashValidAt:(NSString*)rootfsPath error:(NSString**)error {
     NSError* hashError = nil;
     NSString* hash = SHA256OfFile(rootfsPath, @"Verifying image", &hashError);

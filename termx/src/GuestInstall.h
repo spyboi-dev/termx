@@ -62,8 +62,7 @@ extern const long long kRootfsSize;       // bytes of the extracted image
 // thread. The install pipeline's one-time verify, and the launch
 // update check (KernEngine checkForImageUpdateForLaunch), which
 // uses it only when the fingerprint cannot answer. A failure here
-// is a genuinely damaged file, so the error says damaged — never
-// "hash mismatch".
+// is a genuinely damaged file, so the error says damaged.
 + (BOOL)guestImageHashValidAt:(NSString*)rootfsPath error:(NSString**)error;
 
 // Download + verify + extract the image to rootfsPath.
