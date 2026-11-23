@@ -261,6 +261,9 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _moreButton = [self keyButton:@"more"];
     [_moreButton addTarget:self action:@selector(onMore) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:_moreButton];
+    UIButton *pasteButton = [self keyButton:@"paste"];
+    [pasteButton addTarget:self action:@selector(onPaste) forControlEvents:UIControlEventTouchUpInside];
+    [primary addArrangedSubview:pasteButton];
     UIView *spacer = [[UIView alloc] init];
     [primary addArrangedSubview:spacer];
     // Butterfly arrows: left, up/down stacked, right. The up/down pair
@@ -486,6 +489,14 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 - (void)onFn {
     _fnRow.hidden = !_fnRow.hidden;
     [self setToggle:_fnButton on:!_fnRow.hidden];
+}
+
+// Paste: the clipboard text goes to the guest exactly as if typed,
+// newlines included. An empty clipboard is a no-op (nil.length is 0).
+- (void)onPaste {
+    NSString *text = [UIPasteboard generalPasteboard].string;
+    if (text.length == 0) return;
+    [self sendKeyData:[text dataUsingEncoding:NSUTF8StringEncoding]];
 }
 
 - (void)onKeyboard {
