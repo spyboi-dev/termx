@@ -12,7 +12,7 @@ Guest image:
 
 ## Engine
 
-Kernarium's real mainline Linux 6.18 kernel running natively on iOS (User-mode Linux), userspace emulated with the iSH-style interpreter. The guest gets 2 GiB RAM and a 32 GiB persistent disk, so installs survive reboots.
+Based on Kernarium's native Linux kernel (mainline 6.18) running on iOS. The guest gets 2 GiB RAM and a 32 GiB persistent disk, so installs survive reboots.
 
 ## What you get
 
