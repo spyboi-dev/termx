@@ -148,6 +148,16 @@ echo '# TermX: pip --user installs scripts to ~/.local/bin; put it on PATH.' >> 
 echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' >> /home/termx/.bashrc
 echo '# TermX: pip --user installs scripts to ~/.local/bin; put it on PATH.' >> /etc/bash.bashrc
 echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' >> /etc/bash.bashrc
+# Terminal width: the terminal shows 48 columns (14 pt font on this
+# iPhone), but the guest lays out for 80 by default, so long lines are
+# cut at the right edge (fastfetch was the visible case). Set the tty
+# width at login so programs wrap at the visible edge. Guarded to a
+# real terminal; COLUMNS is the fallback for programs that read the
+# variable instead of the winsize. Appended last, after PS1 and PATH.
+echo '# TermX: the terminal shows 48 columns; set the tty width at login so programs wrap at the visible edge.' >> /home/termx/.bashrc
+echo 'if [ -t 0 ]; then stty cols 48 2>/dev/null; export COLUMNS=48; fi' >> /home/termx/.bashrc
+echo '# TermX: the terminal shows 48 columns; set the tty width at login so programs wrap at the visible edge.' >> /etc/bash.bashrc
+echo 'if [ -t 0 ]; then stty cols 48 2>/dev/null; export COLUMNS=48; fi' >> /etc/bash.bashrc
 
 echo "== networking: DHCP on eth0 via systemd-networkd"
 mkdir -p /etc/systemd/network
@@ -208,6 +218,66 @@ cat > /etc/pip.conf <<'EOF'
 break-system-packages = true
 EOF
 
+echo "== fastfetch: real hardware, not the virtual machine"
+# The guest kernel does not know it runs on an Apple A16, so fastfetch
+# reports CPU "Unknown", Host "Virtual Machine" and a Kernarium virtual
+# GPU. Tell fastfetch the real hardware with static custom modules;
+# everything else (OS, kernel, memory, disk, ...) stays auto-detected.
+# The terminal is 48 columns wide, so line wrapping is on (fastfetch
+# defaults it off) and long lines wrap at the edge instead of running
+# off the right. The default Debian logo and module set are kept.
+mkdir -p /home/termx/.config/fastfetch
+cat > /home/termx/.config/fastfetch/config.jsonc <<'EOF'
+{
+  "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+  // TermX: the guest kernel does not know it runs on an Apple A16,
+  // so fastfetch reports CPU "Unknown", Host "Virtual Machine" and a
+  // Kernarium virtual GPU. The real hardware is filled in below with
+  // static custom modules; everything else is auto-detected.
+  "display": {
+    // The terminal is 48 columns wide (stty cols 48 at login). Wrap
+    // long lines at the terminal width instead of letting them run
+    // off the right edge.
+    "disableLinewrap": false
+  },
+  "modules": [
+    "title",
+    "separator",
+    "os",
+    {
+      "type": "custom",
+      "key": "Host",
+      "format": "iPhone 15 Plus"
+    },
+    "kernel",
+    "uptime",
+    "packages",
+    "shell",
+    "display",
+    "terminal",
+    {
+      "type": "custom",
+      "key": "CPU",
+      "format": "Apple A16 (6 cores)"
+    },
+    {
+      "type": "custom",
+      "key": "GPU",
+      "format": "Apple A16 GPU"
+    },
+    "memory",
+    "swap",
+    "disk",
+    "localip",
+    "locale",
+    "break",
+    "colors"
+  ]
+}
+EOF
+chown -R termx:termx /home/termx/.config
+chmod 644 /home/termx/.config/fastfetch/config.jsonc
+
 echo "== config file permissions (644; sudoers stays 440)"
 # Belt and braces for the umask above: every plain config file this
 # script creates must be world-readable, or the service / user that
@@ -216,7 +286,8 @@ chmod 644 /etc/hosts /etc/timezone \
   /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf \
   /etc/systemd/network/10-eth0.network /etc/resolv.conf \
   /etc/sysctl.d/99-termx.conf /etc/fstab /etc/motd \
-  /etc/apt/sources.list /etc/hostname /etc/pip.conf
+  /etc/apt/sources.list /etc/hostname /etc/pip.conf \
+  /home/termx/.config/fastfetch/config.jsonc
 
 echo "== verify the units parse"
 systemd-analyze verify default.target multi-user.target serial-getty@ttyS0.service systemd-networkd.service systemd-resolved.service || echo "systemd-analyze verify reported issues (see above)"
