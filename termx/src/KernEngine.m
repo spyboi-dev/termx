@@ -821,14 +821,22 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
     return [GuestInstall guestInstalledAt:_rootfsPath error:&error];
 }
 
+// Explicit getter: the ivar is declared in the class extension
+// above, so no synthesis is wanted for this readonly property.
+- (BOOL)launchUpdateCheckInFlight {
+    return _launchUpdateCheckInFlight;
+}
+
 // Launch update check (timing diagnostic, 2026-11-22): settles
 // whether the installed image is this build's release, on a
 // background queue — never the main thread, it reads 1 GiB. It
-// never moves the state: the boot is already under way from Ready,
-// and this only sets updateAvailable. Applies only while the launch
-// check is still the thing holding the flag: if the user tapped
-// Install meanwhile, the install completion owns the flag instead,
-// and this completion stands down.
+// sets updateAvailable, and when a newer image is available it
+// holds the guest stopped (Ready -> Stopped) so the startup screen
+// offers a tappable Update button instead of racing the auto-boot
+// into "Starting...". Applies only while the launch check is still
+// the thing holding the flag: if the user tapped Install meanwhile,
+// the install completion owns the flag instead, and this completion
+// stands down.
 - (void)checkForImageUpdateForLaunch {
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -855,6 +863,17 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
             __strong typeof(self) strongSelf2 = weakSelf;
             if (!strongSelf2 || !strongSelf2->_launchUpdateCheckInFlight) return;
             strongSelf2->_launchUpdateCheckInFlight = NO;
+            // An update holds the boot: the guest stays stopped so
+            // the startup screen shows a tappable Update button (and
+            // a Start button to boot as-is) instead of racing the
+            // auto-boot into "Starting...". Only while the guest is
+            // still Ready — if it already booted, the Update button
+            // is offered from Running instead. The state moves first,
+            // so no refresh in between can schedule the auto-boot.
+            if (!current && strongSelf2.state == TermXStateReady) {
+                strongSelf2.statusText = @"Update available — tap Update to install it, or Start to boot as-is";
+                strongSelf2.state = TermXStateStopped;
+            }
             strongSelf2.updateAvailable = !current;
             TXLogEngine(@"Image update check: installed image is %@",
                         current ? @"the current release" : @"an older release — update available");

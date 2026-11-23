@@ -31,6 +31,10 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 @property (nonatomic, strong) UILabel *reasonLabel;
 @property (nonatomic, strong) MTKView *guestView; // the guest framebuffer; never seen
 @property (nonatomic, strong) UIButton *actionButton; // Install (or Start when the guest is powered off), by state
+// Secondary action, visible only when the guest is stopped and an
+// update is available: boots the installed image as-is, so the user
+// is never forced to update. The update stays available afterwards.
+@property (nonatomic, strong) UIButton *startButton;
 // Auto-boot bookkeeping: one automatic boot per launch, plus one
 // automatic retry if a boot fails. The user never taps Boot.
 @property (nonatomic, assign) BOOL autoBootDone;
@@ -179,10 +183,16 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     // Install is the only action button — one tap installs, then
     // the engine boots itself and the terminal opens on its own.
     // Log opens the live log view. The terminal window has no
-    // buttons at all.
+    // buttons at all. The Start button is the exception: it appears
+    // only when the guest is stopped and an update is available, so
+    // the user can boot the installed image as-is instead of
+    // updating. A hidden arranged subview collapses in the stack,
+    // so it takes no space when it is not needed.
     self.actionButton = [self buttonWithTitle:@"Install" action:@selector(actionTapped)];
+    self.startButton = [self buttonWithTitle:@"Start" action:@selector(startTapped)];
+    self.startButton.hidden = YES;
     UIButton *logButton = [self buttonWithTitle:@"Log" action:@selector(logTapped)];
-    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[self.actionButton, logButton]];
+    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[self.actionButton, self.startButton, logButton]];
     buttons.axis = UILayoutConstraintAxisVertical;
     buttons.spacing = 12;
     buttons.translatesAutoresizingMaskIntoConstraints = NO;
@@ -390,9 +400,15 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 // Start when the guest is installed but powered off, disabled with
 // the live phase while something is in flight. The boot itself is
 // automatic (see maybeAutoBoot) — there is no Boot button to tap.
-// Erase is live only when nothing is running.
+// Erase is live only when nothing is running. The Start button is
+// the second choice when an update is available and the guest is
+// stopped: it boots the installed image as-is, and the update stays
+// available for next time.
 - (void)refreshButtons {
     KernEngine *engine = [KernEngine shared];
+    // The Start button lives only in the stopped-with-update state:
+    // Update is the main action there, Start is the way out of it.
+    self.startButton.hidden = !(engine.state == TermXStateStopped && engine.updateAvailable);
     switch (engine.state) {
         case TermXStateIdle:
         case TermXStateFailed:
@@ -643,6 +659,14 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     if (engine.state != TermXStateReady) return;
     if (self.autoBootDone) return;
     if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+    // Wait for the launch update check to settle before auto-booting:
+    // if a newer image is available the engine holds the guest
+    // stopped (see KernEngine checkForImageUpdateForLaunch) and the
+    // Update button is the choice, not a race with the auto-boot.
+    // The 0.5 s poll tick re-enters here once the check has settled,
+    // so nothing is lost by waiting — and no 5 s delay is scheduled
+    // while the outcome is still unknown.
+    if (engine.launchUpdateCheckInFlight) return;
     // Never hand run() a zero-sized view: the runtime refuses a
     // zero display geometry with -1, and a boot on the first tick
     // before layout would burn the one automatic boot on exactly
@@ -785,6 +809,18 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     TerminalViewController *terminal = [[TerminalViewController alloc] init];
     terminal.modalPresentationStyle = UIModalPresentationFullScreen;
     [self presentViewController:terminal animated:YES completion:nil];
+}
+
+// Boot the installed image as-is, update or no update. A manual
+// start earns a fresh automatic retry if this boot fails. The update
+// stays available: updateAvailable is untouched, so the next launch
+// (and the startup screen after this guest stops) still offers it.
+- (void)startTapped {
+    KernEngine *engine = [KernEngine shared];
+    if (engine.state != TermXStateStopped) return;
+    self.bootRetryUsed = NO;
+    self.bootRetryScheduled = NO;
+    [engine bootOnView:self.guestView];
 }
 
 - (void)actionTapped {

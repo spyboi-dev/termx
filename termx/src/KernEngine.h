@@ -117,6 +117,12 @@ extern NSString* const kTermXStateChanged;
 // Changes post kTermXStateChanged so the startup screen refreshes.
 @property (nonatomic, readonly) BOOL updateAvailable;
 
+// YES while the launch update check (background, at cold launch) is
+// still running. The startup screen waits for it before auto-booting:
+// if a newer image is available the guest is held stopped and the
+// Update button is the choice, not a race with the auto-boot.
+@property (nonatomic, readonly) BOOL launchUpdateCheckInFlight;
+
 // True when a valid rootfs image exists on disk — any release. A
 // version difference is an update, not a failure: the image boots
 // as-is. Only a file that cannot be a guest image at all (wrong
