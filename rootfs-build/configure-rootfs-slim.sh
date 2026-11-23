@@ -219,21 +219,31 @@ break-system-packages = true
 EOF
 
 echo "== fastfetch: real hardware, not the virtual machine"
-# The guest kernel does not know it runs on an Apple A16, so fastfetch
+# The guest kernel does not know what phone it runs on, so fastfetch
 # reports CPU "Unknown", Host "Virtual Machine" and a Kernarium virtual
-# GPU. Tell fastfetch the real hardware with static custom modules;
-# everything else (OS, kernel, memory, disk, ...) stays auto-detected.
-# The terminal is 48 columns wide, so line wrapping is on (fastfetch
-# defaults it off) and long lines wrap at the edge instead of running
-# off the right. The default Debian logo and module set are kept.
+# GPU. The app writes the real device into ~/.config/termx/host, cpu
+# and gpu at boot (it detects the model via sysctl hw.model), and
+# fastfetch reads those files here with "command" modules — so the
+# values are automatic per device, never hardcoded. If the files are
+# absent (older app build), the value falls back to "Unknown" instead
+# of a wrong device. Everything else (OS, kernel, memory, disk, ...)
+# stays auto-detected. The terminal is 48 columns wide, so line
+# wrapping is on (fastfetch defaults it off) and long lines wrap at
+# the edge instead of running off the right. The default Debian logo
+# and module set are kept.
 mkdir -p /home/termx/.config/fastfetch
 cat > /home/termx/.config/fastfetch/config.jsonc <<'EOF'
 {
   "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
-  // TermX: the guest kernel does not know it runs on an Apple A16,
-  // so fastfetch reports CPU "Unknown", Host "Virtual Machine" and a
-  // Kernarium virtual GPU. The real hardware is filled in below with
-  // static custom modules; everything else is auto-detected.
+  // TermX: the guest kernel does not know what phone it runs on, so
+  // fastfetch reports CPU "Unknown", Host "Virtual Machine" and a
+  // Kernarium virtual GPU. The app writes the real device into
+  // ~/.config/termx/host, cpu and gpu at boot (it detects the model
+  // via sysctl hw.model), and fastfetch reads those files here — so
+  // the values are automatic per device, never hardcoded. If the
+  // files are absent (older app build), the value falls back to
+  // "Unknown" instead of a wrong device. Everything else is
+  // auto-detected.
   "display": {
     // The terminal is 48 columns wide (stty cols 48 at login). Wrap
     // long lines at the terminal width instead of letting them run
@@ -245,9 +255,9 @@ cat > /home/termx/.config/fastfetch/config.jsonc <<'EOF'
     "separator",
     "os",
     {
-      "type": "custom",
+      "type": "command",
       "key": "Host",
-      "format": "iPhone 15 Plus"
+      "text": "cat $HOME/.config/termx/host 2>/dev/null || echo Unknown"
     },
     "kernel",
     "uptime",
@@ -256,14 +266,14 @@ cat > /home/termx/.config/fastfetch/config.jsonc <<'EOF'
     "display",
     "terminal",
     {
-      "type": "custom",
+      "type": "command",
       "key": "CPU",
-      "format": "Apple A16 (6 cores)"
+      "text": "cat $HOME/.config/termx/cpu 2>/dev/null || echo Unknown"
     },
     {
-      "type": "custom",
+      "type": "command",
       "key": "GPU",
-      "format": "Apple A16 GPU"
+      "text": "cat $HOME/.config/termx/gpu 2>/dev/null || echo Unknown"
     },
     "memory",
     "swap",
