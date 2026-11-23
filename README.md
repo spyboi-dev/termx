@@ -1,7 +1,5 @@
 # TermX
 
-<img src="icon.png" width="128" alt="TermX icon">
-
 TermX is a Linux terminal for iPhone. It runs a Debian system on the phone, with a shell, `apt`, and a persistent disk.
 
 ## What you get
