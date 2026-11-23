@@ -192,8 +192,14 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // The terminal itself: the shared theme — refined dark background,
     // soft-white text, the one 14 pt monospace font. Lines never wrap:
     // the text container is wider than the screen, so long lines scroll
-    // horizontally. It starts at the top of the screen: there is no bar
-    // above it any more.
+    // horizontally. That only holds because widthTracksTextView is NO
+    // below: UITextView otherwise resets a tracking container to the
+    // view's width on every layout, and lines then wrap at ~50 columns
+    // on a phone — the guest lays its output out for an 80-column tty,
+    // so a wrapped line splits a two-column layout (fastfetch's
+    // logo/info, apt's progress bars) and the halves interleave.
+    // It starts at the top of the screen: there is no bar above it
+    // any more.
     _output = [[TXTerminalTextView alloc] init];
     _output.translatesAutoresizingMaskIntoConstraints = NO;
     _output.editable = NO;
@@ -202,7 +208,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _output.font = TXTermFont();
     _output.textContainer.lineBreakMode = NSLineBreakByClipping;
     _output.textContainer.size = CGSizeMake(10000, CGFLOAT_MAX);
-    _output.textContainerInset = UIEdgeInsetsMake(6, 6, 6, 6);
+    // Do not let the container track the view width (see above): with
+    // tracking on, the 10000 pt width is thrown away on layout and
+    // every long line wraps at the screen edge instead of scrolling.
+    _output.textContainer.widthTracksTextView = NO;
+    // A real margin, not the old 6 pt: the text sat flush against the
+    // screen edges. 12 pt each side, 8 pt above, 6 pt below the text.
+    _output.textContainerInset = UIEdgeInsetsMake(8, 12, 6, 12);
     _output.autocorrectionType = UITextAutocorrectionTypeNo;
     // The text view ends at the toolbar, and the toolbar already rides
     // above the keyboard, so the keyboard never overlaps this view and

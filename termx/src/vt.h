@@ -7,6 +7,18 @@
  * colours are parsed into per-cell fg/bg (xterm 256-colour indices, -1
  * for default) and bold, so the view can render them; scrollback lines
  * stay plain text. No dependency on SwiftTerm or any Swift code.
+ *
+ * The 80 columns are not arbitrary: the guest console is a serial ttyS0
+ * whose winsize the kernel leaves at 0, so guest programs fall back to
+ * 80 columns, and there is no host-side channel to tell the guest a
+ * different size (the runtime has no winsize API, and injecting `stty`
+ * keystrokes into the user's live shell is unsafe). The grid must match
+ * what the guest actually emits: a narrower grid would make vt itself
+ * wrap the guest's 80-column lines and interleave two-column output
+ * (fastfetch, apt progress bars) all over again. Lines longer than the
+ * screen do not wrap in the view either — the text container is wider
+ * than the screen with widthTracksTextView off, so they scroll
+ * horizontally instead.
  */
 
 #ifndef CRATETERM_VT_H
