@@ -426,17 +426,26 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIButton *pasteButton = [self keyButton:@"paste"];
     [pasteButton addTarget:self action:@selector(onPaste) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:pasteButton];
-    UIView *spacer = [[UIView alloc] init];
-    [primary addArrangedSubview:spacer];
     // Arrows: four separate full-height buttons, left up down right,
-    // each the same size and style as the other keys and each with
-    // its own touch target. They used to share one stacked container
-    // (up over down, half-height each), which read as a single button
-    // and was too small to tap reliably. All four repeat while held.
-    [self addArrowKey:primary title:@"←" tag:0];
-    [self addArrowKey:primary title:@"↑" tag:1];
-    [self addArrowKey:primary title:@"↓" tag:2];
-    [self addArrowKey:primary title:@"→" tag:3];
+    // each with its own touch target. They used to share one stacked
+    // container (up over down, half-height each), which read as a
+    // single button and was too small to tap reliably. All four
+    // repeat while held. They sit in their own stack with equal
+    // widths, and that stack has a low hugging priority so it
+    // expands to fill the gap after Paste — the arrows used to be
+    // slim because a flexible spacer took all the leftover width
+    // and the arrows kept only their intrinsic (glyph) width.
+    UIStackView *arrowStack = [[UIStackView alloc] init];
+    arrowStack.translatesAutoresizingMaskIntoConstraints = NO;
+    arrowStack.axis = UILayoutConstraintAxisHorizontal;
+    arrowStack.spacing = 4;
+    arrowStack.distribution = UIStackViewDistributionFillEqually;
+    [arrowStack setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisHorizontal];
+    [self addArrowKey:arrowStack title:@"←" tag:0];
+    [self addArrowKey:arrowStack title:@"↑" tag:1];
+    [self addArrowKey:arrowStack title:@"↓" tag:2];
+    [self addArrowKey:arrowStack title:@"→" tag:3];
+    [primary addArrangedSubview:arrowStack];
     UIButton *kbd = [self keyButton:@"⌨"];
     kbd.titleLabel.font = [UIFont monospacedSystemFontOfSize:16 weight:UIFontWeightMedium];
     [kbd.widthAnchor constraintEqualToConstant:44].active = YES;

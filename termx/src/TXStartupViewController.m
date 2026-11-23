@@ -42,10 +42,6 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 @property (nonatomic, assign) BOOL bootRetryScheduled;
 @property (nonatomic, strong, nullable) NSDate *autoBootDeferredSince; // first tick the guest view had no size
 @property (nonatomic, strong) UIButton *eraseButton; // small destructive text button
-// Data disk size picker: the size a NEW data disk gets (GiB), default
-// 2. The existing disk keeps its own size; this only applies when a
-// disk is created (first install, or after Erase data disk).
-@property (nonatomic, strong) UISegmentedControl *diskSizeControl;
 @property (nonatomic, strong) NSMutableArray<UIView *> *rowIcons;
 @property (nonatomic, strong) NSMutableArray<UIImageView *> *rowChecks;
 @property (nonatomic, strong) NSMutableArray<UIActivityIndicatorView *> *rowSpinners;
@@ -206,44 +202,13 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     self.eraseButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.eraseButton addTarget:self action:@selector(eraseTapped) forControlEvents:UIControlEventTouchUpInside];
 
-    // Data disk size: how much storage a NEW data disk gets. The
-    // guest RAM is automatic (the full RAM iOS gives the app), so
-    // only storage is asked. Default 2 GiB. This only applies when
-    // a disk is created; an existing disk keeps its own size.
-    UILabel *diskLabel = [[UILabel alloc] init];
-    diskLabel.font = [UIFont boldSystemFontOfSize:15];
-    diskLabel.textColor = [UIColor whiteColor];
-    diskLabel.text = @"Data disk size";
-    diskLabel.translatesAutoresizingMaskIntoConstraints = NO;
-
-    NSArray<NSString *> *diskSizes = @[@"2 GB", @"4 GB", @"8 GB", @"16 GB", @"32 GB"];
-    self.diskSizeControl = [[UISegmentedControl alloc] initWithItems:diskSizes];
-    self.diskSizeControl.selectedSegmentTintColor = TXStartupTeal();
-    [self.diskSizeControl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor]} forState:UIControlStateSelected];
-    [self.diskSizeControl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.7 alpha:1.0]} forState:UIControlStateNormal];
-    self.diskSizeControl.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.diskSizeControl addTarget:self action:@selector(diskSizeChanged:) forControlEvents:UIControlEventValueChanged];
-    [self.diskSizeControl.heightAnchor constraintEqualToConstant:32].active = YES;
-
-    UILabel *diskCaption = [[UILabel alloc] init];
-    diskCaption.font = [UIFont systemFontOfSize:12];
-    diskCaption.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
-    diskCaption.text = @"New installs only · the existing disk keeps its size";
-    diskCaption.translatesAutoresizingMaskIntoConstraints = NO;
-
-    UIStackView *diskPicker = [[UIStackView alloc] initWithArrangedSubviews:@[diskLabel, self.diskSizeControl, diskCaption]];
-    diskPicker.axis = UILayoutConstraintAxisVertical;
-    diskPicker.spacing = 8;
-    diskPicker.translatesAutoresizingMaskIntoConstraints = NO;
-    [self refreshDiskSizeControl];
-
     // A spacer holds the title and card low on the screen, the way
     // the Andarium screen does, instead of crowding the top row.
     UIView *spacer = [[UIView alloc] init];
     spacer.translatesAutoresizingMaskIntoConstraints = NO;
     [spacer.heightAnchor constraintEqualToConstant:120].active = YES;
 
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[topRow, spacer, titleLabel, self.progressView, card, diskPicker, self.reasonLabel, buttons, self.eraseButton]];
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[topRow, spacer, titleLabel, self.progressView, card, self.reasonLabel, buttons, self.eraseButton]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 28;
     // The progress bar sits tight under the title, not a full
@@ -484,24 +449,6 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     self.eraseButton.enabled = (engine.state != TermXStateDownloading &&
                                 engine.state != TermXStateBooting &&
                                 engine.state != TermXStateRunning);
-}
-
-// The picker reflects the stored size (default 2 GiB). The sizes
-// are 2, 4, 8, 16, 32 GiB in order; anything else falls back to 2.
-- (void)refreshDiskSizeControl {
-    if (!self.diskSizeControl) return;
-    NSInteger gib = [KernEngine dataDiskGiB];
-    NSArray<NSNumber *> *sizes = @[@2, @4, @8, @16, @32];
-    NSInteger idx = [sizes indexOfObject:@(gib)];
-    self.diskSizeControl.selectedSegmentIndex = (idx == NSNotFound) ? 0 : idx;
-}
-
-- (void)diskSizeChanged:(UISegmentedControl *)control {
-    NSArray<NSNumber *> *sizes = @[@2, @4, @8, @16, @32];
-    NSInteger idx = control.selectedSegmentIndex;
-    if (idx < 0 || idx >= (NSInteger)sizes.count) return;
-    [KernEngine setDataDiskGiB:[sizes[(NSUInteger)idx] integerValue]];
-    TXLogEngine(@"Data disk size set to %@ GiB (new installs only)", sizes[(NSUInteger)idx]);
 }
 
 - (void)refreshHeader {
@@ -892,12 +839,51 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         // A manual Install resets the automatic flow, so the Ready
         // state it ends in boots by itself (see maybeAutoBoot), and
         // a boot failure after it gets its one automatic retry.
-        self.autoBootDone = NO;
-        self.bootRetryUsed = NO;
-        self.bootRetryScheduled = NO;
-        [engine installGuestWithCompletion:nil];
+        // Storage is asked here, at install time, not on the startup
+        // screen: a new data disk is created by this install, so
+        // this is the moment the size matters. When a disk already
+        // exists it is reused at its own size, so there is nothing
+        // to ask and the install starts at once.
+        if ([[NSFileManager defaultManager] fileExistsAtPath:engine.dataDiskPath]) {
+            self.autoBootDone = NO;
+            self.bootRetryUsed = NO;
+            self.bootRetryScheduled = NO;
+            [engine installGuestWithCompletion:nil];
+            return;
+        }
+        [self askDataDiskSizeThenInstall];
         return;
     }
+}
+
+// Ask how much storage the new data disk gets, then install. The
+// guest RAM is automatic (the full RAM iOS gives the app), so only
+// storage is asked. Default 2 GiB. The choice is stored and the
+// install creates the disk at that size; Cancel installs nothing.
+- (void)askDataDiskSizeThenInstall {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Data disk size"
+                                                                   message:@"How much storage should the guest keep for your files and installs? A bigger disk holds more, a smaller one leaves more free on your phone."
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    NSArray<NSNumber *> *sizes = @[@2, @4, @8, @16, @32];
+    __weak typeof(self) weakSelf = self;
+    for (NSNumber *size in sizes) {
+        NSString *title = [NSString stringWithFormat:@"%@ GB", size];
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction *action) {
+            (void)action;
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [KernEngine setDataDiskGiB:[size integerValue]];
+            TXLogEngine(@"Data disk size set to %@ GiB for this install", size);
+            strongSelf.autoBootDone = NO;
+            strongSelf.bootRetryUsed = NO;
+            strongSelf.bootRetryScheduled = NO;
+            [[KernEngine shared] installGuestWithCompletion:nil];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = self.actionButton;
+    sheet.popoverPresentationController.sourceRect = self.actionButton.bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 - (void)eraseTapped {
