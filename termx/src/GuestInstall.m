@@ -3,6 +3,7 @@
 #import "TXLog.h"
 #import <CommonCrypto/CommonDigest.h>
 #import <UIKit/UIKit.h> // UIApplicationDidReceiveMemoryWarningNotification
+#import <errno.h> // ENOSPC, for the disk-full download error
 #import <mach/mach.h>
 #import <zlib.h>
 
@@ -131,6 +132,21 @@ static BOOL TXResumeDataIsUsable(NSData* data) {
     return YES;
 }
 
+// Disk-full, anywhere in the error chain: an NSURLSession failure
+// can carry ENOSPC as an NSPOSIXErrorDomain code, or as
+// NSFileWriteOutOfSpaceError in the Cocoa domain, on the error
+// itself or on its underlying error. A full disk is not a Wi-Fi
+// problem, and the old generic "check Wi-Fi" message sent the user
+// to the wrong fix.
+static BOOL TXErrorIsOutOfSpace(NSError* error) {
+    for (NSError* e = error; e; e = e.userInfo[NSUnderlyingErrorKey]) {
+        if (![e isKindOfClass:[NSError class]]) break;
+        if ([e.domain isEqualToString:NSPOSIXErrorDomain] && e.code == ENOSPC) return YES;
+        if ([e.domain isEqualToString:NSCocoaErrorDomain] && e.code == NSFileWriteOutOfSpaceError) return YES;
+    }
+    return NO;
+}
+
 // SHA-256 of a file, streaming in 1 MB chunks: memory stays flat no
 // matter how big the file is. Logs a milestone every 256 MiB with the
 // label, so a kill during the 1 GiB verify leaves its position.
@@ -181,6 +197,78 @@ static dispatch_queue_t TXInstallPipelineQueue(void) {
         q = dispatch_queue_create("app.termx.ios.install-pipeline", DISPATCH_QUEUE_SERIAL);
     });
     return q;
+}
+
+// The swap lock: the image swap's renames (live -> .old, .new ->
+// live, delete .old) and the interrupted-swap recovery
+// (recoverInterruptedSwapAt:) both touch the live path and .old,
+// and the startup screen polls guestInstalledAt twice a second —
+// including while an install is in flight. Without this lock a poll
+// landing in the millisecond window between the two renames could
+// restore .old to the live path while the swap is still moving .new
+// in, and the swap would fail spuriously. The lock is held only for
+// the renames themselves (milliseconds; the gunzip and the hashes
+// run outside it), so the poll never waits on slow work.
+static NSLock* TXImageSwapLock(void) {
+    static NSLock* lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [[NSLock alloc] init]; });
+    return lock;
+}
+
+// Swap a verified .new image into the live path, atomically in the
+// only sense a filesystem swap can be: the live image is moved aside
+// to .old FIRST, then the verified .new is moved into the live path,
+// then .old is deleted — and the verified archive is deleted with it.
+// A kill at any point leaves either the old image (live, or in .old)
+// or the new one, never nothing; the recovery in
+// recoverInterruptedSwapAt: puts a stranded .old back. Returns nil
+// on success, or a user-facing error string. On failure the old image
+// is restored to the live path when one was set aside, so the guest
+// still boots.
+static NSString* TXSwapVerifiedImageIntoPlace(NSString* newPath, NSString* rootfsPath, NSString* gzPath) {
+    NSFileManager* fm = [NSFileManager defaultManager];
+    NSString* oldPath = [rootfsPath stringByAppendingString:@".old"];
+    [TXImageSwapLock() lock];
+    BOOL liveExists = [fm fileExistsAtPath:rootfsPath];
+    NSError* swapError = nil;
+    if (liveExists) {
+        // A stale .old from an earlier killed swap is superseded by
+        // the live image about to be set aside: drop it first.
+        [fm removeItemAtPath:oldPath error:nil];
+        if (![fm moveItemAtPath:rootfsPath toPath:oldPath error:&swapError]) {
+            [TXImageSwapLock() unlock];
+            TXLogEngine(@"Image swap failed moving the old image aside: %@", swapError.localizedDescription ?: @"?");
+            [fm removeItemAtPath:newPath error:nil];
+            return @"could not install the new image — the old image is still in place";
+        }
+    } else if ([fm fileExistsAtPath:oldPath]) {
+        // No live image, but the backup from an interrupted earlier
+        // swap is here: the verified new image takes the live path
+        // below and .old is dropped with it.
+        TXLogEngine(@"Image swap: no live image — the previous swap was interrupted; the verified new image supersedes the .old backup");
+    }
+    if (![fm moveItemAtPath:newPath toPath:rootfsPath error:&swapError]) {
+        TXLogEngine(@"Image swap failed moving the new image in: %@", swapError.localizedDescription ?: @"?");
+        // The old image was set aside above: put it back, so the
+        // guest still boots. If the restore itself fails, the .old
+        // stays and the next installed check recovers it.
+        if (liveExists) {
+            NSError* restoreError = nil;
+            if ([fm moveItemAtPath:oldPath toPath:rootfsPath error:&restoreError]) {
+                TXLogEngine(@"Image swap: old image restored after the failed swap");
+            } else {
+                TXLogEngine(@"Image swap: could not restore the old image: %@", restoreError.localizedDescription ?: @"?");
+            }
+        }
+        [TXImageSwapLock() unlock];
+        [fm removeItemAtPath:newPath error:nil];
+        return @"could not install the new image — the old image is still in place";
+    }
+    [fm removeItemAtPath:oldPath error:nil];
+    [fm removeItemAtPath:gzPath error:nil];
+    [TXImageSwapLock() unlock];
+    return nil;
 }
 
 // TXRootfsDownload: one background download, owned for the process
@@ -333,7 +421,11 @@ static TXRootfsDownload* s_activeDownload = nil;
             [self finish:NO error:extractError];
             return;
         }
-        [fm removeItemAtPath:gzPath error:nil];
+        // The archive is NOT deleted here any more: it stays until
+        // the swap below succeeds, so a kill anywhere before that
+        // leaves a verified archive the next Install reuses instead
+        // of re-downloading 116 MB. It is deleted with the .old
+        // after a successful swap.
         [fm removeItemAtPath:TXResumeDataPath() error:nil];
         [self reportProgress:0.95 step:@"Verifying the image…"];
         NSString* verifyError = nil;
@@ -341,7 +433,7 @@ static TXRootfsDownload* s_activeDownload = nil;
         // the just-extracted file still carries write bits until the
         // chmod below, and guestInstalledAt treats that as unverified.
         if (![GuestInstall guestImageHashValidAt:newPath error:&verifyError]) {
-            TXLogEngine(@"Image verification failed: %@", verifyError ?: @"?");
+            TXLogEngine(@"Image verification failed: %@ — the verified archive is kept, the next Install re-extracts it instead of downloading again", verifyError ?: @"?");
             [fm removeItemAtPath:newPath error:nil];
             [self finish:NO error:verifyError ?: @"image verification failed"];
             return;
@@ -349,18 +441,21 @@ static TXRootfsDownload* s_activeDownload = nil;
         // The runtime requires a read-only image: no write bits at all.
         NSDictionary* attrs = @{NSFilePosixPermissions : @(0444)};
         [fm setAttributes:attrs ofItemAtPath:newPath error:nil];
-        // Swap only now that the new image is verified: the old image
-        // is removed and the new one moved into its place (same
-        // directory, so the move is a rename). The fingerprint was
+        // Swap only now that the new image is verified (see
+        // TXSwapVerifiedImageIntoPlace): the live image is moved
+        // aside to .old first, then the verified .new is moved into
+        // the live path, then .old is deleted. The old code removed
+        // the live image and then moved .new in: a kill between the
+        // two left NO image at all, and since the .gz was already
+        // deleted the only recovery was a full re-download. Now a
+        // kill at any point leaves either the old image (live, or in
+        // .old) or the new one — never nothing. The fingerprint was
         // recorded for the .new path by the verify above; re-record
         // it for the final path with the known-good hash, so the
         // cheap installed check answers from it from now on.
-        [fm removeItemAtPath:rootfsPath error:nil];
-        NSError* swapError = nil;
-        if (![fm moveItemAtPath:newPath toPath:rootfsPath error:&swapError]) {
-            TXLogEngine(@"Image swap failed: %@", swapError.localizedDescription ?: @"?");
-            [fm removeItemAtPath:newPath error:nil];
-            [self finish:NO error:@"could not install the new image — the old image is still in place"];
+        NSString* swapError = TXSwapVerifiedImageIntoPlace(newPath, rootfsPath, gzPath);
+        if (swapError) {
+            [self finish:NO error:swapError];
             return;
         }
         NSDictionary* finalAttrs = [fm attributesOfItemAtPath:rootfsPath error:nil];
@@ -521,6 +616,13 @@ didCompleteWithError:(NSError*)error {
         [self finish:NO error:@"cancelled"];
         return;
     }
+    if (TXErrorIsOutOfSpace(error)) {
+        TXLogEngine(@"Download failed: out of space at %@ of %@",
+                    TXFormatBytes((unsigned long long)MAX(0, self.received)),
+                    TXFormatBytes((unsigned long long)MAX(0, self.expected)));
+        [self finish:NO error:@"the phone ran out of free space while downloading — free some space and try again"];
+        return;
+    }
     TXLogEngine(@"Download failed at %@ of %@: %@",
                 TXFormatBytes((unsigned long long)MAX(0, self.received)),
                 TXFormatBytes((unsigned long long)MAX(0, self.expected)),
@@ -601,6 +703,61 @@ static NSString* const kVerifiedRootfsKey = @"app.termx.ios.verified-rootfs";
     return hash != nil && [hash isEqualToString:kRootfsSHA256];
 }
 
+// The release tag this build installs, parsed out of kRootfsURL
+// (.../releases/download/<tag>/termx-....ext4.gz) — the one copy of
+// the tag, not a second hardcoded string. Falls back to the generic
+// name if the URL ever stops carrying a tag.
++ (NSString*)rootfsReleaseTag {
+    NSArray<NSString*>* parts = [kRootfsURL componentsSeparatedByString:@"/"];
+    NSUInteger idx = [parts indexOfObject:@"download"];
+    if (idx != NSNotFound && idx + 1 < parts.count) {
+        NSString* tag = parts[idx + 1];
+        if (tag.length) return tag;
+    }
+    return @"trixie slim";
+}
+
+// Recover a swap interrupted by a kill: the swap moves the live
+// image to .old before moving the verified .new in, so a kill
+// between the two leaves no live image but a working one in .old.
+// Under the swap lock (so this can never race a swap in flight —
+// the startup screen polls guestInstalledAt twice a second,
+// including during an install): if the live path is empty and .old
+// exists, move .old back; if the live image is in place and a .old
+// sits beside it, the .old is from a swap that already went live,
+// so drop it instead of wasting 1 GiB. Synchronous and cheap (a
+// stat and at most one rename): guestInstalledAt must be able to
+// answer from the restored image on the same call, or a launch
+// after a killed swap would sit at Idle until the next poll.
++ (void)recoverInterruptedSwapAt:(NSString*)rootfsPath {
+    NSFileManager* fm = [NSFileManager defaultManager];
+    NSString* oldPath = [rootfsPath stringByAppendingString:@".old"];
+    [TXImageSwapLock() lock];
+    if ([fm fileExistsAtPath:rootfsPath]) {
+        if ([fm fileExistsAtPath:oldPath]) {
+            NSError* error = nil;
+            if ([fm removeItemAtPath:oldPath error:&error]) {
+                TXLogEngine(@"Removed the stale .old image left by an interrupted swap");
+            } else {
+                TXLogEngine(@"Could not remove the stale .old image: %@", error.localizedDescription ?: @"?");
+            }
+        }
+        [TXImageSwapLock() unlock];
+        return;
+    }
+    if (![fm fileExistsAtPath:oldPath]) {
+        [TXImageSwapLock() unlock];
+        return;
+    }
+    NSError* error = nil;
+    if ([fm moveItemAtPath:oldPath toPath:rootfsPath error:&error]) {
+        TXLogEngine(@"Recovered the guest image from .old after an interrupted swap — the guest boots on the previous image");
+    } else {
+        TXLogEngine(@"Could not recover the guest image from .old: %@", error.localizedDescription ?: @"?");
+    }
+    [TXImageSwapLock() unlock];
+}
+
 // The ext4 superblock magic 0xEF53 at offset 1080 (1024-byte boot
 // sector + 56 bytes into the superblock), little-endian. A two-byte
 // pread: the cheap proof a read-only image with no fingerprint is a
@@ -657,6 +814,12 @@ static NSString* const kVerifiedRootfsKey = @"app.termx.ios.verified-rootfs";
 // the pre-flight chmods them back to 0444 before booting — so
 // rejecting it here would only force a needless 116 MB reinstall.
 + (BOOL)guestInstalledAt:(NSString*)rootfsPath error:(NSString**)error {
+    // First, heal an interrupted swap (see recoverInterruptedSwapAt:):
+    // a kill mid-swap leaves no live image but a working one in .old,
+    // and every consumer of this check — engine init, the startup
+    // screen's poll, the boot pre-flight — must see the restored
+    // image, not "not installed".
+    [self recoverInterruptedSwapAt:rootfsPath];
     NSFileManager* fm = [NSFileManager defaultManager];
     NSDictionary* attrs = [fm attributesOfItemAtPath:rootfsPath error:nil];
     if (!attrs) {
@@ -748,6 +911,11 @@ static NSString* const kVerifiedRootfsKey = @"app.termx.ios.verified-rootfs";
 + (void)installGuestToOnQueue:(NSString*)rootfsPath
                      progress:(void (^)(double, NSString*, int64_t, int64_t))progress
                    completion:(void (^)(BOOL, NSString*))completion {
+    // Heal an interrupted swap first: after a killed swap the live
+    // image may be sitting in .old, and the skip check below answers
+    // from the live path — without the recovery it would see no
+    // current image and re-download a release the phone already has.
+    [self recoverInterruptedSwapAt:rootfsPath];
     // Skip only when the installed image is already this build's
     // release. An older valid image is NOT skipped: Install (and
     // Update) means "get the current image", and the pipeline swaps

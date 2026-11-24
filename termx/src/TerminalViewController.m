@@ -13,7 +13,8 @@
 // Scrolling follows the rule every mobile terminal uses (NewTerm,
 // Blink, Termius): output follows the bottom only while the user is
 // pinned there; once they scroll up into the scrollback the view stays
-// exactly where they put it, and a floating button takes them back down.
+// exactly where they put it, and scrolling back to the bottom re-pins
+// it so output follows again.
 // The engine buffers console output from boot and the terminal replays
 // it on presentation, so the boot log and the login prompt are visible
 // even though the terminal only exists 0.7 s after the shell is ready.
@@ -23,12 +24,11 @@
 // to it.
 //
 // The look is the shared TXTheme: a pure black background with
-// soft-white text, one 14 pt monospace font used by the text view, the
-// placeholder, and the flush renderer alike, and the app teal accent
-// on the jump-to-bottom control. xterm black as a foreground renders
-// as a dim grey (pure black text is invisible on a black background);
-// as a background it is pure black, so black cells blend in instead
-// of reading as holes.
+// soft-white text, and one 14 pt monospace font used by the text view,
+// the placeholder, and the flush renderer alike. xterm black as a
+// foreground renders as a dim grey (pure black text is invisible on
+// a black background); as a background it is pure black, so black
+// cells blend in instead of reading as holes.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "TerminalViewController.h"
 
@@ -534,16 +534,12 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // Clear on boot, once: if the startup screen asked for it, wipe
     // the boot log from the display and ask the guest for a fresh
     // prompt, so the user opens on a clean prompt instead of the
-    // systemd boot log. The log itself is not lost: it stays in
-    // guest.log and engine.log. Only once per terminal instance, and
-    // only when clearScreenOnBoot is YES — returning to the terminal
-    // later never wipes scrollback.
+    // systemd boot log. Only once per terminal instance, and only
+    // when clearScreenOnBoot is YES — returning to the terminal
+    // later never wipes scrollback. The log itself is not lost: it
+    // stays in guest.log and engine.log.
     if (self.clearScreenOnBoot && !_didClearScreenOnBoot) {
         _didClearScreenOnBoot = YES;
-        // Clear on boot only: wipe the boot log from the display and
-        // ask the guest for a fresh prompt, so the user opens on a
-        // clean prompt instead of the systemd boot log. The log
-        // itself is not lost: it stays in guest.log and engine.log.
         // No command is typed into the terminal at boot — the width
         // (stty cols / COLUMNS) and the device-info files used to be
         // injected here, but auto-running commands at boot is not
@@ -710,9 +706,12 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 }
 
 - (void)setToggle:(UIButton *)button on:(BOOL)on {
+    // OFF restores the same white 0.30 the keyButton default uses:
+    // the old 0.16 left a toggled-off Ctrl/More/Fn visibly darker
+    // than its siblings.
     button.backgroundColor = on
         ? [UIColor colorWithRed:0.2 green:0.45 blue:0.85 alpha:1.0]
-        : [UIColor colorWithWhite:0.16 alpha:1.0];
+        : [UIColor colorWithWhite:0.30 alpha:1.0];
 }
 
 #pragma mark - Actions

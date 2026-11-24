@@ -48,6 +48,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 @property (nonatomic, strong) NSMutableArray<UILabel *> *rowTitles;
 @property (nonatomic, strong) NSMutableArray<UILabel *> *rowDetails;
 @property (nonatomic, strong, nullable) NSTimer *pollTimer;
+@property (nonatomic, strong, nullable) id stateChangeObserver; // block-observer token: removeObserver:self does NOT remove a block observer, so the token itself must be kept and removed in dealloc
 @property (nonatomic, strong) NSDate *startTime;
 @property (nonatomic, assign) BOOL terminalPresented; // shown once per Running state
 @property (nonatomic, assign) BOOL presentAfterLogCloses;
@@ -241,10 +242,11 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     ]];
 
     __weak typeof(self) weakSelf = self;
-    [[NSNotificationCenter defaultCenter] addObserverForName:kTermXStateChanged
-                                                       object:nil
-                                                        queue:[NSOperationQueue mainQueue]
-                                                   usingBlock:^(NSNotification * _Nonnull note) {
+    self.stateChangeObserver =
+        [[NSNotificationCenter defaultCenter] addObserverForName:kTermXStateChanged
+                                                           object:nil
+                                                            queue:[NSOperationQueue mainQueue]
+                                                       usingBlock:^(NSNotification * _Nonnull note) {
         (void)note;
         [weakSelf refresh];
         [weakSelf maybePresentTerminal];
@@ -253,6 +255,9 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 
 - (void)dealloc {
     [self.pollTimer invalidate];
+    if (self.stateChangeObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:self.stateChangeObserver];
+    }
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
@@ -261,8 +266,11 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     [self startPollTimer];
     [self refresh];
     // A new Running state may auto-present the terminal once; coming
-    // back from the terminal must not re-trigger it.
-    if ([KernEngine shared].state != TermXStateRunning) {
+    // back from the terminal must not re-trigger it. A suspended
+    // guest counts as up here: it resumes on its own, and resetting
+    // would re-present the terminal the user just swiped away from.
+    if ([KernEngine shared].state != TermXStateRunning &&
+        [KernEngine shared].state != TermXStateSuspended) {
         self.terminalPresented = NO;
     }
     [self maybePresentTerminal];
@@ -432,7 +440,15 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             [self.actionButton setTitle:@"Starting…" forState:UIControlStateNormal];
             self.actionButton.enabled = NO;
             break;
+        case TermXStateStopping:
+            [self.actionButton setTitle:@"Stopping…" forState:UIControlStateNormal];
+            self.actionButton.enabled = NO;
+            break;
         case TermXStateRunning:
+        case TermXStateSuspended:
+            // Suspended behaves like Running here: the guest is up
+            // (frozen, not off), and the button is the way back to
+            // the terminal — the foreground resume runs on its own.
             if (engine.updateAvailable) {
                 [self.actionButton setTitle:@"Update" forState:UIControlStateNormal];
                 self.actionButton.enabled = YES;
@@ -448,7 +464,9 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     }
     self.eraseButton.enabled = (engine.state != TermXStateDownloading &&
                                 engine.state != TermXStateBooting &&
-                                engine.state != TermXStateRunning);
+                                engine.state != TermXStateRunning &&
+                                engine.state != TermXStateStopping &&
+                                engine.state != TermXStateSuspended);
 }
 
 - (void)refreshHeader {
@@ -462,6 +480,12 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             break;
         case TermXStateBooting:
             text = @"Starting"; dot = TXStartupTeal(); labelColor = TXStartupTeal();
+            break;
+        case TermXStateStopping:
+            text = @"Stopping"; dot = TXStartupTeal(); labelColor = TXStartupTeal();
+            break;
+        case TermXStateSuspended:
+            text = @"Suspended"; dot = [UIColor systemOrangeColor]; labelColor = [UIColor systemOrangeColor];
             break;
         case TermXStateRunning:
             text = @"Running"; dot = [UIColor systemGreenColor]; labelColor = [UIColor systemGreenColor];
@@ -525,7 +549,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     if (failed && failedStep == TXBootStepKernel) {
         [self setRow:TXBootStepKernel state:TXStartupRowFailed detail:status];
     } else if (engine.bootPhase == TXBootPhaseServices || engine.bootPhase == TXBootPhaseReady ||
-               engine.state == TermXStateRunning) {
+               engine.state == TermXStateRunning || engine.state == TermXStateSuspended) {
         [self setRow:TXBootStepKernel state:TXStartupRowDone detail:engine.kernelDetail];
     } else if (engine.state == TermXStateBooting) {
         [self setRow:TXBootStepKernel state:TXStartupRowActive detail:@"Booting kernel…"];
@@ -550,7 +574,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     // Startup.
     if (failed && failedStep == TXBootStepStartup) {
         [self setRow:TXBootStepStartup state:TXStartupRowFailed detail:status];
-    } else if (engine.state == TermXStateRunning) {
+    } else if (engine.state == TermXStateRunning || engine.state == TermXStateSuspended) {
         [self setRow:TXBootStepStartup state:TXStartupRowDone detail:@"Shell ready · logged in as termx"];
     } else if (engine.state == TermXStateBooting) {
         // The live phase, in teal: "Starts services" once init is
@@ -796,15 +820,17 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 - (void)actionTapped {
     KernEngine *engine = [KernEngine shared];
     if (engine.updateAvailable &&
-        (engine.state == TermXStateRunning || engine.state == TermXStateStopped)) {
+        (engine.state == TermXStateRunning || engine.state == TermXStateSuspended ||
+         engine.state == TermXStateStopped)) {
         // Update: fetch this build's image and swap it in for the
         // next boot. The data disk is untouched — only the live
         // shell session ends — and a failed update leaves the
         // installed image in place (the pipeline swaps only after
-        // the new image verifies). When the guest is running it
-        // must stop first; the install starts from the poll tick
-        // once the state actually reaches Stopped.
-        if (engine.state == TermXStateRunning) {
+        // the new image verifies). When the guest is running (or
+        // suspended — request_stop ends a suspended run the same
+        // way) it must stop first; the install starts from the poll
+        // tick once the state actually reaches Stopped.
+        if (engine.state == TermXStateRunning || engine.state == TermXStateSuspended) {
             self.updateAfterStop = YES;
             TXLogEngine(@"Update: stopping the guest first");
             [engine stopGuest];
@@ -816,11 +842,11 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         [engine installGuestWithCompletion:nil];
         return;
     }
-    if (engine.state == TermXStateRunning) {
-        // The guest is running and no update is available (an
-        // update while running goes through the branch above):
-        // the button is the way back to the terminal after swiping
-        // down. maybePresentTerminal does not re-present here —
+    if (engine.state == TermXStateRunning || engine.state == TermXStateSuspended) {
+        // The guest is running (or suspended) and no update is
+        // available (an update while running goes through the branch
+        // above): the button is the way back to the terminal after
+        // swiping down. maybePresentTerminal does not re-present here —
         // terminalPresented is already YES from the first
         // auto-presentation — so this tap is the only way back.
         // No clear: returning must not wipe the scrollback.

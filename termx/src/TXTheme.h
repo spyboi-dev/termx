@@ -25,8 +25,8 @@ static inline UIColor *TXThemeForegroundColor(void) {
     return [UIColor colorWithRed:0xE6 / 255.0 green:0xED / 255.0 blue:0xF3 / 255.0 alpha:1.0];
 }
 
-// The one accent: Andarium teal, used for the startup checks, the
-// progress bar, and the terminal's jump-to-bottom control.
+// The one accent: Andarium teal, used for the startup checks and
+// the progress bar.
 static inline UIColor *TXThemeAccentColor(void) {
     return [UIColor colorWithRed:0x2A / 255.0 green:0xB3 / 255.0 blue:0xA3 / 255.0 alpha:1.0];
 }

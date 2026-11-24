@@ -24,6 +24,8 @@ typedef NS_ENUM(NSInteger, TermXState) {
     TermXStateReady,          // guest installed, ready to boot
     TermXStateBooting,        // guest booting
     TermXStateRunning,        // guest up (login prompt seen on the console)
+    TermXStateStopping,       // stop requested, run() has not returned yet
+    TermXStateSuspended,      // guest quiesced in background, resumes on foreground
     TermXStateStopped,        // guest stopped
     TermXStateFailed,         // last step failed; statusText says why
 };
@@ -90,7 +92,7 @@ extern NSString* const kTermXStateChanged;
 
 // Fixed guest facts for the startup screen's row details.
 @property (nonatomic, readonly) NSString* kernelDetail;  // "6.18.60 · 2 vCPUs · 2 GiB RAM"
-@property (nonatomic, readonly) NSString* imageDetail;   // "trixie · read-only"
+@property (nonatomic, readonly) NSString* imageDetail;   // "rootfs-20261123-slim-fix5 · read-only" when current
 @property (nonatomic, readonly) BOOL dataDiskReady;      // data disk exists for this boot
 
 // Guest files live here. rootfsPath is the Debian ext4 image (read-only,

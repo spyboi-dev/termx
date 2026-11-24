@@ -2,7 +2,6 @@
 #import "KernEngine.h"
 #import "KernariumRuntime.h"
 #import "GuestInstall.h"
-#import "TXBootPathCheck.h"
 #import "TXLog.h"
 #import <CommonCrypto/CommonDigest.h>
 #import <dlfcn.h>
@@ -63,8 +62,10 @@ static const uint64_t kDefaultDataDiskGiB = 2;
     __strong NSString* _rootfsPath;
     BOOL _dataDiskReady;
     // Footprint sampler (diagnostic): a GCD timer logging one memory
-    // line every 100 ms until the guest is Running or the run ends.
-    // Created in startMemorySampler, cancelled in stopMemorySampler;
+    // line every 100 ms during the boot window, then every 5 s while
+    // the guest is up, so a long-session jetsam still leaves a trace.
+    // Created in startMemorySampler, slowed by
+    // setMemorySamplerIntervalMs, cancelled in stopMemorySampler;
     // nil when not running. Guarded by @synchronized(self).
     dispatch_source_t _samplerTimer;
     // Background quiesce (the reboot-crash fix, 2026-11-22): a serial
@@ -136,6 +137,8 @@ static NSString* TXStateName(TermXState state) {
         case TermXStateReady: return @"Ready";
         case TermXStateBooting: return @"Booting";
         case TermXStateRunning: return @"Running";
+        case TermXStateStopping: return @"Stopping";
+        case TermXStateSuspended: return @"Suspended";
         case TermXStateStopped: return @"Stopped";
         case TermXStateFailed: return @"Failed";
     }
@@ -616,6 +619,23 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
     TXLogEngine(@"SAMPLER started (100 ms)");
 }
 
+// Slow the sampler down once the guest is up: one line every 5 s
+// instead of every 100 ms. The boot window needs the fine grain;
+// a long session needs only a trace — enough that a jetsam an hour
+// in still leaves recent lines in engine.log, without logging 720
+// lines an hour and waking the disk for it. No-op when the sampler
+// is not running.
+- (void)setMemorySamplerIntervalMs:(uint64_t)ms {
+    @synchronized (self) {
+        if (!_samplerTimer) return;
+        dispatch_source_set_timer(_samplerTimer,
+                                  dispatch_time(DISPATCH_TIME_NOW, 0),
+                                  ms * NSEC_PER_MSEC,
+                                  (uint64_t)(500 * NSEC_PER_MSEC));
+    }
+    TXLogEngine(@"SAMPLER slowed to %llu ms", (unsigned long long)ms);
+}
+
 - (void)stopMemorySampler {
     BOOL wasRunning = NO;
     @synchronized (self) {
@@ -630,16 +650,27 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
 
 - (void)setState:(TermXState)state {
     if (state == _state) return;
+    TermXState oldState = _state;
     _state = state;
     TXLogEngine(@"State: %@ — %@", TXStateName(state), self.statusText ?: @"");
-    // The sampler's job ends when the guest is up, stopped, or
-    // failed — and when the state leaves the boot window for Idle
-    // or Ready: on a fresh install (Idle) there is no boot to watch,
-    // and on Ready the boot has not started yet, so the sampler
-    // would otherwise log every 100 ms forever. A failed boot's
-    // retry re-starts it from bootOnView:.
-    if (state == TermXStateRunning || state == TermXStateStopped || state == TermXStateFailed ||
-        state == TermXStateIdle || state == TermXStateReady) {
+    // The sampler slows down once the guest is up instead of
+    // stopping: a long session needs a trace, not silence — a
+    // jetsam an hour in must still leave recent lines in
+    // engine.log. It slows only on the transition into the
+    // up-states, so Running -> Suspended -> Running does not
+    // re-log every time. It stops when the guest is off, failed,
+    // or not started yet: on a fresh install (Idle) there is no
+    // boot to watch, and on Ready the boot has not started, so the
+    // sampler would otherwise log forever. A failed boot's retry
+    // re-starts it from bootOnView:.
+    BOOL wasUp = (oldState == TermXStateRunning || oldState == TermXStateStopping ||
+                  oldState == TermXStateSuspended);
+    BOOL isUp = (state == TermXStateRunning || state == TermXStateStopping ||
+                 state == TermXStateSuspended);
+    if (isUp && !wasUp) {
+        [self setMemorySamplerIntervalMs:5000];
+    } else if (state == TermXStateStopped || state == TermXStateFailed ||
+               state == TermXStateIdle || state == TermXStateReady) {
         [self stopMemorySampler];
     }
     [[NSNotificationCenter defaultCenter] postNotificationName:kTermXStateChanged object:nil];
@@ -666,6 +697,8 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
             // Real phase transitions only: run() started, then init.
             return (_bootPhase == TXBootPhaseServices) ? 0.7 : 0.35;
         case TermXStateRunning:
+        case TermXStateStopping:
+        case TermXStateSuspended:
             return 1.0;
         case TermXStateFailed:
             return self.progress; // keep the last real value
@@ -702,6 +735,15 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
 }
 
 - (NSString*)imageDetail {
+    // The actual release tag — but only when the installed image IS
+    // this build's release. An older image's tag is not known (only
+    // the current release's hash is pinned), so it falls back to the
+    // generic name instead of naming the wrong release. In practice
+    // the startup screen shows "Update available" for an older image
+    // and never displays this string for it.
+    if ([GuestInstall installedImageIsCurrentReleaseAt:_rootfsPath]) {
+        return [NSString stringWithFormat:@"%@ · read-only", [GuestInstall rootfsReleaseTag]];
+    }
     return @"trixie slim · read-only";
 }
 
@@ -753,6 +795,12 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
                  settle.guest_suspension == KERNARIUM_RUNTIME_GUEST_SUSPENSION_SUSPENDED);
     if (_quiesced) {
         TXLogEngine(@"Background: guest suspended — the data disk is clean, resume on foreground");
+        // The user-facing state follows the guest: Suspended, not
+        // Running — the guest is frozen, and the startup screen must
+        // say so instead of claiming it is running. The foreground
+        // resume flips it back to Running.
+        self.statusText = @"Guest suspended — resumes when you return";
+        self.state = TermXStateSuspended;
     } else {
         TXLogEngine(@"Background: guest did not suspend — still running, nothing to resume");
     }
@@ -805,24 +853,60 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
 }
 
 - (void)enterBackground {
-    // Quiesce the guest so the next launch does not find a dirty data
-    // disk. The reboot crash (2026-11-22): TermX never stopped the
-    // guest when the user left the app, so every restart was a
-    // force-quit that left the data disk dirty — an ext4 journal of
-    // uncommitted transactions — and the next boot died in early
-    // kernel init (the 12:54 run booted on a fresh empty disk; the
-    // 12:58 restart on the reused 137 MiB disk died at kernel
-    // 0.19-0.32 s, and the session record said end "running", stall
-    // total 0, memory healthy). The resident variant keeps the guest
-    // RAM in the process and writes no hibernation image (a plain
-    // quiesce writes up to 2 GiB to TMPDIR on every backgrounding,
-    // and a fresh run() discards stale hibernation images anyway);
-    // the disk settling is identical. Only when the guest is fully
-    // up: a mid-boot guest cannot suspend, and the quiesce would burn
-    // its bounded waits for nothing. Runs on the lifecycle queue,
-    // never the main thread — a quiesce can block ~20 s — under a
-    // background task so iOS gives it the time.
-    if (!_api || !_running || self.state != TermXStateRunning) return;
+    // Two paths, by state. Running: quiesce the guest so the next
+    // launch does not find a dirty data disk (the reboot crash,
+    // 2026-11-22: TermX never stopped the guest when the user left
+    // the app, so every restart was a force-quit that left the data
+    // disk dirty — an ext4 journal of uncommitted transactions —
+    // and the next boot died in early kernel init). The resident
+    // variant keeps the guest RAM in the process and writes no
+    // hibernation image (a plain quiesce writes up to 2 GiB to
+    // TMPDIR on every backgrounding, and a fresh run() discards
+    // stale hibernation images anyway); the disk settling is
+    // identical. Booting: the guest cannot suspend mid-boot, and iOS
+    // freezes the process partway through it, leaving a half-booted
+    // guest with no defined state to resume into — so fail it
+    // cleanly instead (see below) and let the automatic retry
+    // re-boot it on the return to the foreground. Anything else
+    // (Downloading, Stopping, Suspended): nothing to do — a download
+    // survives on its own background session, a stop in flight ends
+    // run() on its own, and a suspended guest is already settled.
+    if (!_api || !_running) return;
+    if (self.state == TermXStateBooting) {
+        // Fail the partial boot cleanly: request_stop ends run(),
+        // the state goes Failed with a retryable reason, and the
+        // startup screen's one automatic retry (5 s, for non-Image
+        // failures) re-boots it when the app returns to the
+        // foreground. The retry timer is deferred by the OS while
+        // backgrounded and fires on return. Wasting a partial boot
+        // is cheaper than resuming a frozen half-boot. The stop runs
+        // on the lifecycle queue so it waits for anything already in
+        // flight, and the state is re-checked there: the boot may
+        // have completed while this block waited, in which case the
+        // guest quiesces normally instead of being stopped for
+        // nothing. The run() return handler keeps an existing Failed
+        // state instead of overwriting it with Stopped, so the retry
+        // still sees the failure.
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(_lifecycleQueue, ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if (strongSelf.state == TermXStateRunning) {
+                [strongSelf quiesceGuestForBackground];
+                return;
+            }
+            if (strongSelf.state != TermXStateBooting || !strongSelf->_running) return;
+            TXLogEngine(@"Background during boot: stopping the partial boot — it retries on the return to the foreground");
+            strongSelf.bootPhase = TXBootPhaseFailed;
+            strongSelf.failedStep = TXBootStepKernel;
+            strongSelf.statusText = @"Boot interrupted by backgrounding — retrying shortly";
+            strongSelf.state = TermXStateFailed;
+            TXLogFlush();
+            if (strongSelf->_api) strongSelf->_api->request_stop();
+        });
+        return;
+    }
+    if (self.state != TermXStateRunning) return;
     // Hold the guest GPU while backgrounded: iOS revokes the GPU within
     // seconds, and the runtime must not submit work while it is gone.
     // Only once the state check above has passed: a mid-boot guest
@@ -873,6 +957,10 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
             strongSelf->_api->resume();
             strongSelf->_quiesced = NO;
             TXLogEngine(@"Foreground: guest resumed");
+            // The user-facing state follows the guest back to Running:
+            // the quiesce had moved it to Suspended.
+            strongSelf.statusText = @"Debian shell — logged in as termx";
+            strongSelf.state = TermXStateRunning;
             TXLogFlush();
         }
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1067,7 +1155,8 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
 
 - (BOOL)eraseDataDiskWithError:(NSString**)error {
     if (self.state == TermXStateRunning || self.state == TermXStateBooting ||
-        self.state == TermXStateDownloading) {
+        self.state == TermXStateDownloading || self.state == TermXStateStopping ||
+        self.state == TermXStateSuspended) {
         if (error) *error = @"stop the guest before erasing the data disk";
         return NO;
     }
@@ -1288,6 +1377,11 @@ static uint32_t TXComputeGuestMemoryMiB(void) {
     // memory does not change), so recomputing on a retry is harmless.
     kGuestMemoryMiB = TXComputeGuestMemoryMiB();
     TXLogEngine(@"Guest RAM: %u MiB (device physical memory minus 1 GiB reserve)", kGuestMemoryMiB);
+    // A stale _quiesced from a previous run must not survive into a
+    // fresh boot: a stopped guest has nothing to resume, and a YES
+    // here would make the next foreground call resume() on a guest
+    // that never suspended.
+    _quiesced = NO;
     // Clear any GPU hold left over from a backgrounded boot that
     // failed: the retry must boot with the GPU free. (The hold is
     // released unconditionally in enterForeground, so this only
@@ -1403,43 +1497,18 @@ static uint32_t TXComputeGuestMemoryMiB(void) {
     // A Linux guest has no boot_completed signal: the console callback
     // flips the state to Running on the login prompt.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        // The experiment, on the exact C strings run() is about to
-        // read: log the raw bytes (pointer, length, full text, hex
-        // dump), then repeat the runtime's exact std::filesystem
-        // checks on them. If the strings are wrong here, the pointers
-        // were the problem all along; if the checks fail here, the
-        // log names which one and its error; if they pass here and
-        // run() still fails with the runtime's line, the runtime sees
-        // different bytes than the app hands it — that is the
-        // distinction this build exists to draw. A failure refuses
-        // the boot with the named cause instead of handing possibly
-        // bad pointers to the runtime.
-        NSUInteger rootfsBytes = [self->_rootfsPath lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
-        NSUInteger overlayBytes = [self->_dataDiskPath lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
-        NSUInteger sessionBytes = [self->_sessionRecordPath lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
-        // Each logged separately (no && chain): a bad first string
-        // must not hide the other two.
-        BOOL rootfsStringOK = TXLogBootCString("rootfs", boot.rootfs_path, rootfsBytes);
-        BOOL overlayStringOK = TXLogBootCString("overlay", boot.overlay_path, overlayBytes);
-        BOOL sessionStringOK = TXLogBootCString("session", boot.session_record_path, sessionBytes);
-        // The exact check runs even when a string looks wrong: the
-        // two are independent evidence, and both belong in the log.
-        BOOL pathsExactOK = TXCheckBootPathsExact(boot.rootfs_path, boot.overlay_path);
-        BOOL stringsOK = rootfsStringOK && overlayStringOK && sessionStringOK;
-        BOOL pathsOK = stringsOK && pathsExactOK;
-        TXLogFlush(); // the experiment lines must be on disk even if the run kills the process
-        if (!pathsOK) {
-            free(bootRootfs); free(bootOverlay); free(bootSession);
-            self->_running = NO;
-            self.bootPhase = TXBootPhaseFailed;
-            self.failedStep = TXBootStepKernel;
-            self.state = TermXStateFailed;
-            self.statusText = @"Boot refused: the runtime's own path check fails on the boot paths — see the log";
-            return;
-        }
         int result = self->_api->run(view, &boot);
         free(bootRootfs); free(bootOverlay); free(bootSession);
         self->_running = NO;
+        if (self.state == TermXStateFailed) {
+            // Already failed while run() was in flight — a console
+            // boot error, or the background-interrupted boot in
+            // enterBackground. Keep the failure and its reason (and
+            // the retry it earns) instead of letting a 0 result
+            // overwrite it with Stopped.
+            TXLogEngine(@"run() returned %d after the state was already Failed — keeping the failure", result);
+            return;
+        }
         if (result == 0) {
             self.bootPhase = TXBootPhaseIdle;
             self.state = TermXStateStopped;
@@ -1466,14 +1535,20 @@ static uint32_t TXComputeGuestMemoryMiB(void) {
     [self stopMemorySampler]; // clean shutdown ends the sampling window
     // Stopping a download cancels it (the background session saves
     // resume data) and goes back to Idle; stopping a running guest
-    // asks the runtime to stop it.
+    // asks the runtime to stop it. The state goes to Stopping first,
+    // so the startup screen shows the stop in progress instead of
+    // still claiming Running until run() returns.
     if (self.state == TermXStateDownloading) {
         TXLogEngine(@"Stop requested during download");
         [GuestInstall cancelDownload];
         return;
     }
     TXLogEngine(@"Stop requested");
-    if (_api && _running) _api->request_stop();
+    if (_api && _running) {
+        self.statusText = @"Stopping the guest…";
+        self.state = TermXStateStopping;
+        _api->request_stop();
+    }
 }
 
 - (NSData*)bufferedConsoleOutput {

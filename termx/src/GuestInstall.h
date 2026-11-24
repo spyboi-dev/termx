@@ -34,6 +34,19 @@ extern const long long kRootfsSize;       // bytes of the extracted image
 
 @interface GuestInstall : NSObject
 
+// The release tag this build installs (e.g. rootfs-20261123-slim-fix5),
+// parsed out of kRootfsURL — the one copy of the tag, not a second
+// hardcoded string. The startup screen shows it as the installed
+// image version when the installed image is this release.
++ (NSString*)rootfsReleaseTag;
+
+// Recover a swap interrupted by a kill: the pipeline moves the live
+// image to .old before moving the verified .new in, so a kill between
+// the two leaves no live image but a working one in .old. Restores
+// it when the live image is missing. Cheap and idempotent — safe to
+// call from every installed check.
++ (void)recoverInterruptedSwapAt:(NSString*)rootfsPath;
+
 // Cheap: true when rootfsPath exists, has the expected size, and
 // either matches the fingerprint recorded when the pipeline last
 // hash-verified it, or passes the ext4 superblock-magic check

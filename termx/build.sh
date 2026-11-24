@@ -26,12 +26,6 @@
 set -e
 cd "$(dirname "$0")"
 SDK="$HOME/workspace/spytube-ios/sdks/iPhoneOS26.5.sdk"
-# The 16.5 SDK's C++ headers: TXBootPathCheck.mm uses std::filesystem,
-# and the 26.5 SDK's libc++ headers need builtins (__builtin_ctzg /
-# __builtin_clzg) that clang-18 does not provide. Only the C++ headers
-# come from here; the sysroot stays 26.5, and the std::filesystem ABI
-# in libc++.dylib is stable across these SDKs.
-SDK16="$HOME/workspace/spytube-ios/sdks/iPhoneOS16.5.sdk"
 SRC=src
 OUT=build
 APP=$OUT/Payload/TermX.app
@@ -48,13 +42,6 @@ if [ ! -d "Frameworks/KRuntime_6_18_4K.framework" ]; then
   echo "  Kernarium/scripts/package-ios-frameworks.sh --sdk device" >&2
   echo "then copy .build/kernarium-xcframeworks/.../KRuntime_6_18_4K.framework" >&2
   echo "into Frameworks/ here and re-run this script. See BUILD-NOTE.md." >&2
-  exit 1
-fi
-
-if [ ! -d "$SDK16/usr/include/c++/v1" ]; then
-  echo "ERROR: $SDK16/usr/include/c++/v1 is missing." >&2
-  echo "TXBootPathCheck.mm needs the 16.5 SDK's C++ headers: the 26.5" >&2
-  echo "SDK's libc++ needs builtins clang-18 does not provide." >&2
   exit 1
 fi
 
@@ -76,10 +63,6 @@ for f in vt; do
   echo "   $f.c"
   $CLANG $CFLAGS -c "$SRC/$f.c" -o "$OUT/$f.o"
 done
-# Objective-C++ (std::filesystem): the C++ headers come from the 16.5
-# SDK, everything else from the 26.5 sysroot (see SDK16 above).
-echo "   TXBootPathCheck.mm"
-$CLANG $CFLAGS -nostdinc++ -isystem "$SDK16/usr/include/c++/v1" -c "$SRC/TXBootPathCheck.mm" -o "$OUT/TXBootPathCheck.o"
 
 echo "== link"
 ld64.lld-18 -arch arm64 -platform_version ios $MIN 26.5 \
@@ -91,7 +74,6 @@ ld64.lld-18 -arch arm64 -platform_version ios $MIN 26.5 \
   "$OUT"/main.o "$OUT"/AppDelegate.o "$OUT"/TerminalViewController.o \
   "$OUT"/KernEngine.o "$OUT"/GuestInstall.o "$OUT"/TXCrashLog.o \
   "$OUT"/TXLog.o "$OUT"/TXLogViewController.o "$OUT"/TXStartupViewController.o \
-  "$OUT"/TXBootPathCheck.o \
   "$OUT"/vt.o \
   -framework UIKit -framework Foundation -framework CoreGraphics \
   -framework QuartzCore -framework Metal -framework MetalKit \
