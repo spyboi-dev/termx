@@ -47,14 +47,23 @@
 // identifier (still correct — it is the actual device) and a generic
 // chip label, so no device ever gets another phone's name.
 static NSString *TXDeviceModelIdentifier(void) {
-    size_t len = 0;
-    if (sysctlbyname("hw.model", NULL, &len, NULL, 0) != 0 || len == 0) return nil;
-    char *buf = malloc(len);
-    if (!buf) return nil;
-    if (sysctlbyname("hw.model", buf, &len, NULL, 0) != 0) { free(buf); return nil; }
-    NSString *model = [NSString stringWithUTF8String:buf];
-    free(buf);
-    return model;
+    // hw.machine is the marketing-style identifier ("iPhone15,5").
+    // hw.model is the internal codename ("D38AP") — the table below
+    // is keyed by hw.machine, so reading hw.model never matches and
+    // every phone fell back to the raw codename. Read hw.machine
+    // first; hw.model is only a fallback if hw.machine is missing.
+    const char *keys[] = { "hw.machine", "hw.model" };
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+        size_t len = 0;
+        if (sysctlbyname(keys[k], NULL, &len, NULL, 0) != 0 || len == 0) continue;
+        char *buf = malloc(len);
+        if (!buf) return nil;
+        if (sysctlbyname(keys[k], buf, &len, NULL, 0) != 0) { free(buf); continue; }
+        NSString *model = [NSString stringWithUTF8String:buf];
+        free(buf);
+        if (model.length) return model;
+    }
+    return nil;
 }
 
 static NSInteger TXDeviceCPUCount(void) {
@@ -661,52 +670,58 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // later never wipes scrollback.
     if (self.clearScreenOnBoot && !_didClearScreenOnBoot) {
         _didClearScreenOnBoot = YES;
-        // Tell the guest the visible width first: it lays out for 80
-        // columns by default, but only ~48 are visible, so long lines
-        // are cut at the right edge. `stty cols` sets the tty winsize
-        // (what TIOCGWINSZ reads), and exporting COLUMNS covers the
-        // programs that read the variable instead of the winsize —
-        // fastfetch was still laying out for 80 after the stty alone,
-        // so both are set. The command is sent as input (bash runs
-        // it); its echo is wiped by the second clear below, so the
-        // user never sees it.
-        NSInteger cols = [self visibleColumns];
-        NSString *stty = [NSString stringWithFormat:@"stty cols %ld; export COLUMNS=%ld\n", (long)cols, (long)cols];
-        [_engine sendConsoleInput:[stty dataUsingEncoding:NSUTF8StringEncoding]];
-        // Tell the guest the real device, detected at runtime (never
-        // hardcoded): the guest is a VM and cannot know the iPhone,
-        // so the app writes the detected host/cpu/gpu to files the
-        // fastfetch config reads. This runs on every iPhone — the
-        // values come from sysctl hw.model on this device, so a
-        // different iPhone gets its own name, not this one's. The
-        // echo is wiped by the second clear below, like the stty.
-        NSString *host = nil, *cpu = nil, *gpu = nil;
-        TXDetectDeviceInfo(&host, &cpu, &gpu);
-        // Single-quote the values for the shell; the detected names
-        // contain no single quotes, but escape any that appear so a
-        // future model name cannot break the command.
-        NSString *(^q)(NSString *) = ^NSString *(NSString *s) {
-            return [NSString stringWithFormat:@"'%@'", [s stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
-        };
-        NSString *devinfo = [NSString stringWithFormat:@"mkdir -p ~/.config/termx; printf '%%s' %@ > ~/.config/termx/host; printf '%%s' %@ > ~/.config/termx/cpu; printf '%%s' %@ > ~/.config/termx/gpu\n", q(host), q(cpu), q(gpu)];
-        [_engine sendConsoleInput:[devinfo dataUsingEncoding:NSUTF8StringEncoding]];
+        // The injected commands must not echo: the guest tty echoes
+        // everything it receives, and the old timed second clear did
+        // not hide it — the echo lands after the clear, so the
+        // command text stayed on screen. Fix the cause, not the
+        // timing: turn echo off first, send the real commands while
+        // it is off, then turn it back on in the same send, so echo
+        // cannot be left off. Only the short `stty -echo` line
+        // itself echoes once; it is wiped by the Phase 2 clear.
+        static const uint8_t ed2[] = { 0x1B, '[', '2', 'J' };
+        NSString *noecho = @"stty -echo\n";
+        [_engine sendConsoleInput:[noecho dataUsingEncoding:NSUTF8StringEncoding]];
         // ED 2 through the parser now: the same clear the `clear`
         // command uses, so it empties both the visible grid and the
         // scrollback (and homes the cursor), and the boot log is gone
         // at once instead of flashing for the delay below.
-        static const uint8_t ed2[] = { 0x1B, '[', '2', 'J' };
         vt_feed(&_vt, ed2, sizeof(ed2));
         __weak typeof(self) weakSelf = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
-            // Second clear: wipes the `stty cols` echo, which lands
-            // after the first clear (bash echoes input as it runs).
-            // 0.3 s is plenty for a local guest to echo; without this
-            // the command would sit on the clean screen.
+            // Wipe the `stty -echo` echo. 0.5 s is plenty for a local
+            // guest to echo one short line and run it, so echo is off
+            // by now and the commands below run silently.
             vt_feed(&strongSelf->_vt, ed2, sizeof(ed2));
-            // Ask the guest for a fresh prompt on the clean screen:
+            // Tell the guest the visible width: it lays out for 80
+            // columns by default, but only ~48 are visible, so long
+            // lines are cut at the right edge. `stty cols` sets the
+            // tty winsize (what TIOCGWINSZ reads), and exporting
+            // COLUMNS covers the programs that read the variable
+            // instead of the winsize — fastfetch was still laying out
+            // for 80 after the stty alone, so both are set.
+            NSInteger cols = [strongSelf visibleColumns];
+            // Tell the guest the real device, detected at runtime
+            // (never hardcoded): the guest is a VM and cannot know
+            // the iPhone, so the app writes the detected host/cpu/gpu
+            // to files the fastfetch config reads. This runs on every
+            // iPhone — the values come from sysctl hw.machine on this
+            // device, so a different iPhone gets its own name, not
+            // this one's. Echo is off, so none of this appears.
+            NSString *host = nil, *cpu = nil, *gpu = nil;
+            TXDetectDeviceInfo(&host, &cpu, &gpu);
+            // Single-quote the values for the shell; the detected
+            // names contain no single quotes, but escape any that
+            // appear so a future model name cannot break the command.
+            NSString *(^q)(NSString *) = ^NSString *(NSString *s) {
+                return [NSString stringWithFormat:@"'%@'", [s stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
+            };
+            NSString *cmds = [NSString stringWithFormat:@"stty cols %ld; export COLUMNS=%ld; mkdir -p ~/.config/termx; printf '%%s' %@ > ~/.config/termx/host; printf '%%s' %@ > ~/.config/termx/cpu; printf '%%s' %@ > ~/.config/termx/gpu; stty echo\n", (long)cols, (long)cols, q(host), q(cpu), q(gpu)];
+            [strongSelf->_engine sendConsoleInput:[cmds dataUsingEncoding:NSUTF8StringEncoding]];
+            // Safety clear, then a fresh prompt on the clean screen:
             // bash prints a new prompt for the newline.
+            vt_feed(&strongSelf->_vt, ed2, sizeof(ed2));
             uint8_t nl = '\n';
             [strongSelf->_engine sendConsoleInput:[NSData dataWithBytes:&nl length:1]];
         });
