@@ -228,4 +228,14 @@ extern NSString* const kTermXStateChanged;
 // reach guest.log). Returns a copy; safe from any thread.
 - (NSData*)bufferedConsoleOutput;
 
+// Take over live console delivery and return the buffered output in
+// one atomic step: sets the delegate and returns the buffer copy
+// under the same lock that the console callback appends under, so a
+// chunk can neither be fed twice (in the snapshot and as a live
+// block, if it arrived between setting the delegate and reading the
+// snapshot) nor missed (arriving between the snapshot read and the
+// delegate set). The terminal must use this instead of setting
+// .delegate and then calling bufferedConsoleOutput.
+- (NSData*)beginConsoleDeliveryWithDelegate:(id<KernEngineDelegate>)delegate;
+
 @end

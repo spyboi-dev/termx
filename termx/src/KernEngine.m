@@ -185,6 +185,13 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
 #if TERMX_RING_BUFFER_AB
     // And into the in-memory replay buffer, so a terminal presented
     // later can still show the boot log and the login prompt.
+    // The delegate is read inside the same lock: the append and the
+    // decision to deliver live are one atomic step, so a chunk can
+    // neither be delivered live and also be in the snapshot a
+    // terminal takes at the same moment, nor be appended after the
+    // snapshot but before the delegate is set (see
+    // beginConsoleDeliveryWithDelegate:).
+    id<KernEngineDelegate> delegate = nil;
     @synchronized (engine) {
         if (!engine.consoleBuffer) engine.consoleBuffer = [NSMutableData data];
         [engine.consoleBuffer appendData:data];
@@ -192,9 +199,11 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
             [engine.consoleBuffer replaceBytesInRange:NSMakeRange(0, engine.consoleBuffer.length - TXConfigConsoleBufferMaxBytes)
                                             withBytes:NULL length:0];
         }
+        delegate = engine.delegate;
     }
-#endif
+#else
     id<KernEngineDelegate> delegate = engine.delegate;
+#endif
     if (delegate) {
         // The callback runs on a runtime thread; the terminal view renders
         // from its own timer, so no main-queue hop is needed here.
@@ -1746,6 +1755,17 @@ static uint32_t TXComputeGuestMemoryMiB(void) {
 
 - (NSData*)bufferedConsoleOutput {
     @synchronized (self) {
+        return [self.consoleBuffer copy] ?: [NSData data];
+    }
+}
+
+// See the header: the delegate set and the buffer copy happen under
+// the same lock the console callback appends under, so no chunk is
+// both in the returned snapshot and delivered live, and none is
+// missed between the two.
+- (NSData*)beginConsoleDeliveryWithDelegate:(id<KernEngineDelegate>)delegate {
+    @synchronized (self) {
+        self.delegate = delegate;
         return [self.consoleBuffer copy] ?: [NSData data];
     }
 }

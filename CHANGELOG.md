@@ -7,6 +7,43 @@ grouped under 0.1.0 by date and commit.
 
 ## 0.3.0 — 2026-11-24 — Phase 5: architecture and code quality
 
+### Double prompt after boot, fixed for real
+
+- The clear-on-boot no longer sends its newline unconditionally:
+  it waits for a short quiet period (300 ms with no new console
+  output, up to 2 s) and only then checks the VT — a prompt already
+  on screen means no newline, and only a quiet, empty VT gets one
+  newline to elicit a fresh prompt. The old unconditional newline
+  sat in the tty input buffer when the guest's first bash prompt
+  was still in flight (slow login, cold boot, first boot after an
+  image update): the prompt arrived as prompt one, bash read the
+  newline as an empty command and printed prompt two. A fixed
+  delay would only have moved the race to a slower login.
+  Verified with a host harness against vt.c: the old sequence
+  reproduces exactly two prompts, the gated sequence exactly one
+  in both the late-prompt and the wiped-prompt case.
+- The replay can no longer feed a chunk twice: the terminal takes
+  over live delivery and reads the buffered output in one atomic
+  step (`beginConsoleDeliveryWithDelegate:`), so a chunk arriving
+  between setting the delegate and reading the snapshot is neither
+  duplicated nor missed.
+- `vt_is_empty` (vt.c): 1 when the grid is all blank and the
+  scrollback is empty — the gate's "has the guest printed yet"
+  test.
+
+### Key row: all eleven keys the same width
+
+- Paste is a clipboard icon (SF Symbol `doc.on.clipboard`)
+  instead of the word, and the hide-keyboard key lost its fixed
+  44 pt width: with the primary row distributing equally, every
+  key — ctrl, alt, esc, tab, more, paste, the four arrows,
+  hide-keyboard — is ~35 pt on a 430 pt screen. The arrows were
+  the smallest keys in the row (squeezed into the leftover width
+  of a nested stack); they now take one equal share each. The
+  four-letter labels shrink slightly to fit instead of clipping.
+  Paste behaviour, the Paste VoiceOver label, and every other
+  key are unchanged.
+
 A refactoring release: no behaviour changes, only structure.
 
 - One flow state: the startup screen's eight flow flags (one

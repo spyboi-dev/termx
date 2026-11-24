@@ -124,6 +124,14 @@ static void vt_clear_scrollback(vt_t *vt) {
     vt->scrollback_count = 0;
 }
 
+int vt_is_empty(vt_t *vt) {
+    if (vt->scrollback_count > 0) return 0;
+    for (int r = 0; r < VT_ROWS; r++)
+        for (int c = 0; c < VT_COLS; c++)
+            if (vt->grid[r][c].ch != 0) return 0;
+    return 1;
+}
+
 static void vt_put_cell(vt_t *vt, int row, int col, uint32_t ch) {
     if (row < 0 || row >= VT_ROWS || col < 0 || col >= VT_COLS) return;
     vt->grid[row][col].ch = ch;

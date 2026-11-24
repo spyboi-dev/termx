@@ -182,6 +182,17 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     NSTimer *_flushTimer;
     NSLayoutConstraint *_toolbarBottom;
     BOOL _didClearScreenOnBoot; // clear-on-boot already done for this terminal instance
+    // Gated fresh prompt (see viewDidAppear): the clear wipes the
+    // replayed prompt, and a newline is only sent once the guest has
+    // been quiet for a while and the VT is still empty — so a prompt
+    // still in flight is not doubled by the newline. _clearOnBootDate
+    // is when the clear ran; _lastConsoleOutputDate is the last
+    // console byte on the main thread (also the clear time until any
+    // output arrives, so "quiet" is measured from the clear);
+    // _clearOnBootNewlineSent marks the decision made, either way.
+    NSDate *_clearOnBootDate;
+    NSDate *_lastConsoleOutputDate;
+    BOOL _clearOnBootNewlineSent;
     CGPoint _exitPanStart; // where the top-edge exit drag began
     BOOL _exitPanAtTop;    // scrollback already at its top when the drag began
     CGFloat _pinchStartSize; // font size when the current pinch began (Termux-style zoom)
@@ -220,7 +231,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [_bellHaptic prepare];
 
     _engine = [KernEngine shared];
-    _engine.delegate = self;
+    // Replay the console output from before this screen existed, and
+    // take over live delivery, in one atomic step: the engine sets
+    // the delegate and returns the buffered output under the same
+    // lock, so a chunk arriving in this window is fed exactly once.
+    // The old order (set the delegate, then read the snapshot) fed
+    // such a chunk twice — once live, once in the snapshot.
+    NSData *backlog = [_engine beginConsoleDeliveryWithDelegate:self];
 
     // Replay the console output from before this screen existed: the
     // engine's delegate is nil until here, so the boot log and the
@@ -232,7 +249,6 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // is a code path live delivery never exercises. The whole buffer
     // is still replayed: only the earliest kernel lines would be
     // beyond the scrollback anyway.
-    NSData *backlog = [_engine bufferedConsoleOutput];
     if (backlog.length) {
         const uint8_t *bytes = backlog.bytes;
         size_t remaining = backlog.length;
@@ -410,17 +426,20 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _secondaryRow.hidden = YES;
     [rows addArrangedSubview:_secondaryRow];
 
-    // Primary row: Ctrl Alt Esc Tab More Paste ... four separate arrows.
-    // The row holds eleven keys on a phone, so the gaps are tight (3 pt)
-    // and the key insets are slim — with the old 10 pt insets the row
-    // overflowed a 430 pt screen once Paste joined it, and the stack
-    // view squeezed the titles. Alt sits next to Ctrl: the two
-    // modifiers belong together, and Alt is used as often as Ctrl
-    // (Emacs, tmux, readline).
+    // Primary row: Ctrl Alt Esc Tab More Paste ... four arrows ...
+    // hide-keyboard. All eleven keys are the same width: the row
+    // distributes equally, so the arrows are as wide as the text
+    // keys instead of squeezed into the leftover space, and the icon
+    // keys (paste, hide-keyboard) are as wide as the rest instead of
+    // narrow. On a 430 pt screen each key is ~35 pt — the
+    // four-letter labels shrink slightly to fit (see keyButton).
+    // Paste is a clipboard icon, not the word: the word took the
+    // most width in the row, and the icon reads just as clearly.
     UIStackView *primary = [[UIStackView alloc] init];
     primary.translatesAutoresizingMaskIntoConstraints = NO;
     primary.axis = UILayoutConstraintAxisHorizontal;
     primary.spacing = 3;
+    primary.distribution = UIStackViewDistributionFillEqually;
     _ctrlButton = [self keyButton:@"ctrl"];
     [_ctrlButton addTarget:self action:@selector(onCtrl) forControlEvents:UIControlEventTouchUpInside];
     _ctrlButton.accessibilityHint = @"Toggles the Control modifier for the next key.";
@@ -435,36 +454,33 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [_moreButton addTarget:self action:@selector(onMore) forControlEvents:UIControlEventTouchUpInside];
     _moreButton.accessibilityHint = @"Shows or hides the second key row.";
     [primary addArrangedSubview:_moreButton];
+    // Paste as a clipboard icon: keyButton:@"paste" gives it the
+    // "Paste" VoiceOver label, then the title is swapped for the
+    // SF Symbol so it takes one key's width like everything else.
+    // Same action, same chunked paste, same haptics as before.
     UIButton *pasteButton = [self keyButton:@"paste"];
+    [pasteButton setTitle:nil forState:UIControlStateNormal];
+    [pasteButton setImage:[UIImage systemImageNamed:@"doc.on.clipboard"
+                                   withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:16 weight:UIImageSymbolWeightMedium]]
+                 forState:UIControlStateNormal];
+    pasteButton.tintColor = [UIColor whiteColor];
+    pasteButton.accessibilityHint = @"Pastes the clipboard into the terminal.";
     [pasteButton addTarget:self action:@selector(onPaste) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:pasteButton];
-    // Arrows: four separate full-height buttons, left up down right,
-    // each with its own touch target. They used to share one stacked
-    // container (up over down, half-height each), which read as a
-    // single button and was too small to tap reliably. All four
-    // repeat while held. They sit in their own stack with equal
-    // widths, and that stack has a low hugging priority so it
-    // expands to fill the gap after Paste — the arrows used to be
-    // slim because a flexible spacer took all the leftover width
-    // and the arrows kept only their intrinsic (glyph) width.
-    UIStackView *arrowStack = [[UIStackView alloc] init];
-    arrowStack.translatesAutoresizingMaskIntoConstraints = NO;
-    arrowStack.axis = UILayoutConstraintAxisHorizontal;
-    arrowStack.spacing = 4;
-    arrowStack.distribution = UIStackViewDistributionFillEqually;
-    [arrowStack setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisHorizontal];
-    // Arrows in pairs: left/right next to each other, then up/down.
-    // The tag is the direction (0 left, 1 up, 2 down, 3 right), not
-    // the position, so the order here is visual only.
-    [self addArrowKey:arrowStack title:@"←" tag:0];
-    [self addArrowKey:arrowStack title:@"→" tag:3];
-    [self addArrowKey:arrowStack title:@"↑" tag:1];
-    [self addArrowKey:arrowStack title:@"↓" tag:2];
-    [primary addArrangedSubview:arrowStack];
+    // Arrows: four separate full-height buttons, left right up down,
+    // each with its own touch target and its own equal share of the
+    // row — they used to share one nested stack squeezed into the
+    // leftover width, which made them the smallest keys in the row.
+    // All four repeat while held. The tag is the direction (0 left,
+    // 1 up, 2 down, 3 right), not the position, so the order here
+    // is visual only: left/right next to each other, then up/down.
+    [self addArrowKey:primary title:@"←" tag:0];
+    [self addArrowKey:primary title:@"→" tag:3];
+    [self addArrowKey:primary title:@"↑" tag:1];
+    [self addArrowKey:primary title:@"↓" tag:2];
     UIButton *kbd = [self keyButton:@"⌨"];
     kbd.titleLabel.font = [UIFont monospacedSystemFontOfSize:16 weight:UIFontWeightMedium];
     kbd.accessibilityHint = @"Hides the keyboard. Tap the terminal to show it again.";
-    [kbd.widthAnchor constraintEqualToConstant:TXConfigHideKeyboardKeyWidthPt].active = YES;
     [kbd addTarget:self action:@selector(onKeyboard) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:kbd];
     [rows addArrangedSubview:primary];
@@ -586,22 +602,35 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         // prompt, the queued prompt reappears, and the newline below
         // prints a second one, which is the double prompt the user
         // saw. Queuing the clear after the pending output means the
-        // clear wipes everything, and the newline prints exactly one
-        // fresh prompt. The delay is one run-loop turn, so the boot
-        // log never visibly flashes.
+        // clear wipes everything.
+        //
+        // The newline is NOT sent here. The guest's own first bash
+        // prompt can still be in flight when the clear runs (login
+        // slower than the 0.7 s present delay, most likely on a cold
+        // boot or the first boot after an image update), and a
+        // newline sent now sits in the tty input buffer: the prompt
+        // arrives as prompt one, bash reads the newline as an empty
+        // command and prints prompt two. Instead the newline is
+        // gated (see checkClearOnBootPrompt): after a short quiet
+        // period with no new console output, the VT is checked — a
+        // prompt already on screen means no newline, and only a
+        // quiet, empty VT gets one newline to elicit a fresh prompt.
+        // A fixed delay would only move the race to a slower login.
         __weak typeof(self) weakSelf = self;
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
             static const uint8_t ed2[] = { 0x1B, '[', '2', 'J' };
             vt_feed(&strongSelf->_vt, ed2, sizeof(ed2));
-            // Ask the guest for a fresh prompt on the clean screen:
-            // bash prints a new prompt for the newline. A bare
-            // newline is not a command, it only requests the prompt.
-            uint8_t nl = '\n';
-            [strongSelf->_engine sendConsoleInput:[NSData dataWithBytes:&nl length:1]];
+            // The quiet clock starts at the clear: no output has
+            // arrived since it yet, so "quiet for 300 ms" is first
+            // true 300 ms from here unless output arrives.
+            strongSelf->_clearOnBootDate = [NSDate date];
+            strongSelf->_lastConsoleOutputDate = strongSelf->_clearOnBootDate;
+            strongSelf->_clearOnBootNewlineSent = NO;
             [strongSelf flushTerminal];
             if ([strongSelf isPinnedToBottom]) [strongSelf scrollToBottomAnimated:NO];
+            [strongSelf scheduleClearOnBootPromptCheck];
         });
     }
     // First render with final geometry: the 60 ms timer will flush
@@ -614,6 +643,57 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [self flushTerminal];
     if ([self isPinnedToBottom]) [self scrollToBottomAnimated:NO];
     [self startBlinkTimer];
+}
+
+// Gated fresh prompt after the clear-on-boot (see viewDidAppear):
+// the newline is only sent once the guest has been quiet and the VT
+// is still empty. Three cases, all ending in exactly one prompt:
+//   - the prompt is already on screen (it arrived after the clear):
+//     no newline, the prompt stands.
+//   - the guest is still printing (output within the quiet period):
+//     wait for a full quiet period, up to the cap, so a prompt
+//     still in flight is not doubled.
+//   - quiet and empty (the prompt was wiped by the clear and
+//     nothing is coming): one newline elicits a fresh prompt.
+// A bare newline is not a command, it only requests the prompt.
+// Everything here runs on the main queue, like the clear and the
+// console feed, so the timestamps and the VT cannot race.
+- (void)scheduleClearOnBootPromptCheck {
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(TXConfigClearOnBootQuietPeriodSec * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf checkClearOnBootPrompt];
+    });
+}
+
+- (void)checkClearOnBootPrompt {
+    if (_clearOnBootNewlineSent) return; // the decision is made, either way
+    NSDate *now = [NSDate date];
+    NSTimeInterval sinceOutput = [now timeIntervalSinceDate:_lastConsoleOutputDate];
+    NSTimeInterval sinceClear = [now timeIntervalSinceDate:_clearOnBootDate];
+    // Still printing: wait for a full quiet period before deciding,
+    // up to the cap, so a slow login is not cut off mid-print.
+    if (sinceOutput < TXConfigClearOnBootQuietPeriodSec &&
+        sinceClear < TXConfigClearOnBootMaxWaitSec) {
+        [self scheduleClearOnBootPromptCheck];
+        return;
+    }
+    // Quiet now. If the VT shows anything, the prompt is already
+    // there — the guest printed it after the clear.
+    if (!vt_is_empty(&_vt)) {
+        _clearOnBootNewlineSent = YES;
+        return;
+    }
+    // Quiet and empty: the prompt was wiped by the clear and nothing
+    // is coming. One newline asks bash for a fresh prompt.
+    uint8_t nl = '\n';
+    [_engine sendConsoleInput:[NSData dataWithBytes:&nl length:1]];
+    _clearOnBootNewlineSent = YES;
+    [self flushTerminal];
+    if ([self isPinnedToBottom]) [self scrollToBottomAnimated:NO];
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -736,9 +816,15 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     b.layer.shadowOffset = CGSizeMake(0, 1);
     b.layer.shadowRadius = 1;
     b.layer.shadowOpacity = 0.35;
-    // Slim horizontal insets: the primary row holds eleven keys, and
-    // 10 pt insets overflowed a 430 pt screen once Paste joined it.
-    b.contentEdgeInsets = UIEdgeInsetsMake(6, 6, 6, 6);
+    // Slim horizontal insets: the primary row holds eleven equal
+    // keys, and 10 pt insets overflowed a 430 pt screen once Paste
+    // joined it. The titles shrink to fit instead of clipping: with
+    // equal widths a four-letter label ("ctrl", "more") is wider
+    // than its key, so the title scales down to ~12 pt rather than
+    // truncating — the three-letter keys stay at full size.
+    b.contentEdgeInsets = UIEdgeInsetsMake(6, 4, 6, 4);
+    b.titleLabel.adjustsFontSizeToFitWidth = YES;
+    b.titleLabel.minimumScaleFactor = 0.75;
     // Pressed state: the key lightens while the finger is down, on
     // top of the default title dim. TouchDown fires before the
     // key's own action, TouchUp restores the colour before the
@@ -840,11 +926,10 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 }
 
 // An arrow key: a full-height keyButton like every other key, with
-// its own touch target and hold-to-repeat. The up and down keys used
-// to be half-height buttons sharing one stacked container, which
-// read as a single button. A single glyph needs less side padding
-// than a word, so the arrows take 5 pt insets — the primary row
-// holds eleven keys, and the arrows are the ones that give.
+// its own touch target and hold-to-repeat. A single glyph needs less
+// side padding than a word, so the arrows take 5 pt insets. They sit
+// directly in the primary row now, one equal share each — the nested
+// stack that used to squeeze them into the leftover width is gone.
 - (void)addArrowKey:(UIStackView *)row title:(NSString *)title tag:(NSInteger)tag {
     UIButton *b = [self keyButton:title];
     b.tag = tag;
@@ -1158,6 +1243,10 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     // ever touched on the main thread, where the flush timer also
     // runs — feeding it from here would race the flush.
     dispatch_async(dispatch_get_main_queue(), ^{
+        // The arrival time, for the clear-on-boot gate: a prompt
+        // that arrives after the clear means the guest is still
+        // printing, so the gated newline must wait for quiet.
+        self->_lastConsoleOutputDate = [NSDate date];
         vt_feed(&_vt, data.bytes, data.length);
     });
 }

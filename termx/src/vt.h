@@ -83,6 +83,11 @@ void vt_feed(vt_t *vt, const uint8_t *bytes, size_t len);
 /* Rendered text: scrollback lines then the grid, trailing spaces trimmed.
  * Caller frees the result. Returns NULL on allocation failure. */
 char *vt_render(vt_t *vt);
+/* 1 when nothing has been printed: the current grid is all blank and
+ * the scrollback is empty. The terminal uses it after a clear-on-boot
+ * to tell whether the guest has printed a prompt yet — a clear wipes
+ * both, so any content means output arrived after the clear. */
+int vt_is_empty(vt_t *vt);
 /* Decode one UTF-8 sequence starting at p (len bytes available).
  * Returns the bytes consumed (1-4) for a complete valid sequence and
  * sets *cp; returns 0 if the bytes are invalid; returns -1 if the

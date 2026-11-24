@@ -58,9 +58,14 @@
 // Key rows: every row (Fn, secondary, primary) is this tall.
 #define TXConfigKeyRowHeightPt 34.0
 
-// The hide-keyboard key (⌨) in the primary row: a fixed width so
-// the arrows keep the leftover space.
-#define TXConfigHideKeyboardKeyWidthPt 44.0
+// Clear-on-boot fresh prompt (TerminalViewController): the newline
+// that asks bash for a prompt on the clean screen is only sent once
+// the guest has been quiet for this long with no new console output.
+// A fixed delay would only move the race to a slower login, so the
+// check waits for real quiet, and the cap stops it waiting forever
+// on a chatty guest — after the cap the VT decides on its own.
+#define TXConfigClearOnBootQuietPeriodSec 0.3
+#define TXConfigClearOnBootMaxWaitSec 2.0
 
 // Exit pan (swipe down from the terminal back to the startup
 // screen): the drag must start in this strip at the top of the
