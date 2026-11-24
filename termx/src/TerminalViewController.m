@@ -36,101 +36,6 @@
 #import "TXTheme.h"
 #import "vt.h"
 
-#import <sys/sysctl.h>
-
-// Device detection: the guest is a VM and cannot know the real
-// iPhone, so the app detects it at runtime and tells the guest (see
-// viewDidAppear). This must be automatic, never hardcoded: TermX is a
-// public tool and any iPhone can run it. The model identifier comes
-// from sysctl hw.model; the marketing name and chip come from a table
-// keyed by that identifier. An unknown model falls back to the raw
-// identifier (still correct — it is the actual device) and a generic
-// chip label, so no device ever gets another phone's name.
-static NSString *TXDeviceModelIdentifier(void) {
-    // hw.machine is the marketing-style identifier ("iPhone15,5").
-    // hw.model is the internal codename ("D38AP") — the table below
-    // is keyed by hw.machine, so reading hw.model never matches and
-    // every phone fell back to the raw codename. Read hw.machine
-    // first; hw.model is only a fallback if hw.machine is missing.
-    const char *keys[] = { "hw.machine", "hw.model" };
-    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
-        size_t len = 0;
-        if (sysctlbyname(keys[k], NULL, &len, NULL, 0) != 0 || len == 0) continue;
-        char *buf = malloc(len);
-        if (!buf) return nil;
-        if (sysctlbyname(keys[k], buf, &len, NULL, 0) != 0) { free(buf); continue; }
-        NSString *model = [NSString stringWithUTF8String:buf];
-        free(buf);
-        if (model.length) return model;
-    }
-    return nil;
-}
-
-static NSInteger TXDeviceCPUCount(void) {
-    int ncpu = 0;
-    size_t len = sizeof(ncpu);
-    if (sysctlbyname("hw.ncpu", &ncpu, &len, NULL, 0) != 0 || ncpu <= 0) return 6;
-    return (NSInteger)ncpu;
-}
-
-// Returns host, cpu, gpu display strings for the current iPhone.
-// host is the marketing name ("iPhone 15 Plus"), cpu is "Apple A16
-// (6 cores)", gpu is "Apple A16 GPU". Unknown models fall back to the
-// raw identifier for host and a generic chip label for cpu/gpu.
-static void TXDetectDeviceInfo(NSString **outHost, NSString **outCPU, NSString **outGPU) {
-    static const struct { const char *model; const char *name; const char *chip; } table[] = {
-        {"iPhone13,1", "iPhone 12 mini", "A14"},
-        {"iPhone13,2", "iPhone 12", "A14"},
-        {"iPhone13,3", "iPhone 12 Pro", "A14"},
-        {"iPhone13,4", "iPhone 12 Pro Max", "A14"},
-        {"iPhone14,4", "iPhone 13 mini", "A15"},
-        {"iPhone14,5", "iPhone 13", "A15"},
-        {"iPhone14,2", "iPhone 13 Pro", "A15"},
-        {"iPhone14,3", "iPhone 13 Pro Max", "A15"},
-        {"iPhone14,7", "iPhone 14", "A15"},
-        {"iPhone14,8", "iPhone 14 Plus", "A15"},
-        {"iPhone15,2", "iPhone 14 Pro", "A16"},
-        {"iPhone15,3", "iPhone 14 Pro Max", "A16"},
-        {"iPhone15,4", "iPhone 15", "A16"},
-        {"iPhone15,5", "iPhone 15 Plus", "A16"},
-        {"iPhone16,1", "iPhone 15 Pro", "A17 Pro"},
-        {"iPhone16,2", "iPhone 15 Pro Max", "A17 Pro"},
-        {"iPhone17,3", "iPhone 16", "A18"},
-        {"iPhone17,4", "iPhone 16 Plus", "A18"},
-        {"iPhone17,1", "iPhone 16 Pro", "A18 Pro"},
-        {"iPhone17,2", "iPhone 16 Pro Max", "A18 Pro"},
-        {"iPhone17,5", "iPhone 16e", "A18"},
-    };
-    NSString *model = TXDeviceModelIdentifier();
-    NSString *name = nil;
-    NSString *chip = nil;
-    if (model) {
-        for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
-            if ([model isEqualToString:[NSString stringWithUTF8String:table[i].model]]) {
-                name = [NSString stringWithUTF8String:table[i].name];
-                chip = [NSString stringWithUTF8String:table[i].chip];
-                break;
-            }
-        }
-    }
-    if (!name) name = model ?: @"iPhone";
-    NSString *cpu = nil;
-    NSString *gpu = nil;
-    if (chip) {
-        cpu = [NSString stringWithFormat:@"Apple %@ (%ld cores)", chip, (long)TXDeviceCPUCount()];
-        gpu = [NSString stringWithFormat:@"Apple %@ GPU", chip];
-    } else {
-        // Unknown model: the chip is not known, so use generic but
-        // correct labels (every iPhone runs Apple Silicon) instead of
-        // guessing a chip or repeating another phone's name.
-        cpu = @"Apple Silicon";
-        gpu = @"Apple GPU";
-    }
-    if (outHost) *outHost = name;
-    if (outCPU) *outCPU = cpu;
-    if (outGPU) *outGPU = gpu;
-}
-
 @interface TerminalViewController () <KernEngineDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate>
 @end
 
@@ -634,31 +539,6 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     }
 }
 
-// Visible terminal width in characters: the text view's width minus
-// the text container insets, divided by the advance of one monospace
-// character at the terminal font. The guest lays out for 80 columns
-// by default, but only ~48 are visible on a 430 pt screen, so long
-// lines are cut at the right edge. The boot clear below sends this to
-// the guest with `stty cols`, so programs wrap at the edge instead of
-// being cut. Clamped to a sane range; 80 when the width is unknown.
-- (NSInteger)visibleColumns {
-    CGFloat width = _output.bounds.size.width - (_output.textContainerInset.left + _output.textContainerInset.right);
-    // Fall back to the screen width if the text view has no size yet
-    // (viewDidAppear can fire before the first layout on a cold
-    // launch): without it the fallback is 80, the stty sets 80, and
-    // nothing changes — the lines stay cut.
-    if (width <= 0) {
-        width = [UIScreen mainScreen].bounds.size.width - (_output.textContainerInset.left + _output.textContainerInset.right);
-    }
-    if (width <= 0) return 80;
-    CGFloat advance = [@"M" sizeWithAttributes:@{NSFontAttributeName: TXTermFont()}].width;
-    if (advance <= 0) return 80;
-    NSInteger cols = (NSInteger)floor(width / advance);
-    if (cols < 20) cols = 20;
-    if (cols > 200) cols = 200;
-    return cols;
-}
-
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     // Clear on boot, once: if the startup screen asked for it, wipe
@@ -670,61 +550,28 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // later never wipes scrollback.
     if (self.clearScreenOnBoot && !_didClearScreenOnBoot) {
         _didClearScreenOnBoot = YES;
-        // The injected commands must not echo: the guest tty echoes
-        // everything it receives, and the old timed second clear did
-        // not hide it — the echo lands after the clear, so the
-        // command text stayed on screen. Fix the cause, not the
-        // timing: turn echo off first, send the real commands while
-        // it is off, then turn it back on in the same send, so echo
-        // cannot be left off. Only the short `stty -echo` line
-        // itself echoes once; it is wiped by the Phase 2 clear.
+        // Clear on boot only: wipe the boot log from the display and
+        // ask the guest for a fresh prompt, so the user opens on a
+        // clean prompt instead of the systemd boot log. The log
+        // itself is not lost: it stays in guest.log and engine.log.
+        // No command is typed into the terminal at boot — the width
+        // (stty cols / COLUMNS) and the device-info files used to be
+        // injected here, but auto-running commands at boot is not
+        // wanted, so both injections are gone. The width is still
+        // covered by the image itself (the shell startup sets stty
+        // cols 48 + COLUMNS=48 at login), but the device-info files
+        // are no longer written, so fastfetch falls back to Unknown
+        // for Host, CPU and GPU. There is no way to pass the device
+        // to the guest without typing a command: the runtime boot
+        // struct has no kernel command line field, so the guest
+        // cannot read it at its own boot either.
         static const uint8_t ed2[] = { 0x1B, '[', '2', 'J' };
-        NSString *noecho = @"stty -echo\n";
-        [_engine sendConsoleInput:[noecho dataUsingEncoding:NSUTF8StringEncoding]];
-        // ED 2 through the parser now: the same clear the `clear`
-        // command uses, so it empties both the visible grid and the
-        // scrollback (and homes the cursor), and the boot log is gone
-        // at once instead of flashing for the delay below.
         vt_feed(&_vt, ed2, sizeof(ed2));
-        __weak typeof(self) weakSelf = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf) return;
-            // Wipe the `stty -echo` echo. 0.5 s is plenty for a local
-            // guest to echo one short line and run it, so echo is off
-            // by now and the commands below run silently.
-            vt_feed(&strongSelf->_vt, ed2, sizeof(ed2));
-            // Tell the guest the visible width: it lays out for 80
-            // columns by default, but only ~48 are visible, so long
-            // lines are cut at the right edge. `stty cols` sets the
-            // tty winsize (what TIOCGWINSZ reads), and exporting
-            // COLUMNS covers the programs that read the variable
-            // instead of the winsize — fastfetch was still laying out
-            // for 80 after the stty alone, so both are set.
-            NSInteger cols = [strongSelf visibleColumns];
-            // Tell the guest the real device, detected at runtime
-            // (never hardcoded): the guest is a VM and cannot know
-            // the iPhone, so the app writes the detected host/cpu/gpu
-            // to files the fastfetch config reads. This runs on every
-            // iPhone — the values come from sysctl hw.machine on this
-            // device, so a different iPhone gets its own name, not
-            // this one's. Echo is off, so none of this appears.
-            NSString *host = nil, *cpu = nil, *gpu = nil;
-            TXDetectDeviceInfo(&host, &cpu, &gpu);
-            // Single-quote the values for the shell; the detected
-            // names contain no single quotes, but escape any that
-            // appear so a future model name cannot break the command.
-            NSString *(^q)(NSString *) = ^NSString *(NSString *s) {
-                return [NSString stringWithFormat:@"'%@'", [s stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
-            };
-            NSString *cmds = [NSString stringWithFormat:@"stty cols %ld; export COLUMNS=%ld; mkdir -p ~/.config/termx; printf '%%s' %@ > ~/.config/termx/host; printf '%%s' %@ > ~/.config/termx/cpu; printf '%%s' %@ > ~/.config/termx/gpu; stty echo\n", (long)cols, (long)cols, q(host), q(cpu), q(gpu)];
-            [strongSelf->_engine sendConsoleInput:[cmds dataUsingEncoding:NSUTF8StringEncoding]];
-            // Safety clear, then a fresh prompt on the clean screen:
-            // bash prints a new prompt for the newline.
-            vt_feed(&strongSelf->_vt, ed2, sizeof(ed2));
-            uint8_t nl = '\n';
-            [strongSelf->_engine sendConsoleInput:[NSData dataWithBytes:&nl length:1]];
-        });
+        // Ask the guest for a fresh prompt on the clean screen: bash
+        // prints a new prompt for the newline. A bare newline is not
+        // a command, it only requests the prompt.
+        uint8_t nl = '\n';
+        [_engine sendConsoleInput:[NSData dataWithBytes:&nl length:1]];
     }
     // First render with final geometry: the 60 ms timer will flush
     // anyway, but this guarantees the view starts pinned to the live
