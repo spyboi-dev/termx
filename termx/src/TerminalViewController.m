@@ -36,7 +36,7 @@
 #import "TXTheme.h"
 #import "vt.h"
 
-@interface TerminalViewController () <KernEngineDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate>
+@interface TerminalViewController () <KernEngineDelegate, UITextFieldDelegate, UIGestureRecognizerDelegate>
 @end
 
 // xterm 256-colour palette: 0-15 the standard colours, 16-231 the 6x6x6
@@ -217,7 +217,6 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     BOOL _didClearScreenOnBoot; // clear-on-boot already done for this terminal instance
     CGPoint _exitPanStart; // where the top-edge exit drag began
     BOOL _exitPanAtTop;    // scrollback already at its top when the drag began
-    UIButton *_jumpToBottomButton; // shown only while scrolled up (Blink/Termius pattern)
     NSTimer *_repeatTimer; // arrow key repeat (NewTerm 2.4: hold to repeat)
     NSData *_repeatData;
 }
@@ -311,7 +310,6 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         NSForegroundColorAttributeName: TXThemeForegroundColor(),
         NSParagraphStyleAttributeName: TXTermParagraphStyle(),
     }];
-    _output.delegate = self; // scrollViewDidScroll: drives the jump-to-bottom button
     [self.view addSubview:_output];
 
     // Hidden field that owns the software keyboard.
@@ -441,10 +439,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     arrowStack.spacing = 4;
     arrowStack.distribution = UIStackViewDistributionFillEqually;
     [arrowStack setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisHorizontal];
+    // Arrows in pairs: left/right next to each other, then up/down.
+    // The tag is the direction (0 left, 1 up, 2 down, 3 right), not
+    // the position, so the order here is visual only.
     [self addArrowKey:arrowStack title:@"←" tag:0];
+    [self addArrowKey:arrowStack title:@"→" tag:3];
     [self addArrowKey:arrowStack title:@"↑" tag:1];
     [self addArrowKey:arrowStack title:@"↓" tag:2];
-    [self addArrowKey:arrowStack title:@"→" tag:3];
     [primary addArrangedSubview:arrowStack];
     UIButton *kbd = [self keyButton:@"⌨"];
     kbd.titleLabel.font = [UIFont monospacedSystemFontOfSize:16 weight:UIFontWeightMedium];
@@ -472,27 +473,6 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // The toolbar rides above the software keyboard when it appears.
     _toolbarBottom = [toolbar.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-4];
     _toolbarBottom.active = YES;
-
-    // Jump-to-bottom button (Blink/Termius pattern): appears only
-    // while the user has scrolled up into the scrollback, and takes
-    // them back to the live prompt. It rides just above the toolbar,
-    // in the app teal so it reads as part of TermX, not a system pill.
-    _jumpToBottomButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    _jumpToBottomButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [_jumpToBottomButton setTitle:@"↓ Bottom" forState:UIControlStateNormal];
-    _jumpToBottomButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-    [_jumpToBottomButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    _jumpToBottomButton.backgroundColor = [TXThemeAccentColor() colorWithAlphaComponent:0.95];
-    _jumpToBottomButton.layer.cornerRadius = 14;
-    _jumpToBottomButton.contentEdgeInsets = UIEdgeInsetsMake(4, 12, 4, 12);
-    _jumpToBottomButton.hidden = YES;
-    [_jumpToBottomButton addTarget:self action:@selector(onJumpToBottom) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:_jumpToBottomButton];
-    [NSLayoutConstraint activateConstraints:@[
-        [_jumpToBottomButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [_jumpToBottomButton.bottomAnchor constraintEqualToAnchor:toolbar.topAnchor constant:-8],
-        [_jumpToBottomButton.heightAnchor constraintEqualToConstant:28],
-    ]];
 
     // Render the terminal at most every 60 ms; the guest sends a few bytes
     // at a time and redrawing on every one would thrash.
@@ -939,7 +919,6 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         restored.y = MIN(MAX(restored.y, minY), MAX(maxOffset, minY));
         _output.contentOffset = restored;
     }
-    [self updateJumpToBottomButton];
 }
 
 // Pinned means the last visible line is the live one: the bottom of
@@ -959,21 +938,6 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     CGFloat maxOffset = _output.contentSize.height + _output.contentInset.bottom - _output.bounds.size.height;
     CGFloat y = MAX(maxOffset, -_output.contentInset.top);
     [_output setContentOffset:CGPointMake(_output.contentOffset.x, y) animated:animated];
-}
-
-- (void)updateJumpToBottomButton {
-    _jumpToBottomButton.hidden = [self isPinnedToBottom];
-}
-
-- (void)onJumpToBottom {
-    [self scrollToBottomAnimated:YES];
-}
-
-// UITextViewDelegate: keep the jump-to-bottom button in step with
-// where the user actually is.
-- (void)scrollViewDidScroll:(UIScrollView *)scrollView {
-    (void)scrollView;
-    [self updateJumpToBottomButton];
 }
 
 - (void)appendRun:(NSMutableAttributedString *)out text:(NSString *)text
