@@ -80,7 +80,7 @@ apt_install_retry() {
       iproute2 iputils-ping curl wget nano less \
       openssh-client tar gzip xz-utils file \
       locales tzdata kmod bash-completion ncurses-base \
-      systemd-timesyncd \
+      systemd-timesyncd fastfetch \
       iptables; then
       return 0
     fi
@@ -148,15 +148,42 @@ echo '# TermX: pip --user installs scripts to ~/.local/bin; put it on PATH.' >> 
 echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' >> /home/termx/.bashrc
 echo '# TermX: pip --user installs scripts to ~/.local/bin; put it on PATH.' >> /etc/bash.bashrc
 echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' >> /etc/bash.bashrc
+# Useful aliases, so the first shell feels finished rather than bare.
+# Appended to both bashrc files, like PS1 and PATH above.
+echo '# TermX: a few useful aliases (ll, la, .., ff for fastfetch).' >> /home/termx/.bashrc
+echo "alias ll='ls -alF'" >> /home/termx/.bashrc
+echo "alias la='ls -A'" >> /home/termx/.bashrc
+echo "alias ..='cd ..'" >> /home/termx/.bashrc
+echo "alias ff='fastfetch'" >> /home/termx/.bashrc
+echo '# TermX: a few useful aliases (ll, la, .., ff for fastfetch).' >> /etc/bash.bashrc
+echo "alias ll='ls -alF'" >> /etc/bash.bashrc
+echo "alias la='ls -A'" >> /etc/bash.bashrc
+echo "alias ..='cd ..'" >> /etc/bash.bashrc
+echo "alias ff='fastfetch'" >> /etc/bash.bashrc
 # Terminal width: the terminal shows 48 columns (14 pt font on this
 # iPhone), but the guest lays out for 80 by default, so long lines are
 # cut at the right edge (fastfetch was the visible case). Set the tty
 # width at login so programs wrap at the visible edge. Guarded to a
 # real terminal; COLUMNS is the fallback for programs that read the
 # variable instead of the winsize. Appended last, after PS1 and PATH.
+#
+# Honest limit (fix6): 48 is FIXED. It does not follow the phone's
+# orientation or the terminal's pinch zoom, because the guest has no
+# way to learn the terminal size: there is no winsize channel from
+# the app to the guest (the runtime boot struct carries no terminal
+# size for the shell), and the app never types a command into the
+# terminal at boot, so nothing can re-run stty when the size
+# changes. A login shell re-reads this at every login, so rotating
+# the phone and opening a new shell still gets 48; landscape just
+# wastes the extra width. Fixing it properly needs a runtime
+# winsize channel, not a bashrc trick — do not fake one here. The
+# same note is appended into the bashrc files below, so the limit is
+# visible to anyone reading them.
 echo '# TermX: the terminal shows 48 columns; set the tty width at login so programs wrap at the visible edge.' >> /home/termx/.bashrc
+echo '# Fixed at 48: it does not follow the phone orientation or pinch zoom — the guest has no winsize channel from the app.' >> /home/termx/.bashrc
 echo 'if [ -t 0 ]; then stty cols 48 2>/dev/null; export COLUMNS=48; fi' >> /home/termx/.bashrc
 echo '# TermX: the terminal shows 48 columns; set the tty width at login so programs wrap at the visible edge.' >> /etc/bash.bashrc
+echo '# Fixed at 48: it does not follow the phone orientation or pinch zoom — the guest has no winsize channel from the app.' >> /etc/bash.bashrc
 echo 'if [ -t 0 ]; then stty cols 48 2>/dev/null; export COLUMNS=48; fi' >> /etc/bash.bashrc
 
 echo "== networking: DHCP on eth0 via systemd-networkd"
@@ -197,8 +224,11 @@ EOF
 echo "== motd"
 cat > /etc/motd <<'EOF'
 TermX — minimal Debian trixie on a real Linux kernel, inside iOS.
-You are user "termx" (passwordless sudo). apt works: try "sudo apt update".
-Nothing else is bundled: install what you need, e.g. "sudo apt install python3 git nodejs".
+You are user "termx" (passwordless sudo). apt works, fastfetch is
+installed (try "fastfetch"), and Docker runs too once installed:
+"sudo apt install docker.io", then "sudo docker run hello-world".
+Pinch to zoom the terminal; your files and installs live on the
+data disk and survive reboots.
 EOF
 
 echo "== pip: allow system-wide installs like TermX (PEP 668 off)"
@@ -221,27 +251,32 @@ EOF
 echo "== fastfetch: real hardware, not the virtual machine"
 # The guest kernel does not know what phone it runs on, so fastfetch
 # reports CPU "Unknown", Host "Virtual Machine" and a Kernarium virtual
-# GPU. The app writes the real device into ~/.config/termx/host, cpu
-# and gpu at boot (it detects the model via sysctl hw.model), and
-# fastfetch reads those files here with "command" modules — so the
-# values are automatic per device, never hardcoded. If the files are
-# absent (older app build), the value falls back to "Unknown" instead
-# of a wrong device. Everything else (OS, kernel, memory, disk, ...)
-# stays auto-detected. The terminal is 48 columns wide, so line
-# wrapping is on (fastfetch defaults it off) and long lines wrap at
-# the edge instead of running off the right. The default Debian logo
-# and module set are kept.
+# GPU. The config below reads ~/.config/termx/host, cpu and gpu with
+# "command" modules — those files are written by older app builds only:
+# since build d1e4491 the app writes nothing at boot (it never types a
+# command into the terminal after boot, and the runtime boot struct has
+# no kernel command line field to pass the device through), so on a
+# fresh install the files do not exist and the value falls back to
+# "Unknown" instead of a wrong device. A phone that ran an older build
+# keeps its old values on its data disk. Everything else (OS, kernel,
+# memory, disk, ...) stays auto-detected. The terminal is 48 columns
+# wide, so line wrapping is on (fastfetch defaults it off) and long
+# lines wrap at the edge instead of running off the right. The default
+# Debian logo and module set are kept. fastfetch itself is installed
+# by the apt list above (fix6) — the config used to ship without the
+# binary, so out-of-box `fastfetch` was "command not found".
 mkdir -p /home/termx/.config/fastfetch
 cat > /home/termx/.config/fastfetch/config.jsonc <<'EOF'
 {
   "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
   // TermX: the guest kernel does not know what phone it runs on, so
   // fastfetch reports CPU "Unknown", Host "Virtual Machine" and a
-  // Kernarium virtual GPU. The app writes the real device into
-  // ~/.config/termx/host, cpu and gpu at boot (it detects the model
-  // via sysctl hw.model), and fastfetch reads those files here — so
-  // the values are automatic per device, never hardcoded. If the
-  // files are absent (older app build), the value falls back to
+  // Kernarium virtual GPU. The command modules below read
+  // ~/.config/termx/host, cpu and gpu — files written by older app
+  // builds only. Since app build d1e4491 the app writes nothing at
+  // boot (it never types a command into the terminal, and the runtime
+  // has no channel to pass the device model to the guest), so on a
+  // fresh install the files do not exist and the value falls back to
   // "Unknown" instead of a wrong device. Everything else is
   // auto-detected.
   "display": {

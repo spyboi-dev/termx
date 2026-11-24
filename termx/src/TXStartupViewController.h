@@ -13,7 +13,7 @@
 // red. Nothing is faked, no timers pretend to be progress.
 //
 // This screen is the app's control centre, and the ONLY place with
-// controls: Install, Log, and Erase data disk. Install is the only
+// controls: Install, Log, About, and Erase data disk. Install is the only
 // tap in the whole flow: one tap installs the guest, then the engine
 // boots itself and the terminal opens on its own; on later launches
 // the engine starts by itself. The terminal window has no buttons

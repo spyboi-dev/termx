@@ -95,6 +95,30 @@ extern NSString* const kTermXStateChanged;
 @property (nonatomic, readonly) NSString* imageDetail;   // "rootfs-20261123-slim-fix5 · read-only" when current
 @property (nonatomic, readonly) BOOL dataDiskReady;      // data disk exists for this boot
 
+// The release tag of the installed image, when it IS this build's
+// release (e.g. "rootfs-20261124-slim-fix6"). Nil when nothing is
+// installed, or when the installed image is an older release — its
+// tag is not known (only the current release's hash is pinned), so
+// the About screen says "older release" instead of guessing.
+@property (nonatomic, readonly, nullable) NSString* installedImageRelease;
+
+// YES when the persistent data disk file exists on disk, even before
+// this boot opened it: the startup screen shows its usage from the
+// file itself (storageUsedBytes/storageTotalBytes read the sparse
+// file directly), instead of waiting for a boot to mark it ready.
+@property (nonatomic, readonly) BOOL dataDiskExists;
+
+// Version facts for the About screen. The build commit is the
+// -DTERMX_BUILD_COMMIT marker baked in by build.sh; the framework
+// SHA-256 is baked in the same way (-DTERMX_FRAMEWORK_SHA256), so
+// the About screen never has to hash a 53 MB file at runtime. The
+// upstream commit is the Kernarium revision the framework was built
+// from (see .github/workflows/build-framework.yml).
++ (NSString*)appBuildCommit;
++ (NSString*)runtimeFrameworkSHA256;
++ (NSString*)runtimeUpstreamCommit; // short hash, e.g. "fbe12ee"
++ (uint32_t)runtimeAPIVersion;
+
 // Guest files live here. rootfsPath is the Debian ext4 image (read-only,
 // no write bits, as the runtime requires); dataDiskPath is the guest's
 // persistent writable data disk: one sparse file at a fixed path in the

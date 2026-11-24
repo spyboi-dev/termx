@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "TXStartupViewController.h"
 #import "KernEngine.h"
+#import "TXAboutViewController.h"
 #import "TXLog.h"
 #import "TXLogViewController.h"
 #import "TXTheme.h"
@@ -219,7 +220,8 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     self.startButton = [self buttonWithTitle:@"Start" action:@selector(startTapped)];
     self.startButton.hidden = YES;
     UIButton *logButton = [self buttonWithTitle:@"Log" action:@selector(logTapped)];
-    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[self.actionButton, self.startButton, logButton]];
+    UIButton *aboutButton = [self buttonWithTitle:@"About" action:@selector(aboutTapped)];
+    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[self.actionButton, self.startButton, logButton, aboutButton]];
     buttons.axis = UILayoutConstraintAxisVertical;
     buttons.spacing = 12;
     buttons.translatesAutoresizingMaskIntoConstraints = NO;
@@ -649,6 +651,15 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         [self setRow:TXBootStepStorage state:TXStartupRowDone detail:detail];
     } else if (engine.state == TermXStateBooting) {
         [self setRow:TXBootStepStorage state:TXStartupRowActive detail:@"Opening data disk…"];
+    } else if (engine.dataDiskExists) {
+        // The disk exists from an earlier boot, so its usage is
+        // already known from the file itself — show it here even
+        // though this boot has not opened it yet. The row stays
+        // Pending: opening the disk for this boot is still to come.
+        NSString *detail = [NSString stringWithFormat:@"%@ used of %@",
+                            TXFormatBytes(engine.storageUsedBytes),
+                            TXFormatBytes(engine.storageTotalBytes)];
+        [self setRow:TXBootStepStorage state:TXStartupRowPending detail:detail];
     } else {
         [self setRow:TXBootStepStorage state:TXStartupRowPending detail:@"Data disk · persists across boots"];
     }
@@ -1070,6 +1081,17 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             [weakSelf presentTerminalWithClearScreen:YES];
         }
     }];
+}
+
+- (void)aboutTapped {
+    TXAboutViewController *aboutVC = [[TXAboutViewController alloc] init];
+    aboutVC.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(aboutDoneTapped)];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:aboutVC];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)aboutDoneTapped {
+    [self dismissViewControllerAnimated:YES completion:nil];
 }
 
 @end

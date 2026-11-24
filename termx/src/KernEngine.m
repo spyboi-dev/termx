@@ -24,6 +24,20 @@ NSString* const kTermXStateChanged = @"TermXStateChanged";
 #define TERMX_BUILD_COMMIT "nogit"
 #endif
 
+// The runtime framework's SHA-256, baked in by build.sh the same
+// way as the commit marker above (-DTERMX_FRAMEWORK_SHA256="..."),
+// so the About screen can show it without hashing a 53 MB file at
+// runtime. "not recorded" when built without it (e.g. by hand).
+#ifndef TERMX_FRAMEWORK_SHA256
+#define TERMX_FRAMEWORK_SHA256 "not recorded"
+#endif
+
+// The Kernarium upstream commit the framework was built from (see
+// .github/workflows/build-framework.yml, which checks out exactly
+// this revision). Short form for display; the full hash is in the
+// workflow.
+static NSString* const kTermXRuntimeUpstreamCommit = @"fbe12ee";
+
 // The Linux guest: 2 vCPUs, and as much RAM as iOS gives the app
 // minus a 1 GiB reserve for iOS and the app itself (see
 // TXComputeGuestMemoryMiB). The iPhone 15 Plus has 6 GiB, so the
@@ -798,6 +812,34 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
         return [NSString stringWithFormat:@"%@ · read-only", [GuestInstall rootfsReleaseTag]];
     }
     return @"trixie slim · read-only";
+}
+
+- (NSString*)installedImageRelease {
+    if (![self guestInstalled]) return nil;
+    if ([GuestInstall installedImageIsCurrentReleaseAt:_rootfsPath]) {
+        return [GuestInstall rootfsReleaseTag];
+    }
+    return nil;
+}
+
+- (BOOL)dataDiskExists {
+    return [[NSFileManager defaultManager] fileExistsAtPath:_dataDiskPath];
+}
+
++ (NSString*)appBuildCommit {
+    return @(TERMX_BUILD_COMMIT);
+}
+
++ (NSString*)runtimeFrameworkSHA256 {
+    return @(TERMX_FRAMEWORK_SHA256);
+}
+
++ (NSString*)runtimeUpstreamCommit {
+    return kTermXRuntimeUpstreamCommit;
+}
+
++ (uint32_t)runtimeAPIVersion {
+    return KERNARIUM_RUNTIME_API_VERSION;
 }
 
 // Words for the quiesce settle report (KernariumRuntime.h: the

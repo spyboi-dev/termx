@@ -27,14 +27,14 @@
 + (BOOL)imageLooksLikeExt4At:(NSString*)path;
 @end
 
-// Guest image: Debian trixie arm64 MINIMAL (slim), built 2026-11-21
-// (see rootfs-build/build-rootfs-slim.sh). Boots to a shell with working
+// Guest image: Debian trixie arm64 MINIMAL (slim), built 2026-11-24
+// (fix6; see rootfs-build/build-rootfs-slim.sh). Boots to a shell with working
 // apt and networking; users apt-install what they need. The .ext4.gz must
 // be published at kRootfsURL before first use from the app; the app
 // refuses an image whose hash does not match.
 //
 // NOTE: these four constants are the SLIM image (release
-// rootfs-20261123-slim-fix5). The local filename kRootfsName is deliberately
+// rootfs-20261124-slim-fix6). The local filename kRootfsName is deliberately
 // UNCHANGED from the old full image: the slim image replaces the full
 // one at the same path. A phone holding an older image does NOT fail:
 // a version difference is an update, not corruption — the installed
@@ -44,10 +44,10 @@
 // reinstall. The persistent data disk (termx-data.ext4) is a separate
 // file and is never touched by the image switch.
 NSString* const kRootfsURL =
-    @"https://github.com/spyboi-dev/termx/releases/download/rootfs-20261123-slim-fix5/termx-debian-trixie-arm64-slim.ext4.gz";
+    @"https://github.com/spyboi-dev/termx/releases/download/rootfs-20261124-slim-fix6/termx-debian-trixie-arm64-slim.ext4.gz";
 NSString* const kRootfsName = @"termx-debian-trixie-arm64.ext4";
-NSString* const kRootfsGzSHA256 = @"bfcf52c751205b16468afe68ed49921c80ebda8d9d3319e39b70365c38f2108c";
-NSString* const kRootfsSHA256 = @"5a42d1adaede735ffc82399de3d87127ace3f12f3cfa6d4b85aca11152400b3a";
+NSString* const kRootfsGzSHA256 = @"417011127ba253532a8339cade70a7723d6135707b71a6a08cfeb7b25c430025";
+NSString* const kRootfsSHA256 = @"995940f8690a338752730b89ff5bfedd28d4af320b89651b9fd9c872e7912a0a";
 const long long kRootfsSize = 1073741824; // extracted image size in bytes (exactly 1 GiB)
 
 // Background session: one identifier for the process lifetime, so a
