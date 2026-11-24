@@ -45,7 +45,8 @@ The guest boots from a read-only system image, with a persistent data disk on to
 ## Limitations
 
 - Device info is incomplete: fastfetch reports the CPU as Unknown and the host as Virtual Machine, because the guest kernel does not know it runs on an Apple A16.
-- The app must stay in the foreground; iOS can suspend it, and the guest stops with the app.
+- When you leave the app, the guest pauses (its disk is saved first) and resumes when you return. It does not run in the background.
+- Memory: the IPA is adhoc-signed, so the increased-memory-limit entitlement is not granted; the guest runs under iOS's standard per-process memory limit, with a 1 GiB reserve. That entitlement needs a provisioning profile that carries it, which a free developer account cannot get.
 - Sideload only. A free Apple ID certificate expires after 7 days and must be refreshed.
 
 ## Build from source

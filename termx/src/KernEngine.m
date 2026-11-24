@@ -35,6 +35,20 @@ NSString* const kTermXStateChanged = @"TermXStateChanged";
 // jetsam twice in a row (2026-11-22, build 2bbe39f); the later
 // sampler proved those deaths were the /init mkdir panic, not
 // jetsam, so the 512 MiB cut is no longer needed.
+// No increased-memory-limit entitlement (Phase 3): the IPA is
+// adhoc-signed (see build.sh) and adhoc signing cannot grant
+// entitlements at all; increased-memory-limit and
+// extended-virtual-addressing are special Apple entitlements that
+// need a provisioning profile carrying them, which a free developer
+// account cannot get and this sideloaded distribution path cannot
+// provide. The dead TermX.entitlements file that claimed them was
+// removed rather than left lying. So the guest runs under iOS's
+// standard per-process memory limit: the 1 GiB reserve above is the
+// headroom, and the sampler (see setState:) watches the footprint
+// through long sessions so a jetsam still leaves a trace. If a
+// signing identity with those entitlements ever becomes available,
+// re-add the entitlements file and sign with codesign
+// --entitlements — ld64.lld -adhoc_codesign cannot embed them.
 static uint32_t kGuestMemoryMiB = 2048;
 static const uint32_t kGuestCPUs = 2;
 // The guest's persistent data disk, in GiB: one sparse file at a fixed
@@ -101,6 +115,10 @@ static const uint64_t kDefaultDataDiskGiB = 2;
 @property (nonatomic, readwrite) TXBootPhase bootPhase;
 @property (nonatomic, readwrite) NSInteger failedStep;
 @property (nonatomic, readwrite) BOOL updateAvailable;
+@property (nonatomic, readwrite) BOOL lastFailureRetryable;
+@property (nonatomic, readwrite) NSString *lastSessionEnd;
+@property (nonatomic, readwrite) NSString *lastSessionMessage;
+@property (nonatomic, readwrite) BOOL lastSessionCrashed;
 @property (nonatomic, readwrite) int64_t downloadReceived;
 @property (nonatomic, readwrite) int64_t downloadExpected;
 // Console output buffered since boot for the terminal's replay (see
@@ -252,6 +270,10 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         _state = TermXStateIdle;
         _bootPhase = TXBootPhaseIdle;
         _failedStep = -1;
+        // Ordinary failures earn the one automatic retry; only a
+        // corrupt data disk clears this (see bootOnView:). BOOL
+        // ivars default to NO, so this must be set explicitly.
+        self.lastFailureRetryable = YES;
         _statusText = @"Not installed yet — tap Install";
         NSString* docs = NSSearchPathForDirectoriesInDomains(
             NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -392,6 +414,10 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
                 stateOffset = 8192; stallOffset = NSNotFound; networkOffset = NSNotFound;
                 storageOffset = NSNotFound; cameraOffset = NSNotFound;
             }
+            // The end word and message are hoisted out of the
+            // layout branches below: they are what the next launch
+            // acts on (see after this if/else), not just logs.
+            NSString* endWord = nil, *messageText = nil;
             if (!knownLayout) {
                 TXLogEngine(@"Session record (unrecognized layout, whole file):\n%@", [record stringByTrimmingCharactersInSet:pad]);
             } else {
@@ -419,7 +445,7 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
                 } else if (stallFirstLine.length) {
                     TXLogEngine(@"Session stall: %@", stallFirstLine);
                 }
-                NSString* endWord = nil, *bootWord = nil, *messageText = nil;
+                NSString* bootWord = nil;
                 for (NSString* line in [stateText componentsSeparatedByString:@"\n"]) {
                     if ([line hasPrefix:@"end "]) endWord = [line substringFromIndex:4];
                     else if ([line hasPrefix:@"boot "]) bootWord = [line substringFromIndex:5];
@@ -428,6 +454,33 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
                 if (endWord.length) TXLogEngine(@"Session end state: %@", endWord);
                 if (bootWord.length) TXLogEngine(@"Session boot: %@", bootWord);
                 if (messageText.length) TXLogEngine(@"Session message: %@", messageText);
+            }
+            // Act on the record, not just log it (Phase 3): a crash
+            // is a fact the next launch must show, and a kill is a
+            // fact it must boot through. The values are trimmed:
+            // the state slot is space-padded to its fixed size, so
+            // a line can carry trailing spaces.
+            if (endWord.length) {
+                self.lastSessionEnd = [endWord stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                if (messageText.length) {
+                    self.lastSessionMessage = [messageText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                }
+                if ([self.lastSessionEnd isEqualToString:@"guest-panic"] ||
+                    [self.lastSessionEnd isEqualToString:@"kernel-abort"]) {
+                    self.lastSessionCrashed = YES;
+                    TXLogEngine(@"Previous session ended in a crash (%@) — the startup screen holds the auto-boot and offers a fresh start", self.lastSessionEnd);
+                } else if ([self.lastSessionEnd isEqualToString:@"running"]) {
+                    // Killed from outside (force-quit or jetsam):
+                    // applicationWillTerminate never fires on a
+                    // force-quit, so the session ends "running" with
+                    // no clean end. Boot normally — the data-disk
+                    // integrity check in the pre-flight is the guard
+                    // for a dirty disk, not this record: ext4 journal
+                    // replay handles a disk that was only mid-write,
+                    // and a genuinely damaged disk fails the check
+                    // with the erase remedy named.
+                    TXLogEngine(@"Previous session was still running when the process died (force-quit or jetsam) — booting normally");
+                }
             }
             TXLogFlush();
         } else {
@@ -852,6 +905,31 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
     dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)));
 }
 
+// BACKGROUND STRATEGY (Phase 3) — the guest suspends, it does not run.
+//
+// When the app backgrounds, the guest is suspended with the runtime's
+// quiesce_resident: its filesystems are settled first, so the data
+// disk is clean on the next launch, and the guest RAM stays resident
+// in the process (no hibernation image is written). On the return to
+// the foreground the guest resumes where it left off. Nothing the
+// user was doing is lost; nothing keeps running while the app is away.
+//
+// Deliberately no background execution: the app declares no
+// UIBackgroundModes, and no background mode is used to keep the guest
+// alive. The modes iOS offers (audio, location, fetch, processing)
+// are for their stated purposes — a terminal guest is none of those,
+// and using one to keep a Linux system running in the background
+// would violate Apple's rules for those modes. The honest design is
+// suspend-on-background, and the startup screen says so in plain
+// words. A future reader tempted to "fix" backgrounding by adding a
+// mode should re-read this first.
+//
+// The edges: a boot interrupted by backgrounding fails cleanly and
+// retries on the return (see below); a download survives on its own
+// background URL session; a force-quit never calls
+// applicationWillTerminate, so that session ends "running" and the
+// next launch boots normally, with the data-disk integrity check in
+// the pre-flight as the guard for a dirty disk.
 - (void)enterBackground {
     // Two paths, by state. Running: quiesce the guest so the next
     // launch does not find a dirty data disk (the reboot crash,
@@ -1141,8 +1219,8 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
     close(fd);
     if (!ok) {
         // Remove the empty/partial file: if it stays, the next boot
-        // "reuses" it (the pre-flight only checks it is a regular
-        // file) and fails the same way again, forever.
+        // "reuses" it and the pre-flight's integrity check fails it
+        // as a damaged disk, forever.
         unlink(_dataDiskPath.UTF8String);
         if (error) *error = @"could not size the data disk";
         return NO;
@@ -1186,7 +1264,14 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
 - (BOOL)preflightBootOnView:(MTKView*)view
                       width:(uint32_t*)outWidth
                      height:(uint32_t*)outHeight
-                      error:(NSString**)error {
+                      error:(NSString**)error
+                 failedStep:(TXBootStep*)outStep
+                  retryable:(BOOL*)outRetryable {
+    // Every failure is an ordinary, retryable kernel failure unless
+    // a check below says otherwise: a corrupt data disk is a Storage
+    // failure that a retry cannot fix.
+    if (outStep) *outStep = TXBootStepKernel;
+    if (outRetryable) *outRetryable = YES;
     // 1. The request itself: the runtime refuses a struct smaller
     // than everything before the adb key. The app's header is the
     // upstream header at the pinned commit fbe12ee, the same commit
@@ -1313,6 +1398,53 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
         TXLogEngine(@"Pre-flight FAILED: overlay %@ is not a regular file", _dataDiskPath);
         return NO;
     }
+    // Data-disk integrity (Phase 3): the pre-flight used to check
+    // only that the disk is a regular file, so a corrupt disk failed
+    // the boot with a generic error and the only remedy was Erase.
+    // Read the ext4 superblock magic (0xEF53 at offset 1080), the
+    // same check as the image above. A fresh disk is all zeros —
+    // ftruncate creates it, and the guest formats it on first boot
+    // — so an all-zero head is unformatted, not corrupt, and boots.
+    // Anything else without the magic is a damaged disk: fail here,
+    // on the Storage step, with the remedy named, and do not retry
+    // it (a retry fails identically). Never auto-erase: the disk
+    // holds the user's installed packages and files.
+    BOOL diskCorrupt = NO;
+    if ((unsigned long long)overlaySt.st_size < 4096) {
+        TXLogEngine(@"Pre-flight FAILED: data disk is too small to be a filesystem (%llu bytes)", (unsigned long long)overlaySt.st_size);
+        diskCorrupt = YES;
+    } else {
+        int diskFd = open(_dataDiskPath.UTF8String, O_RDONLY);
+        if (diskFd >= 0) {
+            unsigned char head[4096];
+            ssize_t n = pread(diskFd, head, sizeof(head), 0);
+            close(diskFd);
+            if (n == (ssize_t)sizeof(head)) {
+                if (head[1080] == 0x53 && head[1081] == 0xEF) {
+                    TXLogEngine(@"Pre-flight: data disk ext4 magic OK");
+                } else {
+                    BOOL allZero = YES;
+                    for (size_t i = 0; i < sizeof(head); i++) {
+                        if (head[i] != 0) { allZero = NO; break; }
+                    }
+                    if (allZero) {
+                        TXLogEngine(@"Pre-flight: data disk is unformatted (first boot) — the guest formats it");
+                    } else {
+                        TXLogEngine(@"Pre-flight FAILED: data disk superblock magic is not ext4 and the disk is not empty");
+                        diskCorrupt = YES;
+                    }
+                }
+            } else {
+                TXLogEngine(@"Pre-flight: could not read the data disk head (%zd bytes) — continuing", n);
+            }
+        }
+    }
+    if (diskCorrupt) {
+        if (error) *error = @"Boot refused: the data disk is damaged (not a valid ext4 filesystem). Erase the data disk to start fresh — the Debian system image is untouched.";
+        if (outStep) *outStep = TXBootStepStorage;
+        if (outRetryable) *outRetryable = NO;
+        return NO;
+    }
     TXLogEngine(@"Pre-flight: rootfs %@ (mode %04o), overlay %@",
                 _rootfsPath, rootSt.st_mode & 0777, _dataDiskPath);
     // 6. Both paths are named in `ubd<n>=` kernel arguments, which
@@ -1382,6 +1514,11 @@ static uint32_t TXComputeGuestMemoryMiB(void) {
     // here would make the next foreground call resume() on a guest
     // that never suspended.
     _quiesced = NO;
+    // A fresh boot earns a fresh retry decision: an earlier
+    // non-retryable failure (a corrupt data disk) must not poison
+    // this boot's retry. The pre-flight below clears it again if
+    // the disk is still corrupt.
+    self.lastFailureRetryable = YES;
     // Clear any GPU hold left over from a backgrounded boot that
     // failed: the retry must boot with the GPU free. (The hold is
     // released unconditionally in enterForeground, so this only
@@ -1446,9 +1583,12 @@ static uint32_t TXComputeGuestMemoryMiB(void) {
     // times with a bare "Guest run failed (-1)" and no cause.
     uint32_t bootWidth = 0, bootHeight = 0;
     NSString* preflightError = nil;
-    if (![self preflightBootOnView:view width:&bootWidth height:&bootHeight error:&preflightError]) {
+    TXBootStep preflightStep = TXBootStepKernel;
+    BOOL preflightRetryable = YES;
+    if (![self preflightBootOnView:view width:&bootWidth height:&bootHeight error:&preflightError failedStep:&preflightStep retryable:&preflightRetryable]) {
         self.bootPhase = TXBootPhaseFailed;
-        self.failedStep = TXBootStepKernel;
+        self.failedStep = preflightStep;
+        self.lastFailureRetryable = preflightRetryable;
         self.state = TermXStateFailed;
         self.statusText = preflightError ?: @"Boot refused — see the log for the exact check";
         TXLogFlush(); // the named cause must be on disk even if the app is killed next

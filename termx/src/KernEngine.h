@@ -119,6 +119,25 @@ extern NSString* const kTermXStateChanged;
 // Changes post kTermXStateChanged so the startup screen refreshes.
 @property (nonatomic, readonly) BOOL updateAvailable;
 
+// What the last guest session did, read from guest/session.json at
+// launch (see KernEngine.m init). lastSessionCrashed is YES when the
+// last run ended in a guest panic or kernel abort: the startup screen
+// shows that and holds the auto-boot instead of silently booting
+// into the same failure. lastSessionEnd is the record's end word
+// ("running", "stopped", "guest-panic", "kernel-abort", …) and
+// lastSessionMessage is its message, if any. A last run still
+// "running" means the process was killed from outside (force-quit
+// or jetsam): the boot proceeds normally, and the data-disk
+// integrity check is the guard for a dirty disk, not this record.
+@property (nonatomic, readonly) NSString *lastSessionEnd;
+@property (nonatomic, readonly) NSString *lastSessionMessage;
+@property (nonatomic, readonly) BOOL lastSessionCrashed;
+
+// NO after a boot failure that must not be retried (a corrupt data
+// disk: a retry fails identically). YES for ordinary failures. The
+// startup screen's one automatic retry reads this.
+@property (nonatomic, readonly) BOOL lastFailureRetryable;
+
 // YES while the launch update check (background, at cold launch) is
 // still running. The startup screen waits for it before auto-booting:
 // if a newer image is available the guest is held stopped and the

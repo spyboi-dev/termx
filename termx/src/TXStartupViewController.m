@@ -29,6 +29,16 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 @property (nonatomic, strong) UILabel *timerLabel;
 @property (nonatomic, strong) UIProgressView *progressView;
 @property (nonatomic, strong) UILabel *reasonLabel;
+// Crash notice: shown when the last guest session ended in a guest
+// panic or kernel abort (see KernEngine.lastSessionCrashed). The
+// auto-boot is held until the user chooses Start anyway or Start
+// fresh, so a crash is never silently booted into again.
+@property (nonatomic, strong) UILabel *crashLabel;
+// Background note: the honest one-liner about the guest pausing
+// when the app backgrounds (see KernEngine enterBackground).
+@property (nonatomic, strong) UILabel *infoLabel;
+@property (nonatomic, assign) BOOL crashAcknowledged; // user chose Start anyway / Start fresh for this launch's crash
+@property (nonatomic, assign) BOOL crashChoiceShown; // refreshCrashNotice's verdict, read by refreshButtons in the same refresh pass
 @property (nonatomic, strong) MTKView *guestView; // the guest framebuffer; never seen
 @property (nonatomic, strong) UIButton *actionButton; // Install (or Start when the guest is powered off), by state
 // Secondary action, visible only when the guest is stopped and an
@@ -175,6 +185,27 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     self.reasonLabel.hidden = YES;
     self.reasonLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
+    // Crash notice: the last run ended in a guest panic or kernel
+    // abort. Shown only when the engine says so (see
+    // refreshCrashNotice); the auto-boot waits for the user's choice.
+    self.crashLabel = [[UILabel alloc] init];
+    self.crashLabel.font = [UIFont systemFontOfSize:14];
+    self.crashLabel.textColor = [UIColor systemRedColor];
+    self.crashLabel.numberOfLines = 0;
+    self.crashLabel.hidden = YES;
+    self.crashLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    // Background note, always visible: the guest pauses when the app
+    // backgrounds (its disk is saved first) and resumes on return.
+    // It does not run in the background — say so plainly.
+    self.infoLabel = [[UILabel alloc] init];
+    self.infoLabel.font = [UIFont systemFontOfSize:13];
+    self.infoLabel.textColor = [UIColor colorWithWhite:0.45 alpha:1.0];
+    self.infoLabel.textAlignment = NSTextAlignmentCenter;
+    self.infoLabel.numberOfLines = 0;
+    self.infoLabel.text = @"When you leave the app, the guest pauses and its disk is saved first. It doesn't run in the background.";
+    self.infoLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
     // All controls live here, on this screen, and nowhere else:
     // Install is the only action button — one tap installs, then
     // the engine boots itself and the terminal opens on its own.
@@ -209,7 +240,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     spacer.translatesAutoresizingMaskIntoConstraints = NO;
     [spacer.heightAnchor constraintEqualToConstant:120].active = YES;
 
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[topRow, spacer, titleLabel, self.progressView, card, self.reasonLabel, buttons, self.eraseButton]];
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[topRow, spacer, titleLabel, self.progressView, card, self.reasonLabel, self.crashLabel, buttons, self.eraseButton, self.infoLabel]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 28;
     // The progress bar sits tight under the title, not a full
@@ -217,6 +248,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     [stack setCustomSpacing:12 afterView:titleLabel];
     [stack setCustomSpacing:28 afterView:self.progressView];
     [stack setCustomSpacing:16 afterView:buttons];
+    [stack setCustomSpacing:20 afterView:self.eraseButton];
     stack.translatesAutoresizingMaskIntoConstraints = NO;
 
     UIScrollView *scroll = [[UIScrollView alloc] init];
@@ -385,6 +417,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
                             (unsigned long)(elapsed / 60), (unsigned long)((NSInteger)elapsed % 60)];
     [self refreshHeader];
     [self refreshRows];
+    [self refreshCrashNotice];
     [self refreshButtons];
     self.progressView.progress = (float)[KernEngine shared].bootProgress;
     // The automatic flow lives here, so every path that updates the
@@ -411,9 +444,17 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 // available for next time.
 - (void)refreshButtons {
     KernEngine *engine = [KernEngine shared];
-    // The Start button lives only in the stopped-with-update state:
-    // Update is the main action there, Start is the way out of it.
-    self.startButton.hidden = !(engine.state == TermXStateStopped && engine.updateAvailable);
+    // The Start button lives in two places: the stopped-with-update
+    // state (boot the installed image as-is), and the crash choice
+    // (Start fresh — erase the data disk and boot). In the crash
+    // choice it is the second option next to Start anyway.
+    BOOL crashChoice = self.crashChoiceShown;
+    self.startButton.hidden = !((engine.state == TermXStateStopped && engine.updateAvailable) || crashChoice);
+    if (crashChoice) {
+        [self.startButton setTitle:@"Start fresh" forState:UIControlStateNormal];
+    } else if (engine.state == TermXStateStopped && engine.updateAvailable) {
+        [self.startButton setTitle:@"Start" forState:UIControlStateNormal];
+    }
     switch (engine.state) {
         case TermXStateIdle:
         case TermXStateFailed:
@@ -423,14 +464,25 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         case TermXStateStopped:
             if (engine.updateAvailable) {
                 [self.actionButton setTitle:@"Update" forState:UIControlStateNormal];
+            } else if (crashChoice) {
+                // "Start" here is Start anyway: the crash label
+                // names both options, and this button boots as-is.
+                [self.actionButton setTitle:@"Start anyway" forState:UIControlStateNormal];
             } else {
                 [self.actionButton setTitle:@"Start" forState:UIControlStateNormal];
             }
             self.actionButton.enabled = YES;
             break;
         case TermXStateReady:
-            [self.actionButton setTitle:@"Starting…" forState:UIControlStateNormal];
-            self.actionButton.enabled = NO;
+            if (crashChoice) {
+                // The auto-boot is held for the crash choice (see
+                // maybeAutoBoot): this button is Start anyway.
+                [self.actionButton setTitle:@"Start anyway" forState:UIControlStateNormal];
+                self.actionButton.enabled = YES;
+            } else {
+                [self.actionButton setTitle:@"Starting…" forState:UIControlStateNormal];
+                self.actionButton.enabled = NO;
+            }
             break;
         case TermXStateDownloading:
             [self.actionButton setTitle:@"Downloading…" forState:UIControlStateNormal];
@@ -511,6 +563,36 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     }
     self.reasonLabel.hidden = (reason == nil);
     self.reasonLabel.text = reason ?: @"";
+}
+
+// Crash notice (Phase 3): when the last guest session ended in a
+// guest panic or kernel abort, say so on screen with the reason, and
+// hold the auto-boot until the user chooses. The choice is shown
+// only before a boot (Ready/Stopped): once the guest is up, failed,
+// or downloading, the notice has nothing to gate. crashChoiceShown
+// is the verdict refreshButtons reads in the same refresh pass.
+- (void)refreshCrashNotice {
+    KernEngine *engine = [KernEngine shared];
+    BOOL show = engine.lastSessionCrashed && !self.crashAcknowledged &&
+                (engine.state == TermXStateReady || engine.state == TermXStateStopped);
+    self.crashChoiceShown = show;
+    self.crashLabel.hidden = !show;
+    if (show) {
+        // The message can be a kernel panic line: first line only,
+        // trimmed, capped so the label stays a notice, not a log.
+        NSString *message = engine.lastSessionMessage ?: @"";
+        NSString *firstLine = [[message componentsSeparatedByString:@"\n"] firstObject] ?: @"";
+        firstLine = [firstLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (firstLine.length > 200) {
+            firstLine = [[firstLine substringToIndex:200] stringByAppendingString:@"…"];
+        }
+        NSString *what = ([engine.lastSessionEnd isEqualToString:@"kernel-abort"] ? @"kernel abort" : @"guest panic");
+        if (firstLine.length) {
+            self.crashLabel.text = [NSString stringWithFormat:@"The last run crashed (%@): %@\nStart anyway, or Start fresh to erase the data disk and begin again.", what, firstLine];
+        } else {
+            self.crashLabel.text = [NSString stringWithFormat:@"The last run crashed (%@).\nStart anyway, or Start fresh to erase the data disk and begin again.", what];
+        }
+    }
 }
 
 // Each row is driven only by what the engine really reports.
@@ -691,6 +773,11 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     // The 0.5 s poll tick re-enters here once the check has settled,
     // so nothing is lost by waiting.
     if (engine.launchUpdateCheckInFlight) return;
+    // Never silently auto-boot into a crash (Phase 3): when the last
+    // session ended in a guest panic or kernel abort, the auto-boot
+    // waits until the user chooses Start anyway or Start fresh on
+    // this screen. The choice is recorded in crashAcknowledged.
+    if (engine.lastSessionCrashed && !self.crashAcknowledged) return;
     // Never hand run() a zero-sized view: the runtime refuses a
     // zero display geometry with -1, and a boot on the first tick
     // before layout would burn the one automatic boot on exactly
@@ -730,6 +817,9 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         return;
     }
     if (engine.failedStep == TXBootStepImage) return;
+    // A corrupt data disk is not retried: the retry would fail
+    // identically, and the remedy is Erase, not another boot.
+    if (!engine.lastFailureRetryable) return;
     if (self.bootRetryScheduled || self.bootRetryUsed) return;
     self.bootRetryScheduled = YES;
     __weak typeof(self) weakSelf = self;
@@ -809,8 +899,29 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 // start earns a fresh automatic retry if this boot fails. The update
 // stays available: updateAvailable is untouched, so the next launch
 // (and the startup screen after this guest stops) still offers it.
+// When the crash choice is showing, this button is Start fresh:
+// erase the data disk, then boot. Erase is the clean path after a
+// crash the saved state may have caused — and it stays a manual tap
+// only, never automatic.
 - (void)startTapped {
     KernEngine *engine = [KernEngine shared];
+    if (engine.lastSessionCrashed && !self.crashAcknowledged &&
+        (engine.state == TermXStateReady || engine.state == TermXStateStopped)) {
+        NSString *error = nil;
+        if (![engine eraseDataDiskWithError:&error]) {
+            // Do not boot into the same broken disk, and do not hide
+            // the choice: the user can still tap Start anyway.
+            TXLogEngine(@"Start fresh: erase failed: %@", error ?: @"?");
+            [self refresh];
+            return;
+        }
+        TXLogEngine(@"Start fresh: data disk erased after the last run crashed — booting clean");
+        self.crashAcknowledged = YES;
+        self.bootRetryUsed = NO;
+        self.bootRetryScheduled = NO;
+        [engine bootOnView:self.guestView];
+        return;
+    }
     if (engine.state != TermXStateStopped) return;
     self.bootRetryUsed = NO;
     self.bootRetryScheduled = NO;
@@ -819,6 +930,16 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 
 - (void)actionTapped {
     KernEngine *engine = [KernEngine shared];
+    if (engine.lastSessionCrashed && !self.crashAcknowledged && engine.state == TermXStateReady) {
+        // Start anyway: the user chose to boot into whatever crashed
+        // last time. A manual start earns a fresh automatic retry
+        // if this boot fails.
+        self.crashAcknowledged = YES;
+        self.bootRetryUsed = NO;
+        self.bootRetryScheduled = NO;
+        [engine bootOnView:self.guestView];
+        return;
+    }
     if (engine.updateAvailable &&
         (engine.state == TermXStateRunning || engine.state == TermXStateSuspended ||
          engine.state == TermXStateStopped)) {
@@ -856,6 +977,9 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     if (engine.state == TermXStateStopped) {
         // The guest is installed but powered off: start it. A manual
         // start earns a fresh automatic retry if this boot fails.
+        // Tapping Start here is also choosing Start anyway when the
+        // crash choice is showing.
+        self.crashAcknowledged = YES;
         self.bootRetryUsed = NO;
         self.bootRetryScheduled = NO;
         [engine bootOnView:self.guestView];
