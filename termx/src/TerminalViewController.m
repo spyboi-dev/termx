@@ -3,13 +3,16 @@
 // The terminal screen follows NewTerm 3's model (hbang/NewTerm, Apache-2.0):
 // a scrolling line-based terminal, 80x25, xterm-256color, system monospace
 // font, and the keyboard toolbar above the software keyboard: Ctrl
-// (toggle), Esc, Tab, More (toggle), Paste, and four separate arrow
-// keys on the primary row; Home, End, PgUp, PgDn, Del and Fn (toggle)
-// on the secondary row; F1-F12 on a horizontally scrolling Fn row.
-// The VT emulation is our own vt.c (NewTerm uses SwiftTerm, which is Swift and
-// cannot build here); the key bytes match NewTerm's TerminalConstants
-// exactly. The shell itself lives in the guest, never on iOS: typed input
-// goes to the guest console, guest output feeds the terminal view.
+// (toggle), Alt (toggle), Esc, Tab, More (toggle), Paste, and four
+// separate arrow keys on the primary row; Home, End, PgUp, PgDn, Del,
+// Copy and Fn (toggle) on the secondary row; F1-F12 on a horizontally
+// scrolling Fn row. Alt prefixes ESC to the next input, the standard
+// terminal behaviour (Emacs, tmux, readline). The block cursor blinks
+// while the terminal is focused. The VT emulation is our own vt.c
+// (NewTerm uses SwiftTerm, which is Swift and cannot build here); the
+// key bytes match NewTerm's TerminalConstants exactly. The shell itself
+// lives in the guest, never on iOS: typed input goes to the guest
+// console, guest output feeds the terminal view.
 // Scrolling follows the rule every mobile terminal uses (NewTerm,
 // Blink, Termius): output follows the bottom only while the user is
 // pinned there; once they scroll up into the scrollback the view stays
@@ -65,17 +68,22 @@ static UIColor *XTermColor(int index) {
     return [UIColor colorWithRed:r / 255.0 green:g / 255.0 blue:b / 255.0 alpha:1.0];
 }
 
-// The one paragraph style for terminal text: 2 pt of line spacing so
-// dense shell output breathes. It is built once and shared by the
-// scrollback attributes and every grid run — a spacing set in only
-// one place would make the two halves of the screen sit on different
-// baselines.
-static NSParagraphStyle *TXTermParagraphStyle(void) {
+// The one paragraph style for terminal text, built for the current
+// font size: line spacing scales with the size (2 pt at the 14 pt
+// default, ~1.4 pt at 10, ~3.4 pt at 24), so a pinch-zoomed terminal
+// keeps the same proportions instead of the lines crowding together
+// at large sizes or spreading apart at small ones. It is built once
+// and shared by the scrollback attributes and every grid run — a
+// spacing set in only one place would make the two halves of the
+// screen sit on different baselines. Cached for the last size built:
+// the flush calls this on every run, and rebuilding the style object
+// each time would be wasteful.
+static NSParagraphStyle *TXTermParagraphStyleForSize(CGFloat size) {
     static NSParagraphStyle *style = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
+    static CGFloat styleSize = 0;
+    if (!style || styleSize != size) {
         NSMutableParagraphStyle *para = [[NSMutableParagraphStyle alloc] init];
-        para.lineSpacing = 2;
+        para.lineSpacing = size * 2.0 / 14.0;
         // Clip, never wrap: the layout manager takes the paragraph
         // style's line-break mode over the text container's, and the
         // default is word-wrapping — so a container set to Clipping
@@ -84,53 +92,9 @@ static NSParagraphStyle *TXTermParagraphStyle(void) {
         // long line is one visual line that scrolls horizontally.
         para.lineBreakMode = NSLineBreakByClipping;
         style = [para copy];
-    });
-    return style;
-}
-
-// Lossy UTF-8 decode: valid sequences decode normally, each invalid
-// byte becomes U+FFFD (replacement character) and is skipped. A guest
-// can emit raw bytes (Latin-1, a binary dump), so a scrollback line
-// is not always valid UTF-8 — stringWithUTF8String returns nil for
-// the whole line, and the old flush skipped it, so the line vanished
-// and every line below it shifted up. This never returns nil for a
-// non-NULL input and never skips a byte: a truncated multi-byte
-// sequence degrades to one U+FFFD per byte. (The && short-circuits
-// keep the p[1]/p[2]/p[3] reads inside the string: a continuation
-// check fails on the NUL terminator before the next byte is read.)
-static NSString *TXLossyUTF8String(const char *cstr) {
-    if (!cstr) return @"";
-    NSMutableString *out = [NSMutableString string];
-    const uint8_t *p = (const uint8_t *)cstr;
-    while (*p) {
-        uint8_t b = *p;
-        if (b < 0x80) {
-            [out appendFormat:@"%C", (unichar)b];
-            p++;
-        } else if (b >= 0xC2 && b <= 0xDF && (p[1] & 0xC0) == 0x80) {
-            uint32_t cp = ((b & 0x1F) << 6) | (p[1] & 0x3F);
-            [out appendFormat:@"%C", (unichar)cp];
-            p += 2;
-        } else if (b >= 0xE0 && b <= 0xEF && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 &&
-                   !(b == 0xE0 && p[1] < 0xA0) && !(b == 0xED && p[1] > 0x9F)) {
-            // Valid 3-byte sequence (rejects overlongs and surrogates).
-            uint32_t cp = ((b & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
-            [out appendFormat:@"%C", (unichar)cp];
-            p += 3;
-        } else if (b >= 0xF0 && b <= 0xF4 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80 &&
-                   !(b == 0xF0 && p[1] < 0x90) && !(b == 0xF4 && p[1] > 0x8F)) {
-            // Valid 4-byte sequence (rejects overlongs and > U+10FFFF).
-            uint32_t cp = ((b & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
-            cp -= 0x10000;
-            unichar pair[2] = { (unichar)(0xD800 + (cp >> 10)), (unichar)(0xDC00 + (cp & 0x3FF)) };
-            [out appendString:[NSString stringWithCharacters:pair length:2]];
-            p += 4;
-        } else {
-            [out appendString:@"\uFFFD"];
-            p++;
-        }
+        styleSize = size;
     }
-    return [out copy];
+    return style;
 }
 
 static const uint8_t kFnBytes[12][6] = {
@@ -207,9 +171,11 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     TXTerminalTextView *_output;
     TXTerminalInputField *_input;
     UIButton *_ctrlButton;
+    UIButton *_altButton;
     UIButton *_moreButton;
     UIButton *_fnButton;
     BOOL _ctrlLatched;
+    BOOL _altLatched;
     UIStackView *_secondaryRow;
     UIScrollView *_fnRow;
     NSTimer *_flushTimer;
@@ -220,12 +186,37 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     CGFloat _pinchStartSize; // font size when the current pinch began (Termux-style zoom)
     NSTimer *_repeatTimer; // arrow key repeat (NewTerm 2.4: hold to repeat)
     NSData *_repeatData;
+    // Incremental rendering (see flushTerminal): what the text view
+    // already shows, so a flush only appends the scrollback lines
+    // that arrived since the last render and re-renders the 25 grid
+    // rows, instead of rebuilding the whole 2000-line string.
+    NSUInteger _renderedScrollbackCount; // scrollback lines in the text view
+    uint64_t _renderedScrollbackSeq;     // seq of the last rendered scrollback line
+    uint64_t _renderedScrollbackDropped; // dropped count at the last render
+    NSUInteger _scrollbackTextLength;    // chars of the text view that are scrollback
+    BOOL _fullRebuildNeeded; // font size changed, or the render state is stale
+    // Cursor blink: a timer toggles _cursorBlinkOn, and the next flush
+    // re-renders the grid with the cursor shown or hidden. The flag
+    // _cursorBlinkChanged is what wakes the flush when nothing else
+    // arrived; it is cleared only by a flush that actually ran, so a
+    // blink tick during a drag is not lost.
+    NSTimer *_blinkTimer;
+    BOOL _cursorBlinkOn;
+    BOOL _cursorBlinkChanged;
+    UIImpactFeedbackGenerator *_keyHaptic;  // light tap on key presses
+    UIImpactFeedbackGenerator *_bellHaptic; // medium tap when the guest rings BEL
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = TXThemeBackgroundColor();
     vt_init(&_vt);
+    _cursorBlinkOn = YES; // the cursor starts visible; the blink timer toggles it
+    _fullRebuildNeeded = YES; // first render builds the whole string (see flushTerminal)
+    _keyHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [_keyHaptic prepare];
+    _bellHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [_bellHaptic prepare];
 
     _engine = [KernEngine shared];
     _engine.delegate = self;
@@ -286,6 +277,9 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // screen edges. 12 pt each side, 8 pt above, 6 pt below the text.
     _output.textContainerInset = UIEdgeInsetsMake(8, 12, 6, 12);
     _output.autocorrectionType = UITextAutocorrectionTypeNo;
+    // VoiceOver: the output is the terminal itself, not a text field.
+    _output.accessibilityLabel = @"Terminal output";
+    _output.accessibilityHint = @"Shows the terminal output. Tap to focus the keyboard; tap a web address to open it.";
     // The text view ends at the toolbar, and the toolbar already rides
     // above the keyboard, so the keyboard never overlaps this view and
     // it needs no bottom inset at all. A keyboard-height inset used to
@@ -309,7 +303,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _output.attributedText = [[NSAttributedString alloc] initWithString:@"" attributes:@{
         NSFontAttributeName: TXTermFont(),
         NSForegroundColorAttributeName: TXThemeForegroundColor(),
-        NSParagraphStyleAttributeName: TXTermParagraphStyle(),
+        NSParagraphStyleAttributeName: TXTermParagraphStyleForSize(TXTermFontSize()),
     }];
     [self.view addSubview:_output];
 
@@ -336,10 +330,12 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [self.view addSubview:_input];
 
     // The keyboard toolbar, NewTerm's model: a blurred bar with the key
-    // rows, riding above the software keyboard.
+    // rows, riding above the software keyboard. It is a container, not
+    // an element: VoiceOver reads the key buttons inside it, not the bar.
     UIVisualEffectView *toolbar = [[UIVisualEffectView alloc]
         initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterial]];
     toolbar.translatesAutoresizingMaskIntoConstraints = NO;
+    toolbar.isAccessibilityElement = NO;
     [self.view addSubview:toolbar];
 
     UIStackView *rows = [[UIStackView alloc] init];
@@ -383,7 +379,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _fnRow.hidden = YES;
     [rows addArrangedSubview:_fnRow];
 
-    // Secondary row (hidden until More is toggled): Home End PgUp PgDn Del Fn.
+    // Secondary row (hidden until More is toggled): Home End PgUp PgDn Del Copy Fn.
     _secondaryRow = [[UIStackView alloc] init];
     _secondaryRow.translatesAutoresizingMaskIntoConstraints = NO;
     _secondaryRow.axis = UILayoutConstraintAxisHorizontal;
@@ -397,30 +393,46 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIView *sp2 = [[UIView alloc] init];
     [_secondaryRow addArrangedSubview:sp2];
     [self addKey:_secondaryRow title:@"del" bytes:"\x1B[3~" length:4];
+    // Copy: the whole transcript (scrollback plus grid) to the
+    // clipboard, so copying does not depend only on the long-press
+    // menu — which is awkward while output streams, because the
+    // flush rebuilds the text under the selection.
+    UIButton *copyButton = [self keyButton:@"copy"];
+    [copyButton addTarget:self action:@selector(onCopyAll) forControlEvents:UIControlEventTouchUpInside];
+    [_secondaryRow addArrangedSubview:copyButton];
     UIView *sp3 = [[UIView alloc] init];
     [_secondaryRow addArrangedSubview:sp3];
     _fnButton = [self keyButton:@"fn"];
     [_fnButton addTarget:self action:@selector(onFn) forControlEvents:UIControlEventTouchUpInside];
+    _fnButton.accessibilityHint = @"Shows or hides the function key row.";
     [_secondaryRow addArrangedSubview:_fnButton];
     _secondaryRow.hidden = YES;
     [rows addArrangedSubview:_secondaryRow];
 
-    // Primary row: Ctrl Esc Tab More Paste ... four separate arrows.
-    // The row holds ten keys on a phone, so the gaps are tight (4 pt)
+    // Primary row: Ctrl Alt Esc Tab More Paste ... four separate arrows.
+    // The row holds eleven keys on a phone, so the gaps are tight (3 pt)
     // and the key insets are slim — with the old 10 pt insets the row
     // overflowed a 430 pt screen once Paste joined it, and the stack
-    // view squeezed the titles.
+    // view squeezed the titles. Alt sits next to Ctrl: the two
+    // modifiers belong together, and Alt is used as often as Ctrl
+    // (Emacs, tmux, readline).
     UIStackView *primary = [[UIStackView alloc] init];
     primary.translatesAutoresizingMaskIntoConstraints = NO;
     primary.axis = UILayoutConstraintAxisHorizontal;
-    primary.spacing = 4;
+    primary.spacing = 3;
     _ctrlButton = [self keyButton:@"ctrl"];
     [_ctrlButton addTarget:self action:@selector(onCtrl) forControlEvents:UIControlEventTouchUpInside];
+    _ctrlButton.accessibilityHint = @"Toggles the Control modifier for the next key.";
     [primary addArrangedSubview:_ctrlButton];
+    _altButton = [self keyButton:@"alt"];
+    [_altButton addTarget:self action:@selector(onAlt) forControlEvents:UIControlEventTouchUpInside];
+    _altButton.accessibilityHint = @"Toggles the Alt modifier for the next key. Alt plus a key sends Escape followed by that key.";
+    [primary addArrangedSubview:_altButton];
     [self addKey:primary title:@"esc" bytes:"\x1B" length:1];
     [self addKey:primary title:@"tab" bytes:"\t" length:1];
     _moreButton = [self keyButton:@"more"];
     [_moreButton addTarget:self action:@selector(onMore) forControlEvents:UIControlEventTouchUpInside];
+    _moreButton.accessibilityHint = @"Shows or hides the second key row.";
     [primary addArrangedSubview:_moreButton];
     UIButton *pasteButton = [self keyButton:@"paste"];
     [pasteButton addTarget:self action:@selector(onPaste) forControlEvents:UIControlEventTouchUpInside];
@@ -450,6 +462,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [primary addArrangedSubview:arrowStack];
     UIButton *kbd = [self keyButton:@"⌨"];
     kbd.titleLabel.font = [UIFont monospacedSystemFontOfSize:16 weight:UIFontWeightMedium];
+    kbd.accessibilityHint = @"Hides the keyboard. Tap the terminal to show it again.";
     [kbd.widthAnchor constraintEqualToConstant:44].active = YES;
     [kbd addTarget:self action:@selector(onKeyboard) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:kbd];
@@ -490,9 +503,21 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(keyboardWillChange:)
                                                  name:UIKeyboardWillChangeFrameNotification object:nil];
+    // Tap the terminal to focus the keyboard — or to open a web
+    // address, when the tap lands on one (see onTapTerminal:).
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(onTapTerminal)];
+        initWithTarget:self action:@selector(onTapTerminal:)];
     [_output addGestureRecognizer:tap];
+
+    // Double-tap resets the pinch zoom to the default 14 pt. It does
+    // not replace the single tap: a double-tap also fires two single
+    // taps, which focus the keyboard — harmless. The text view's own
+    // double-tap (word selection) still fires alongside it, so a
+    // double-tap selects a word and resets the size together.
+    UITapGestureRecognizer *doubleTap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onDoubleTapTerminal:)];
+    doubleTap.numberOfTapsRequired = 2;
+    [_output addGestureRecognizer:doubleTap];
 
     // The way back to the startup screen: a downward drag that
     // starts in the top strip of the terminal. A scroll through the
@@ -587,6 +612,107 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [self.view layoutIfNeeded];
     [self flushTerminal];
     if ([self isPinnedToBottom]) [self scrollToBottomAnimated:NO];
+    [self startBlinkTimer];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [self stopBlinkTimer];
+}
+
+// The block cursor blinks at ~530 ms on, ~530 ms off (the common
+// terminal default). The timer runs in the common modes so a blink
+// tick is not starved by a key hold, and it only toggles a flag:
+// the flush does the re-render, so the blink never fights the
+// 60 ms flush timer. It pauses while the terminal is not focused
+// (the keyboard is dismissed) or the app is in the background, and
+// the cursor shows solid then — a blinking cursor on a screen the
+// user is not typing in is noise, and a blink tick must not wake
+// the app from the background to re-render.
+- (void)startBlinkTimer {
+    [self stopBlinkTimer];
+    _cursorBlinkOn = YES;
+    __weak typeof(self) weakSelf = self;
+    _blinkTimer = [NSTimer scheduledTimerWithTimeInterval:0.53 repeats:YES block:^(NSTimer *t) {
+        (void)t;
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf onBlinkTimer];
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:_blinkTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)stopBlinkTimer {
+    [_blinkTimer invalidate];
+    _blinkTimer = nil;
+}
+
+- (void)onBlinkTimer {
+    BOOL focused = [_input isFirstResponder];
+    BOOL active = [UIApplication sharedApplication].applicationState == UIApplicationStateActive;
+    if (!focused || !active) {
+        // Paused: show the cursor solid. Only wake a flush if the
+        // cursor was actually hidden, or every background tick would
+        // re-render for nothing.
+        if (!_cursorBlinkOn) {
+            _cursorBlinkOn = YES;
+            _cursorBlinkChanged = YES;
+            [self flushTerminal];
+        }
+        return;
+    }
+    _cursorBlinkOn = !_cursorBlinkOn;
+    _cursorBlinkChanged = YES;
+    [self flushTerminal];
+}
+
+// BEL: a short vibration, no sound. The guest rings the bell for
+// tab completion with no matches, a backspace at an empty line, and
+// similar "no" answers — a sound would be intrusive in a terminal,
+// and a haptic is felt without being heard.
+- (void)ringBell {
+    [_bellHaptic impactOccurred];
+    [_bellHaptic prepare];
+}
+
+// The one key background colour, for every state a key can be in.
+// A toggle's ON colour lives on the button's `selected` property, so
+// the pressed-state handlers and setToggle below can both ask this
+// one function instead of each remembering the colours — the old
+// code had setToggle restore white 0.16 while keyButton used 0.30,
+// so a toggled-off key came back visibly darker than its siblings.
+static UIColor *TXKeyBackground(BOOL on, BOOL pressed) {
+    if (pressed) {
+        return on ? [UIColor colorWithRed:0.30 green:0.55 blue:0.95 alpha:1.0]
+                  : [UIColor colorWithWhite:0.45 alpha:1.0];
+    }
+    return on ? [UIColor colorWithRed:0.2 green:0.45 blue:0.85 alpha:1.0]
+              : [UIColor colorWithWhite:0.30 alpha:1.0];
+}
+
+// VoiceOver label for a key title: the glyphs and abbreviations
+// ("←", "⌨", "ctrl", "pgup") read as nothing useful on their own.
+static NSString *TXKeyAccessibilityLabel(NSString *title) {
+    if ([title isEqualToString:@"←"]) return @"Left arrow";
+    if ([title isEqualToString:@"→"]) return @"Right arrow";
+    if ([title isEqualToString:@"↑"]) return @"Up arrow";
+    if ([title isEqualToString:@"↓"]) return @"Down arrow";
+    if ([title isEqualToString:@"⌨"]) return @"Hide keyboard";
+    if ([title isEqualToString:@"ctrl"]) return @"Control";
+    if ([title isEqualToString:@"alt"]) return @"Alt";
+    if ([title isEqualToString:@"esc"]) return @"Escape";
+    if ([title isEqualToString:@"tab"]) return @"Tab";
+    if ([title isEqualToString:@"more"]) return @"More keys";
+    if ([title isEqualToString:@"paste"]) return @"Paste";
+    if ([title isEqualToString:@"copy"]) return @"Copy all";
+    if ([title isEqualToString:@"fn"]) return @"Function keys";
+    if ([title isEqualToString:@"home"]) return @"Home";
+    if ([title isEqualToString:@"end"]) return @"End";
+    if ([title isEqualToString:@"pgup"]) return @"Page up";
+    if ([title isEqualToString:@"pgdn"]) return @"Page down";
+    if ([title isEqualToString:@"del"]) return @"Delete";
+    if (title.length == 2 && [title hasPrefix:@"f"]) return [title uppercaseString]; // f1..f12
+    return title;
 }
 
 - (UIButton *)keyButton:(NSString *)title {
@@ -601,40 +727,96 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // key label instead of a link. The corner radius matches the
     // keyboard's, and the small shadow below the key gives the same
     // depth the keyboard keys have.
-    b.backgroundColor = [UIColor colorWithWhite:0.30 alpha:1.0];
+    b.backgroundColor = TXKeyBackground(NO, NO);
     [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateSelected];
     b.layer.cornerRadius = 6;
     b.layer.shadowColor = [UIColor blackColor].CGColor;
     b.layer.shadowOffset = CGSizeMake(0, 1);
     b.layer.shadowRadius = 1;
     b.layer.shadowOpacity = 0.35;
-    // Slim horizontal insets: the primary row holds ten keys, and
+    // Slim horizontal insets: the primary row holds eleven keys, and
     // 10 pt insets overflowed a 430 pt screen once Paste joined it.
-    b.contentEdgeInsets = UIEdgeInsetsMake(6, 7, 6, 7);
+    b.contentEdgeInsets = UIEdgeInsetsMake(6, 6, 6, 6);
+    // Pressed state: the key lightens while the finger is down, on
+    // top of the default title dim. TouchDown fires before the
+    // key's own action, TouchUp restores the colour before the
+    // action's toggle (if any) sets the new one — the order is the
+    // order the targets were added, and keyButton's targets are
+    // added first, at creation.
+    [b addTarget:self action:@selector(keyButtonPressed:) forControlEvents:UIControlEventTouchDown];
+    [b addTarget:self action:@selector(keyButtonReleased:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+    // VoiceOver: a glyph or abbreviation alone reads as nothing.
+    b.accessibilityLabel = TXKeyAccessibilityLabel(title);
+    b.accessibilityHint = @"Sends this key to the terminal.";
+    b.accessibilityTraits = UIAccessibilityTraitButton;
     return b;
 }
 
+// A press lightens the key; releasing restores the colour for its
+// toggle state (selected = a latched Ctrl/Alt or an open More/Fn row).
+- (void)keyButtonPressed:(UIButton *)button {
+    button.backgroundColor = TXKeyBackground(button.selected, YES);
+}
+
+- (void)keyButtonReleased:(UIButton *)button {
+    button.backgroundColor = TXKeyBackground(button.selected, NO);
+}
+
+// A light tap for a key press. The generator is prepared again
+// after each impact, so the next press is ready.
+- (void)keyHaptic {
+    [_keyHaptic impactOccurred];
+    [_keyHaptic prepare];
+}
+
 - (void)sendKeyData:(NSData *)data {
-    [[UIDevice currentDevice] playInputClick];
+    [self sendKeyData:data withFeedback:YES];
+}
+
+// A key button's bytes, with the latched modifiers applied. The
+// feedback (click + haptic) is only for a real press: the arrow
+// repeat timer sends with feedback NO, or holding an arrow would
+// buzz the haptic at 12 Hz.
+- (void)sendKeyData:(NSData *)data withFeedback:(BOOL)feedback {
+    if (feedback) {
+        [[UIDevice currentDevice] playInputClick];
+        [self keyHaptic];
+    }
+    // Alt prefixes ESC to the next input (the standard terminal Alt
+    // behaviour: Alt+x sends ESC then x). A key button is not a
+    // letter, so a latched Alt applies to this press and releases —
+    // Alt+Up is ESC followed by the Up sequence, Alt+Esc is ESC ESC.
+    if (_altLatched) {
+        uint8_t esc = 0x1B;
+        [_engine sendConsoleInput:[NSData dataWithBytes:&esc length:1]];
+        [self releaseAlt];
+    }
     // A key button is not a letter: if Ctrl is latched and the user
     // taps Esc, Tab, an arrow, Paste or an F-key instead of typing,
     // release the latch here, or it would leak into the next typed
     // character and turn it into a control byte the user never asked
     // for. (Typing a letter goes through the text-field delegate,
     // not here, so the Ctrl+letter path is untouched.)
-    if (_ctrlLatched) [self onCtrl];
+    [self releaseCtrl];
     [_engine sendConsoleInput:data];
 }
 
 // Backspace: DEL (0x7F), the Linux console erase character. One
 // place for both callers: the deleteBackward override on the empty
 // field, and the delegate's backspace branch for the (currently
-// impossible) case where the field holds text. Backspace is not a
+// impossible) case where the field holds text. Alt+Backspace is ESC
+// then DEL (readline deletes the previous word). Backspace is not a
 // letter, so the delegate's Ctrl+letter path never runs for it:
 // release a latched Ctrl here, or it would stay latched and turn the
 // next typed letter into a control byte.
 - (void)sendBackspace {
-    if (_ctrlLatched) [self onCtrl];
+    if (_altLatched) {
+        uint8_t esc = 0x1B;
+        [_engine sendConsoleInput:[NSData dataWithBytes:&esc length:1]];
+        [self releaseAlt];
+    }
+    [self releaseCtrl];
     uint8_t backspace = 0x7F;
     [_engine sendConsoleInput:[NSData dataWithBytes:&backspace length:1]];
 }
@@ -659,10 +841,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 // An arrow key: a full-height keyButton like every other key, with
 // its own touch target and hold-to-repeat. The up and down keys used
 // to be half-height buttons sharing one stacked container, which
-// read as a single button.
+// read as a single button. A single glyph needs less side padding
+// than a word, so the arrows take 5 pt insets — the primary row
+// holds eleven keys, and the arrows are the ones that give.
 - (void)addArrowKey:(UIStackView *)row title:(NSString *)title tag:(NSInteger)tag {
     UIButton *b = [self keyButton:title];
     b.tag = tag;
+    b.contentEdgeInsets = UIEdgeInsetsMake(6, 5, 6, 5);
     [b addTarget:self action:@selector(arrowTouchDown:) forControlEvents:UIControlEventTouchDown];
     [b addTarget:self action:@selector(arrowTouchUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
     [row addArrangedSubview:b];
@@ -690,7 +875,9 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         (void)t;
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) { [t invalidate]; return; }
-        [strongSelf sendKeyData:strongSelf->_repeatData];
+        // No feedback on repeats: a press clicks and taps once, and
+        // the hold repeats silently (see sendKeyData:withFeedback:).
+        [strongSelf sendKeyData:strongSelf->_repeatData withFeedback:NO];
     }];
     // The timer must fire while the button is held: a hold puts the
     // run loop in tracking mode, and a timer in the default mode
@@ -706,24 +893,48 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 }
 
 - (void)setToggle:(UIButton *)button on:(BOOL)on {
-    // OFF restores the same white 0.30 the keyButton default uses:
-    // the old 0.16 left a toggled-off Ctrl/More/Fn visibly darker
-    // than its siblings.
-    button.backgroundColor = on
-        ? [UIColor colorWithRed:0.2 green:0.45 blue:0.85 alpha:1.0]
-        : [UIColor colorWithWhite:0.30 alpha:1.0];
+    // The toggle state lives on `selected`, so the pressed-state
+    // handlers can restore the right colour without knowing which
+    // toggle this is. VoiceOver reads the value as On/Off.
+    button.selected = on;
+    button.backgroundColor = TXKeyBackground(on, NO);
+    button.accessibilityValue = on ? @"On" : @"Off";
 }
 
 #pragma mark - Actions
 
+// The toggles: tap to latch, tap again (or use it) to release. The
+// release paths in sendKeyData/sendBackspace/onPaste and the typing
+// delegate use releaseCtrl/releaseAlt below, not these — these are
+// the button actions, and they also give the haptic.
 - (void)onCtrl {
     _ctrlLatched = !_ctrlLatched;
     [self setToggle:_ctrlButton on:_ctrlLatched];
+    [self keyHaptic];
+}
+
+- (void)releaseCtrl {
+    if (!_ctrlLatched) return;
+    _ctrlLatched = NO;
+    [self setToggle:_ctrlButton on:NO];
+}
+
+- (void)onAlt {
+    _altLatched = !_altLatched;
+    [self setToggle:_altButton on:_altLatched];
+    [self keyHaptic];
+}
+
+- (void)releaseAlt {
+    if (!_altLatched) return;
+    _altLatched = NO;
+    [self setToggle:_altButton on:NO];
 }
 
 - (void)onMore {
     _secondaryRow.hidden = !_secondaryRow.hidden;
     [self setToggle:_moreButton on:!_secondaryRow.hidden];
+    [self keyHaptic];
     if (_secondaryRow.hidden && !_fnRow.hidden) {
         _fnRow.hidden = YES;
         [self setToggle:_fnButton on:NO];
@@ -733,6 +944,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 - (void)onFn {
     _fnRow.hidden = !_fnRow.hidden;
     [self setToggle:_fnButton on:!_fnRow.hidden];
+    [self keyHaptic];
 }
 
 // Paste: the clipboard text goes to the guest exactly as if typed,
@@ -747,9 +959,28 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     if (text.length == 0) return;
     NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
     if (!data.length) return;
-    if (_ctrlLatched) [self onCtrl];
+    // A paste is not a key: a latched modifier releases once, on
+    // the first chunk, the way sendKeyData does for a key button —
+    // not once per chunk.
+    [self releaseCtrl];
+    [self releaseAlt];
     [[UIDevice currentDevice] playInputClick];
+    [self keyHaptic];
     [self sendPasteChunk:data offset:0];
+}
+
+// Copy all: the whole transcript (scrollback plus grid, plain text)
+// to the clipboard. vt_render is the plain-text transcript; it is
+// built from cells, so it is always valid UTF-8.
+- (void)onCopyAll {
+    char *text = vt_render(&_vt);
+    if (!text) return;
+    NSString *transcript = [NSString stringWithUTF8String:text];
+    free(text);
+    if (!transcript) transcript = @"";
+    [UIPasteboard generalPasteboard].string = transcript;
+    [[UIDevice currentDevice] playInputClick];
+    [self keyHaptic];
 }
 
 // One 1 KiB chunk of a paste, then the next chunk on the next
@@ -775,8 +1006,61 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [self.view endEditing:YES];
 }
 
-- (void)onTapTerminal {
+- (void)onTapTerminal:(UITapGestureRecognizer *)tap {
+    // A tap on a web address opens it; anywhere else focuses the
+    // keyboard. The URL check comes first, or the tap would both
+    // open the browser and show the keyboard.
+    NSURL *url = [self urlAtPoint:[tap locationInView:_output]];
+    if (url) {
+        [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+        return;
+    }
     [_input becomeFirstResponder];
+}
+
+// The web address under a tap, or nil. Only the tapped line is
+// scanned (running a detector over the whole transcript on every
+// tap would be wasteful), and the tap must land on the link's own
+// text — closestPositionToPoint snaps to the nearest text, so a tap
+// in empty space below a URL-terminated line would otherwise count
+// as a tap on the URL. Only http and https open from the terminal:
+// a mailto or telephone link under a tap is too easy to hit by
+// accident when the user only meant to focus the keyboard.
+- (nullable NSURL *)urlAtPoint:(CGPoint)point {
+    UITextPosition *pos = [_output closestPositionToPoint:point];
+    if (!pos) return nil;
+    NSInteger ch = [_output offsetFromPosition:_output.beginningOfDocument toPosition:pos];
+    NSString *text = _output.text;
+    if (ch < 0 || ch >= (NSInteger)text.length) return nil;
+    NSRange lineRange = [text lineRangeForRange:NSMakeRange((NSUInteger)ch, 0)];
+    NSString *line = [text substringWithRange:lineRange];
+    NSError *error = nil;
+    NSDataDetector *detector = [NSDataDetector dataDetectorWithTypes:NSTextCheckingTypeLink error:&error];
+    if (!detector) return nil;
+    NSArray<NSTextCheckingResult *> *matches = [detector matchesInString:line options:0 range:NSMakeRange(0, line.length)];
+    for (NSTextCheckingResult *match in matches) {
+        NSRange linkRange = NSMakeRange(match.range.location + lineRange.location, match.range.length);
+        if (!NSLocationInRange((NSUInteger)ch, linkRange)) continue;
+        NSURL *url = match.URL;
+        if (!url || (![url.scheme isEqualToString:@"http"] && ![url.scheme isEqualToString:@"https"])) continue;
+        UITextPosition *start = [_output positionFromPosition:_output.beginningOfDocument offset:(NSInteger)linkRange.location];
+        UITextPosition *end = start ? [_output positionFromPosition:start offset:(NSInteger)linkRange.length] : nil;
+        UITextRange *linkTextRange = (start && end) ? [_output textRangeFromPosition:start toPosition:end] : nil;
+        if (!linkTextRange) continue;
+        CGRect rect = [_output firstRectForRange:linkTextRange];
+        if (CGRectContainsPoint(CGRectInset(rect, -8, -4), point)) return url;
+    }
+    return nil;
+}
+
+// Double-tap resets the pinch zoom to the default 14 pt.
+- (void)onDoubleTapTerminal:(UITapGestureRecognizer *)tap {
+    (void)tap;
+    if (TXTermFontSize() == 14) return;
+    TXSetTermFontSize(14);
+    _output.font = TXTermFont();
+    _fullRebuildNeeded = YES; // the whole text re-renders at the new size
+    [self flushTerminal];
 }
 
 // The exit drag: a downward pan that began in the top strip of the
@@ -813,7 +1097,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 // or zoom in to read small text. The scale is relative to the size
 // when the pinch began, not cumulative, so a slow pinch does not
 // run away. The new size is saved at once, so it survives a relaunch
-// and the next terminal opens at the same size. The flush re-renders
+// and the next terminal opens at the same size. A pinch changes the
+// display only, not the guest: there is no winsize channel to the
+// guest (the runtime has no winsize API), so the guest still lays
+// out for the width its shell set at login — zooming out shows more
+// columns on screen than the guest thinks exist, and zooming in
+// shows fewer. Do not "fix" this by typing stty into the terminal:
+// auto-running commands at boot is not wanted. The flush re-renders
 // the whole scrollback at the new size; the content and scroll
 // position are preserved by flushTerminal.
 - (void)onPinch:(UIPinchGestureRecognizer *)pinch {
@@ -825,9 +1115,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
             CGFloat size = _pinchStartSize * pinch.scale;
             if (size < 10) size = 10;
             if (size > 24) size = 24;
-            if (fabs(size - TXTermFontSize()) < 0.5) return;
+            // A small dead zone (0.1 pt) keeps recognizer jitter
+            // from re-rendering on every tiny movement; the old
+            // 0.5 pt zone made small pinches feel unresponsive.
+            if (fabs(size - TXTermFontSize()) < 0.1) return;
             TXSetTermFontSize(size);
             _output.font = TXTermFont();
+            _fullRebuildNeeded = YES; // the whole text re-renders at the new size
             [self flushTerminal];
             break;
         }
@@ -885,7 +1179,11 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 }
 
 - (void)flushTerminal {
-    if (!_vt.dirty) return;
+    // Wake on new output or on a blink tick. The blink flag is
+    // cleared only by a flush that actually ran (below, after the
+    // drag check): a blink tick during a drag must not be lost, or
+    // the cursor would stick in one phase until the next output.
+    if (!_vt.dirty && !_cursorBlinkChanged) return;
     // Do not rebuild while the user is dragging or the view is still
     // decelerating: setting attributedText resets the scroll position,
     // and rebuilding mid-drag would yank the view. The dirty flag
@@ -893,100 +1191,305 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // (The timer is in the common modes so it fires during a key
     // hold; a drag is the only time a flush is skipped.)
     if (_output.isTracking || _output.isDragging || _output.isDecelerating) return;
-    // The 60 ms timer rebuilds the whole attributed string every
-    // flush. Setting attributedText resets the scroll position, so the
-    // old code yanked the view to the bottom on every flush and a
-    // swipe down was undone 60 ms later — "it go up again and again".
+    _vt.dirty = 0;
+    _cursorBlinkChanged = NO;
+    // Full rebuild when the render state cannot be trusted: the font
+    // size changed (every attribute changes), the scrollback shrank
+    // (a clear), or the counters went backwards. Otherwise the
+    // incremental path appends only what arrived since the last
+    // render. A full rebuild is also the fallback inside the
+    // incremental path if it finds an inconsistency mid-way.
+    if (_fullRebuildNeeded ||
+        (NSUInteger)_vt.scrollback_count < _renderedScrollbackCount ||
+        _vt.scrollback_seq < _renderedScrollbackSeq ||
+        _vt.scrollback_dropped < _renderedScrollbackDropped) {
+        [self fullRebuildTerminal];
+    } else {
+        [self incrementalFlushTerminal];
+    }
+    // The bell rings after the render, so the output that caused it
+    // is already on screen. vt->bell is cleared here, not in the
+    // render paths: a flush that returns early (dragging) leaves it
+    // set, so the bell is rung by the next flush instead of lost.
+    if (_vt.bell) {
+        _vt.bell = 0;
+        [self ringBell];
+    }
+}
+
+// The whole string, rebuilt from the VT: the known-good path, used
+// for the first render, after a font-size change, after a clear, and
+// as the fallback when the incremental path finds an inconsistency.
+// The 60 ms timer used to rebuild the whole string on every flush,
+// which dropped frames under heavy output; the incremental path
+// below is the steady state, and this stays as the fallback.
+- (void)fullRebuildTerminal {
+    // This method rebuilds the whole attributed string from the VT.
+    // Setting attributedText resets the scroll position, so the old
+    // flush yanked the view to the bottom on every tick and a swipe
+    // down was undone 60 ms later — "it go up again and again".
     // The fix is the rule every mobile terminal uses: follow the
     // bottom only while the user is already pinned there; when they
     // have scrolled up into the scrollback, put the view back exactly
-    // where they left it. _vt.dirty is cleared here and set again by
-    // vt_feed on new output, so an idle terminal does no work at all
-    // (before this the flag was never cleared and every flush rebuilt
-    // the string forever, even with no new output).
-    _vt.dirty = 0;
+    // where they left it.
     BOOL pinned = [self isPinnedToBottom];
     CGPoint savedOffset = _output.contentOffset;
-    // Setting attributedText clears any active text selection, so the
-    // user cannot copy while output streams: save it (as an NSRange,
-    // which survives the rebuild) and restore it afterwards, clamped
-    // to the new text length.
     NSRange savedSelection = _output.selectedRange;
     BOOL hadSelection = savedSelection.length > 0;
     UIFont *font = TXTermFont();
     NSMutableAttributedString *out = [[NSMutableAttributedString alloc] init];
-    // Scrollback stays plain text (vt.c keeps no colours for it).
-    NSDictionary *plain = @{
+    NSAttributedString *newline = [[NSAttributedString alloc] initWithString:@"\n" attributes:@{
         NSFontAttributeName: font,
         NSForegroundColorAttributeName: TXThemeForegroundColor(),
-        NSParagraphStyleAttributeName: TXTermParagraphStyle(),
-    };
+        NSParagraphStyleAttributeName: TXTermParagraphStyleForSize(font.pointSize),
+    }];
+    // Scrollback keeps its colours now (vt.c stores cells, not
+    // plain text), so it renders through the same run grouping as
+    // the grid — a coloured line looks the same scrolled up as it
+    // did on the live screen.
     for (int i = 0; i < _vt.scrollback_count; i++) {
-        NSString *line = [NSString stringWithUTF8String:_vt.scrollback[i]];
-        // A line that is not valid UTF-8 must still render: fall
-        // back to the lossy decode (U+FFFD for bad bytes) instead of
-        // skipping the line, or it vanishes and the lines below shift.
-        if (!line) line = TXLossyUTF8String(_vt.scrollback[i]);
-        if (!line) line = @"";
-        [out appendAttributedString:[[NSAttributedString alloc] initWithString:[line stringByAppendingString:@"\n"] attributes:plain]];
+        [self appendScrollbackRow:i font:font newline:newline to:out];
     }
-    // The grid renders with per-cell colours, grouped into runs.
-    for (int r = 0; r < VT_ROWS; r++) {
-        int last = VT_COLS - 1;
-        while (last >= 0 && _vt.grid[r][last].ch == 0) last--;
-        if (r == _vt.cy && _vt.cx > last && _vt.cursor_visible) last = _vt.cx; // keep the cursor cell
-        NSMutableString *runText = [NSMutableString string];
-        vt_cell runCell = _vt.grid[r][0];
-        BOOL haveRun = NO;
-        for (int c = 0; c <= last; c++) {
-            vt_cell cell = _vt.grid[r][c];
-            BOOL isCursor = (r == _vt.cy && c == _vt.cx && _vt.cursor_visible);
-            if (haveRun && (cell.fg != runCell.fg || cell.bg != runCell.bg ||
-                            cell.bold != runCell.bold || isCursor)) {
-                [self appendRun:out text:runText cell:runCell font:font cursor:NO];
-                [runText setString:@""];
-                haveRun = NO;
-            }
-            if (!haveRun) { runCell = cell; haveRun = YES; }
-            if (cell.ch == 0) [runText appendString:@" "];
-            else if (cell.ch < 0x10000) [runText appendFormat:@"%C", (unichar)cell.ch];
-            else {
-                // Astral plane: emit the UTF-16 surrogate pair.
-                uint32_t v = cell.ch - 0x10000;
-                unichar pair[2] = { (unichar)(0xD800 + (v >> 10)), (unichar)(0xDC00 + (v & 0x3FF)) };
-                [runText appendString:[NSString stringWithCharacters:pair length:2]];
-            }
-            if (isCursor) {
-                [self appendRun:out text:runText cell:runCell font:font cursor:YES];
-                [runText setString:@""];
-                haveRun = NO;
-            }
-        }
-        if (haveRun) [self appendRun:out text:runText cell:runCell font:font cursor:NO];
-        if (r < VT_ROWS - 1) [out appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n" attributes:plain]];
-    }
+    NSUInteger scrollbackLength = out.length;
+    [out appendAttributedString:[self gridAttributedStringWithFont:font]];
     _output.attributedText = out;
+    // The render state now matches the VT exactly.
+    _renderedScrollbackCount = (NSUInteger)_vt.scrollback_count;
+    _renderedScrollbackSeq = _vt.scrollback_seq;
+    _renderedScrollbackDropped = _vt.scrollback_dropped;
+    _scrollbackTextLength = scrollbackLength;
+    _fullRebuildNeeded = NO;
+    [self restoreTerminalPosition:pinned savedOffset:savedOffset
+                   savedSelection:savedSelection hadSelection:hadSelection
+                    deletedLength:0 droppedLines:0 font:font];
+}
+
+// The steady state: only what changed since the last render.
+// The scrollback is the expensive part (up to 2000 lines) and it
+// only ever grows at the end and drops from the front, so the new
+// lines are appended at the scrollback/grid boundary and the dropped
+// ones are deleted from the front; the grid (25 rows) is re-rendered
+// whole, which is cheap. Any inconsistency falls back to a full
+// rebuild — a wrong render state must never produce a wrong screen.
+- (void)incrementalFlushTerminal {
+    BOOL pinned = [self isPinnedToBottom];
+    CGPoint savedOffset = _output.contentOffset;
+    NSRange savedSelection = _output.selectedRange;
+    BOOL hadSelection = savedSelection.length > 0;
+    UIFont *font = TXTermFont();
+    NSAttributedString *newline = [[NSAttributedString alloc] initWithString:@"\n" attributes:@{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: TXThemeForegroundColor(),
+        NSParagraphStyleAttributeName: TXTermParagraphStyleForSize(font.pointSize),
+    }];
+    NSTextStorage *storage = _output.textStorage;
+    NSUInteger deletedLength = 0;
+    NSUInteger droppedLines = 0;
+    [storage beginEditing];
+
+    // Defensive: the dispatcher already routes a shrunk scrollback
+    // to a full rebuild, but an out-of-range length here would read
+    // or replace out of bounds — fall back instead of trusting it.
+    if (_scrollbackTextLength > (NSUInteger)storage.length ||
+        (NSUInteger)_vt.scrollback_count < _renderedScrollbackCount) {
+        [storage endEditing];
+        [self fullRebuildTerminal];
+        return;
+    }
+
+    // 1. Drop the lines that fell off the front at the cap.
+    uint64_t droppedDelta = _vt.scrollback_dropped - _renderedScrollbackDropped;
+    if (droppedDelta > 0) {
+        if (droppedDelta > _renderedScrollbackCount || _scrollbackTextLength > (NSUInteger)storage.length) {
+            [storage endEditing];
+            [self fullRebuildTerminal];
+            return;
+        }
+        // Find the end of the droppedDelta-th line in the scrollback
+        // portion (each line ends with "\n"). The scan is short: at
+        // the cap one line drops per scroll.
+        NSString *text = storage.string;
+        NSUInteger pos = 0;
+        NSUInteger found = 0;
+        while (found < droppedDelta && pos < _scrollbackTextLength) {
+            NSRange nl = [text rangeOfString:@"\n" options:0 range:NSMakeRange(pos, _scrollbackTextLength - pos)];
+            if (nl.location == NSNotFound) break;
+            pos = NSMaxRange(nl);
+            found++;
+        }
+        if (found != droppedDelta) {
+            [storage endEditing];
+            [self fullRebuildTerminal];
+            return;
+        }
+        [storage deleteCharactersInRange:NSMakeRange(0, pos)];
+        deletedLength = pos;
+        droppedLines = (NSUInteger)droppedDelta;
+        _scrollbackTextLength -= pos;
+        _renderedScrollbackCount -= (NSUInteger)droppedDelta;
+        _renderedScrollbackDropped = _vt.scrollback_dropped;
+    }
+
+    // 2. Append the new scrollback lines at the scrollback/grid
+    // boundary. The new lines are the last ones in the VT's
+    // scrollback; the grid below them is pushed down, not rewritten.
+    NSUInteger newCount = (NSUInteger)_vt.scrollback_count - _renderedScrollbackCount;
+    if (newCount > 0) {
+        NSMutableAttributedString *added = [[NSMutableAttributedString alloc] init];
+        for (NSUInteger k = 0; k < newCount; k++) {
+            int row = _vt.scrollback_count - (int)newCount + (int)k;
+            [self appendScrollbackRow:row font:font newline:newline to:added];
+        }
+        [storage insertAttributedString:added atIndex:_scrollbackTextLength];
+        _scrollbackTextLength += added.length;
+        _renderedScrollbackCount += newCount;
+        _renderedScrollbackSeq = _vt.scrollback_seq;
+    }
+
+    // 3. Re-render the grid (25 rows): replace everything after the
+    // scrollback. This is what the blink tick exercises when no new
+    // output arrived — only the cursor cell changes.
+    NSRange gridRange = NSMakeRange(_scrollbackTextLength, (NSUInteger)storage.length - _scrollbackTextLength);
+    [storage replaceCharactersInRange:gridRange withAttributedString:[self gridAttributedStringWithFont:font]];
+    [storage endEditing];
+
+    [self restoreTerminalPosition:pinned savedOffset:savedOffset
+                   savedSelection:savedSelection hadSelection:hadSelection
+                    deletedLength:deletedLength droppedLines:droppedLines font:font];
+}
+
+// After a render: restore the selection and the scroll position.
+// Setting attributedText clears any active text selection, so the
+// user cannot copy while output streams: save it (as an NSRange,
+// which survives the rebuild) and restore it afterwards, clamped
+// to the new text length. Lines dropped from the front shift the
+// selection up by the deleted characters, and shift the scroll
+// offset up by the dropped lines' height — without the offset
+// shift the view would jump down by the dropped lines. Pinned
+// means the last visible line is the live one: the bottom of the
+// content is within one line of the bottom of the view.
+- (void)restoreTerminalPosition:(BOOL)pinned savedOffset:(CGPoint)savedOffset
+                 savedSelection:(NSRange)savedSelection hadSelection:(BOOL)hadSelection
+                  deletedLength:(NSUInteger)deletedLength droppedLines:(NSUInteger)droppedLines
+                           font:(UIFont *)font {
     [_output layoutIfNeeded]; // contentSize is current before we measure it
     if (hadSelection) {
-        // Restore the selection, clamped to the new text length (new
-        // output can grow it, a clear-screen can shrink it under the
-        // old range).
-        NSUInteger len = out.length;
+        NSUInteger len = _output.textStorage.length;
         NSRange restored = savedSelection;
+        if (deletedLength > 0) {
+            if (restored.location >= deletedLength) {
+                restored.location -= deletedLength;
+            } else {
+                // The selection started inside the deleted lines:
+                // clamp it to the top, keeping what survived.
+                NSUInteger cut = deletedLength - restored.location;
+                restored.location = 0;
+                restored.length = restored.length > cut ? restored.length - cut : 0;
+            }
+        }
         if (restored.location > len) restored.location = len;
         if (restored.location + restored.length > len) restored.length = len - restored.location;
         _output.selectedRange = restored;
     }
-    if (pinned) [self scrollToBottomAnimated:NO];
-    else {
+    if (pinned) {
+        [self scrollToBottomAnimated:NO];
+    } else {
         // Restore the saved offset, clamped to the new content
         // height (a clear-screen can shrink it under the old one).
+        // contentInset.bottom is zero by design (the toolbar clears
+        // the keyboard, so the text view takes no inset — see
+        // viewDidLoad), and this check reads it, so if an inset ever
+        // comes back the "bottom" moves past the text by exactly
+        // that amount and the terminal opens black. Keep it zero.
+        CGPoint restored = savedOffset;
+        if (droppedLines > 0) {
+            CGFloat lineHeight = font.lineHeight + TXTermParagraphStyleForSize(font.pointSize).lineSpacing;
+            restored.y -= (CGFloat)droppedLines * lineHeight;
+        }
         CGFloat maxOffset = _output.contentSize.height + _output.contentInset.bottom - _output.bounds.size.height;
         CGFloat minY = -_output.contentInset.top;
-        CGPoint restored = savedOffset;
         restored.y = MIN(MAX(restored.y, minY), MAX(maxOffset, minY));
         _output.contentOffset = restored;
     }
+}
+
+// One scrollback row (cells) plus its newline. The row is trimmed
+// to its last non-blank cell here, at render time — the same rule
+// as a grid row.
+- (void)appendScrollbackRow:(int)row font:(UIFont *)font newline:(NSAttributedString *)newline
+                         to:(NSMutableAttributedString *)out {
+    const vt_cell *cells = _vt.scrollback + (size_t)row * VT_COLS;
+    int last = VT_COLS - 1;
+    while (last >= 0 && cells[last].ch == 0) last--;
+    if (last >= 0) {
+        [self appendCellRow:cells count:last + 1 font:font cursorAt:-1 cursorVisible:NO to:out];
+    }
+    [out appendAttributedString:newline];
+}
+
+// The 25 grid rows as one attributed string (no trailing newline).
+// The cursor cell is kept even past the last non-blank cell when the
+// cursor is shown, so the block is always visible.
+- (NSMutableAttributedString *)gridAttributedStringWithFont:(UIFont *)font {
+    NSMutableAttributedString *grid = [[NSMutableAttributedString alloc] init];
+    BOOL cursorShown = _vt.cursor_visible && _cursorBlinkOn;
+    NSAttributedString *newline = [[NSAttributedString alloc] initWithString:@"\n" attributes:@{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: TXThemeForegroundColor(),
+        NSParagraphStyleAttributeName: TXTermParagraphStyleForSize(font.pointSize),
+    }];
+    for (int r = 0; r < VT_ROWS; r++) {
+        int last = VT_COLS - 1;
+        while (last >= 0 && _vt.grid[r][last].ch == 0) last--;
+        if (r == _vt.cy && _vt.cx > last && cursorShown) last = _vt.cx; // keep the cursor cell
+        if (last >= 0) {
+            [self appendCellRow:_vt.grid[r] count:last + 1 font:font
+                       cursorAt:(r == _vt.cy ? _vt.cx : -1) cursorVisible:cursorShown
+                             to:grid];
+        }
+        if (r < VT_ROWS - 1) [grid appendAttributedString:newline];
+    }
+    return grid;
+}
+
+// Render one row of cells, grouping consecutive cells with the same
+// fg/bg/bold into runs. The grid and the scrollback both render
+// through here, so a colour means the same in both. cursorCol is the
+// column of the block cursor (-1 for no cursor: scrollback rows
+// never have one); when the cursor is shown its cell renders
+// inverted and breaks the run.
+- (void)appendCellRow:(const vt_cell *)cells count:(int)count font:(UIFont *)font
+             cursorAt:(int)cursorCol cursorVisible:(BOOL)cursorVisible
+                   to:(NSMutableAttributedString *)out {
+    if (count <= 0) return;
+    NSMutableString *runText = [NSMutableString string];
+    vt_cell runCell = cells[0];
+    BOOL haveRun = NO;
+    for (int c = 0; c < count; c++) {
+        vt_cell cell = cells[c];
+        BOOL isCursor = (cursorVisible && c == cursorCol);
+        if (haveRun && (cell.fg != runCell.fg || cell.bg != runCell.bg ||
+                        cell.bold != runCell.bold || isCursor)) {
+            [self appendRun:out text:runText cell:runCell font:font cursor:NO];
+            [runText setString:@""];
+            haveRun = NO;
+        }
+        if (!haveRun) { runCell = cell; haveRun = YES; }
+        if (cell.ch == 0) [runText appendString:@" "];
+        else if (cell.ch < 0x10000) [runText appendFormat:@"%C", (unichar)cell.ch];
+        else {
+            // Astral plane: emit the UTF-16 surrogate pair.
+            uint32_t v = cell.ch - 0x10000;
+            unichar pair[2] = { (unichar)(0xD800 + (v >> 10)), (unichar)(0xDC00 + (v & 0x3FF)) };
+            [runText appendString:[NSString stringWithCharacters:pair length:2]];
+        }
+        if (isCursor) {
+            [self appendRun:out text:runText cell:runCell font:font cursor:YES];
+            [runText setString:@""];
+            haveRun = NO;
+        }
+    }
+    if (haveRun) [self appendRun:out text:runText cell:runCell font:font cursor:NO];
 }
 
 // Pinned means the last visible line is the live one: the bottom of
@@ -1025,7 +1528,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         NSFontAttributeName: font,
         NSForegroundColorAttributeName: fg,
         NSBackgroundColorAttributeName: bg,
-        NSParagraphStyleAttributeName: TXTermParagraphStyle(),
+        NSParagraphStyleAttributeName: TXTermParagraphStyleForSize(font.pointSize),
     };
     [out appendAttributedString:[[NSAttributedString alloc] initWithString:text attributes:attrs]];
 }
@@ -1043,42 +1546,54 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         return NO;
     }
     if (string.length == 0) return NO;
+    // Work out the bytes for this key first, then apply the latched
+    // modifiers: Ctrl turns a letter into its control byte (and
+    // Return into Ctrl-J), Alt prefixes ESC to whatever the key
+    // produces. Both latches release on use.
+    NSData *toSend = nil;
     if ([string isEqualToString:@"\n"]) {
         // NewTerm sends carriage return, not line feed — unless Ctrl
         // is latched, in which case Return is Ctrl-J (line feed,
         // 0x0A) and the latch releases. Without this the newline
         // branch returns before the Ctrl check below, so Ctrl stays
         // latched and the next typed letter becomes a control byte.
-        if (_ctrlLatched) {
-            uint8_t lf = 0x0A;
-            [_engine sendConsoleInput:[NSData dataWithBytes:&lf length:1]];
-            [self onCtrl];
-        } else {
-            uint8_t cr = '\r';
-            [_engine sendConsoleInput:[NSData dataWithBytes:&cr length:1]];
-        }
-        return NO;
-    }
-    if (_ctrlLatched) {
+        uint8_t b = _ctrlLatched ? 0x0A : '\r';
+        toSend = [NSData dataWithBytes:&b length:1];
+        [self releaseCtrl];
+    } else if (_ctrlLatched) {
         // Ctrl plus a letter: send the control byte, then unlatch.
-        unichar c = [string characterAtIndex:0];
-        uint8_t control = 0;
-        if (c >= 'a' && c <= 'z') control = (uint8_t)(c - 'a' + 1);
-        else if (c >= 'A' && c <= 'Z') control = (uint8_t)(c - 'A' + 1);
-        else if (c == '[') control = 0x1B;
-        else if (c == '\\') control = 0x1C;
-        else if (c == ']') control = 0x1D;
-        else if (c == '^') control = 0x1E;
-        else if (c == '_') control = 0x1F;
-        if (control) {
-            [_engine sendConsoleInput:[NSData dataWithBytes:&control length:1]];
-            [self onCtrl];
-            return NO;
-        }
-        [self onCtrl];
+        // A character with no control mapping (a digit, a space)
+        // sends as-is once the latch releases.
+        uint8_t control = [self controlByteForCharacter:[string characterAtIndex:0]];
+        [self releaseCtrl];
+        if (control) toSend = [NSData dataWithBytes:&control length:1];
+        else toSend = [string dataUsingEncoding:NSUTF8StringEncoding];
+    } else {
+        toSend = [string dataUsingEncoding:NSUTF8StringEncoding];
     }
-    [_engine sendConsoleInput:[string dataUsingEncoding:NSUTF8StringEncoding]];
+    if (_altLatched) {
+        // Alt prefixes ESC to the next input, whatever it is: Alt+x
+        // is ESC x, Alt+Return is ESC CR, Alt+Ctrl+C is ESC ETX.
+        uint8_t esc = 0x1B;
+        [_engine sendConsoleInput:[NSData dataWithBytes:&esc length:1]];
+        [self releaseAlt];
+    }
+    if (toSend.length) [_engine sendConsoleInput:toSend];
     return NO;
+}
+
+// The control byte for a character with Ctrl held: a-z and A-Z map
+// to 1-26, [ \ ] ^ _ to ESC FS GS RS US. Anything else has no
+// control byte (0), and the character sends as-is.
+- (uint8_t)controlByteForCharacter:(unichar)c {
+    if (c >= 'a' && c <= 'z') return (uint8_t)(c - 'a' + 1);
+    if (c >= 'A' && c <= 'Z') return (uint8_t)(c - 'A' + 1);
+    if (c == '[') return 0x1B;
+    if (c == '\\') return 0x1C;
+    if (c == ']') return 0x1D;
+    if (c == '^') return 0x1E;
+    if (c == '_') return 0x1F;
+    return 0;
 }
 
 #pragma mark - Keyboard
@@ -1111,6 +1626,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
 - (void)dealloc {
     [_flushTimer invalidate];
+    [_blinkTimer invalidate];
     [_repeatTimer invalidate];
     vt_free(&_vt);
 }

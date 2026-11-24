@@ -19,14 +19,83 @@ typedef struct {
     int nparams;
     int cur;      /* parameter being built, -1 when none yet. */
     int priv;     /* CSI '?' seen. */
-    uint32_t utf8; /* partial code point. */
-    int utf8_left;
+    /* The multi-byte UTF-8 sequence in progress: bytes buffered so
+     * far (at most 4). A sequence split across two feeds stays here
+     * until it completes, so it still prints whole; an invalid one
+     * is dropped one byte at a time and the bytes after it are
+     * re-decoded, so a good character after a bad byte is not lost.
+     * Decoded only by vt_utf8_decode — the validation lives there. */
+    uint8_t utf8_buf[4];
+    int utf8_len;
     int16_t cur_fg; /* SGR foreground, -1 default. */
     int16_t cur_bg; /* SGR background, -1 default. */
     uint8_t cur_bold;
 } vt_parse;
 
 static vt_parse P;
+
+/* Forward: vt_feed_utf8 (below) prints through vt_put_char, which
+ * is defined further down with the rest of the screen code. */
+static void vt_put_char(vt_t *vt, uint32_t ch);
+
+/* The one UTF-8 decoder (see vt.h). Strict: overlongs, surrogates
+ * and > U+10FFFF are invalid, so a hostile or binary guest cannot
+ * smuggle a surrogate into an NSString (which would break the text
+ * view) or a NUL into a C string. */
+int vt_utf8_decode(const uint8_t *p, size_t len, uint32_t *cp) {
+    if (len == 0) return -1;
+    uint8_t b0 = p[0];
+    if (b0 < 0x80) { *cp = b0; return 1; }
+    int need;
+    uint32_t min_cp, c;
+    if (b0 >= 0xC2 && b0 <= 0xDF) { need = 2; c = b0 & 0x1F; min_cp = 0x80; }
+    else if (b0 >= 0xE0 && b0 <= 0xEF) { need = 3; c = b0 & 0x0F; min_cp = 0x800; }
+    else if (b0 >= 0xF0 && b0 <= 0xF4) { need = 4; c = b0 & 0x07; min_cp = 0x10000; }
+    else return 0; /* stray continuation, 0xC0/0xC1, 0xF5 and up. */
+    if (len < (size_t)need) return -1;
+    for (int i = 1; i < need; i++) {
+        if ((p[i] & 0xC0) != 0x80) return 0;
+        c = (c << 6) | (p[i] & 0x3F);
+    }
+    if (c < min_cp) return 0; /* overlong. */
+    if (c >= 0xD800 && c <= 0xDFFF) return 0; /* surrogate. */
+    if (c > 0x10FFFF) return 0;
+    *cp = c;
+    return need;
+}
+
+/* Feed one byte >= 0x80 into the pending UTF-8 sequence. The buffer
+ * holds at most 4 bytes and a 4-byte buffer always resolves, so the
+ * loop below always terminates: each retry drops one byte, and the
+ * last byte alone either decodes (ASCII) or drops as invalid. */
+static void vt_feed_utf8(vt_t *vt, uint8_t b) {
+    if (P.utf8_len < 4) P.utf8_buf[P.utf8_len++] = b;
+    else {
+        /* Unreachable by construction (see above): a 4-byte buffer
+         * resolves on the byte that completed it. Drop the pending
+         * bytes rather than lose the new one silently. */
+        P.utf8_len = 0;
+        P.utf8_buf[P.utf8_len++] = b;
+    }
+    for (;;) {
+        uint32_t cp = 0;
+        int n = vt_utf8_decode(P.utf8_buf, (size_t)P.utf8_len, &cp);
+        if (n > 0) {
+            vt_put_char(vt, cp);
+            vt->dirty = 1;
+            P.utf8_len = 0;
+            return;
+        }
+        if (n < 0) return; /* incomplete — wait for more bytes. */
+        /* Invalid: drop the first buffered byte and retry the rest
+         * as a fresh sequence, so a good character after a bad byte
+         * still prints (a bad lead followed by '(' used to eat the
+         * '(' too). */
+        memmove(P.utf8_buf, P.utf8_buf + 1, (size_t)(P.utf8_len - 1));
+        P.utf8_len--;
+        if (P.utf8_len == 0) return;
+    }
+}
 
 /* A blank cell carries the default colours, except that an erase leaves
  * the current background behind (back colour erase, as xterm does). */
@@ -47,10 +116,11 @@ static void vt_clear_grid(vt_t *vt) {
     vt->scroll_bottom = VT_ROWS - 1;
 }
 
-/* Free every scrollback line and forget them, keeping the allocated
- * array so the next scroll does not reallocate from scratch. */
+/* Forget the scrollback rows, keeping the allocated array so the
+ * next scroll does not reallocate from scratch. The seq counters are
+ * NOT reset: they are monotonic, and the view detects a clear by the
+ * count shrinking. */
 static void vt_clear_scrollback(vt_t *vt) {
-    for (int i = 0; i < vt->scrollback_count; i++) free(vt->scrollback[i]);
     vt->scrollback_count = 0;
 }
 
@@ -65,52 +135,41 @@ static void vt_put_cell(vt_t *vt, int row, int col, uint32_t ch) {
 static void vt_scroll_up(vt_t *vt) {
     /* Top line of the scroll region leaves the grid into scrollback;
      * only rows inside [scroll_top, scroll_bottom] move. Lines outside
-     * the region are untouched. */
-    char *line = NULL;
-    size_t len = 0, cap = 0;
-    for (int c = 0; c < VT_COLS; c++) {
-        uint32_t ch = vt->grid[vt->scroll_top][c].ch;
-        char buf[4];
-        int n = 0;
-        if (ch == 0) buf[n++] = ' ';
-        else if (ch < 0x80) buf[n++] = (char)ch;
-        else if (ch < 0x800) { buf[n++] = 0xC0 | (ch >> 6); buf[n++] = 0x80 | (ch & 0x3F); }
-        else if (ch < 0x10000) { buf[n++] = 0xE0 | (ch >> 12); buf[n++] = 0x80 | ((ch >> 6) & 0x3F); buf[n++] = 0x80 | (ch & 0x3F); }
-        else { buf[n++] = 0xF0 | (ch >> 18); buf[n++] = 0x80 | ((ch >> 12) & 0x3F); buf[n++] = 0x80 | ((ch >> 6) & 0x3F); buf[n++] = 0x80 | (ch & 0x3F); }
-        if (len + (size_t)n + 1 > cap) {
-            // Grow with a temp: if realloc fails the old buffer
-            // must survive (assigning its result straight to line
-            // would lose it), and the grid is left untouched.
-            size_t new_cap = (cap + 64) * 2;
-            char *grown = realloc(line, new_cap);
-            if (!grown) { free(line); return; }
-            line = grown;
-            cap = new_cap;
-        }
-        memcpy(line + len, buf, (size_t)n);
-        len += (size_t)n;
-    }
-    if (!line) return;
-    while (len > 0 && line[len - 1] == ' ') len--;
-    line[len] = '\0';
+     * the region are untouched. The row is copied whole, cells and
+     * colours together — the scrollback keeps the colours, and
+     * trailing blanks are trimmed only at render time, the same as
+     * a grid row. There is no encode and no trim at push time any
+     * more: the old code encoded the line to UTF-8 here (duplicating
+     * append_utf8) and stripped its trailing spaces (duplicating the
+     * render-time trim). */
     if (vt->scrollback_count == vt->scrollback_cap) {
         if (vt->scrollback_cap >= VT_SCROLLBACK_MAX) {
-            free(vt->scrollback[0]);
-            memmove(vt->scrollback, vt->scrollback + 1, sizeof(char *) * (size_t)(vt->scrollback_cap - 1));
+            /* At the cap: drop the oldest row, shifting the rest
+             * down one row. */
+            memmove(vt->scrollback, vt->scrollback + VT_COLS,
+                    sizeof(vt_cell) * (size_t)(VT_COLS * (vt->scrollback_cap - 1)));
             vt->scrollback_count--;
+            vt->scrollback_dropped++;
         } else {
-            // Grow with a temp: if realloc fails the old array must
-            // survive. Assigning the result straight to scrollback
-            // would lose it (NULL) while scrollback_cap was already
-            // doubled, and the next scroll would write through NULL.
+            /* Grow with a temp: if realloc fails the old array must
+             * survive. Assigning the result straight to scrollback
+             * would lose it (NULL) while scrollback_cap was already
+             * doubled, and the next scroll would write through NULL.
+             * Growth is clamped to VT_SCROLLBACK_MAX: the old
+             * doubling ran past it to 2048 rows, so the "2000-line
+             * cap" was really 2048. */
             int new_cap = vt->scrollback_cap ? vt->scrollback_cap * 2 : 64;
-            char **grown = realloc(vt->scrollback, sizeof(char *) * (size_t)new_cap);
-            if (!grown) { free(line); return; }
+            if (new_cap > VT_SCROLLBACK_MAX) new_cap = VT_SCROLLBACK_MAX;
+            vt_cell *grown = realloc(vt->scrollback, sizeof(vt_cell) * (size_t)(VT_COLS * new_cap));
+            if (!grown) return;
             vt->scrollback = grown;
             vt->scrollback_cap = new_cap;
         }
     }
-    vt->scrollback[vt->scrollback_count++] = line;
+    memcpy(vt->scrollback + (size_t)vt->scrollback_count * VT_COLS,
+           vt->grid[vt->scroll_top], sizeof(vt_cell) * VT_COLS);
+    vt->scrollback_count++;
+    vt->scrollback_seq++;
     memmove(vt->grid[vt->scroll_top], vt->grid[vt->scroll_top + 1],
             sizeof(vt_cell) * VT_COLS * (vt->scroll_bottom - vt->scroll_top));
     for (int c = 0; c < VT_COLS; c++) vt_blank_cell(vt, vt->scroll_bottom, c);
@@ -125,6 +184,11 @@ static void vt_newline(vt_t *vt) {
 }
 
 static void vt_put_char(vt_t *vt, uint32_t ch) {
+    /* BEL rings the bell and prints nothing. It sets the flag; the
+     * view clears it when it rings, so a bell is never rung twice
+     * or lost. The caller sets vt->dirty after this, so the flush
+     * runs and picks the flag up. */
+    if (ch == 0x07) { vt->bell = 1; return; }
     if (ch == '\r') { vt->cx = 0; vt->pending_wrap = 0; return; }
     if (ch == '\n') { vt_newline(vt); return; }
     if (ch == '\b') { if (vt->cx > 0) vt->cx--; vt->pending_wrap = 0; return; }
@@ -346,7 +410,6 @@ void vt_init(vt_t *vt) {
 }
 
 void vt_free(vt_t *vt) {
-    for (int i = 0; i < vt->scrollback_count; i++) free(vt->scrollback[i]);
     free(vt->scrollback);
     vt->scrollback = NULL;
     vt->scrollback_count = vt->scrollback_cap = 0;
@@ -357,18 +420,22 @@ void vt_feed(vt_t *vt, const uint8_t *bytes, size_t len) {
         uint8_t b = bytes[i];
         switch (P.state) {
         case VT_GROUND:
-            if (b == 0x1B) { P.state = VT_ESC; break; }
-            if (b < 0x80) { vt_put_char(vt, b); vt->dirty = 1; break; }
-            if ((b & 0xE0) == 0xC0) { P.utf8 = b & 0x1F; P.utf8_left = 1; break; }
-            if ((b & 0xF0) == 0xE0) { P.utf8 = b & 0x0F; P.utf8_left = 2; break; }
-            if ((b & 0xF8) == 0xF0) { P.utf8 = b & 0x07; P.utf8_left = 3; break; }
-            if ((b & 0xC0) == 0x80 && P.utf8_left > 0) {
-                P.utf8 = (P.utf8 << 6) | (b & 0x3F);
-                if (--P.utf8_left == 0) { vt_put_char(vt, P.utf8); vt->dirty = 1; }
+            if (b == 0x1B) { P.utf8_len = 0; P.state = VT_ESC; break; }
+            if (b < 0x80) {
+                /* ASCII: a pending partial UTF-8 sequence is
+                 * abandoned (the byte is not a continuation), and the
+                 * byte itself still prints — the old state machine
+                 * dropped it, so a bad lead ate the next character. */
+                P.utf8_len = 0;
+                vt_put_char(vt, b);
+                vt->dirty = 1;
                 break;
             }
-            /* Stray continuation or invalid byte: drop it. */
-            P.utf8_left = 0;
+            /* Multi-byte UTF-8, decoded by the one shared decoder
+             * (see vt_feed_utf8). A sequence split across two feeds
+             * still prints whole; an invalid one is dropped without
+             * eating the good bytes after it. */
+            vt_feed_utf8(vt, b);
             break;
         case VT_ESC:
             if (b == '[') {
@@ -448,12 +515,15 @@ static void append_utf8(char **out, size_t *len, size_t *cap, uint32_t ch) {
 char *vt_render(vt_t *vt) {
     char *out = NULL;
     size_t len = 0, cap = 0;
+    /* Scrollback rows are cells now: encode each row the same way as
+     * a grid row (append_utf8 is the one encoder), trimming trailing
+     * blanks here at render time. */
     for (int i = 0; i < vt->scrollback_count; i++) {
-        const char *line = vt->scrollback[i];
-        size_t n = strlen(line);
-        if (len + n + 2 > cap) { cap = (len + n + 2) * 2 + 256; out = realloc(out, cap); if (!out) return NULL; }
-        memcpy(out + len, line, n);
-        len += n;
+        const vt_cell *row = vt->scrollback + (size_t)i * VT_COLS;
+        int last = VT_COLS - 1;
+        while (last >= 0 && row[last].ch == 0) last--;
+        for (int c = 0; c <= last; c++) append_utf8(&out, &len, &cap, row[c].ch);
+        if (len + 2 > cap) { cap = (len + 2) * 2 + 256; out = realloc(out, cap); if (!out) return NULL; }
         out[len++] = '\n';
     }
     for (int r = 0; r < VT_ROWS; r++) {

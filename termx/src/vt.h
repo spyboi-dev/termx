@@ -5,8 +5,11 @@
  * and a shell actually emit: printable text (UTF-8), CR/LF/BS/TAB, and
  * CSI H/f/A/B/C/D/G/d/J/K/m/s/u/h/l/r, plus ESC 7/8 and ESC c. SGR
  * colours are parsed into per-cell fg/bg (xterm 256-colour indices, -1
- * for default) and bold, so the view can render them; scrollback lines
- * stay plain text. No dependency on SwiftTerm or any Swift code.
+ * for default) and bold, so the view can render them. The scrollback
+ * keeps the cells, not plain text, so scrolling up shows the colours
+ * the lines were printed with; trailing blanks are trimmed only at
+ * render time, the same as a grid row. No dependency on SwiftTerm or
+ * any Swift code.
  *
  * The 80 columns are not arbitrary: the guest console is a serial ttyS0
  * whose winsize the kernel leaves at 0, so guest programs fall back to
@@ -42,10 +45,27 @@ typedef struct {
     vt_cell grid[VT_ROWS][VT_COLS];
     int cx, cy;
     int saved_cx, saved_cy;
-    char **scrollback; /* UTF-8 lines, oldest first. */
+    /* Scrollback: one flat array of scrollback_cap rows of VT_COLS
+     * cells, oldest first. A row is stored whole (80 cells); the
+     * view trims trailing blanks when it renders the row. Keeping
+     * cells (not plain text) is what preserves colour in scrollback.
+     * 2000 rows x 80 cells x 12 bytes is ~1.9 MB at the cap. */
+    vt_cell *scrollback;
     int scrollback_count;
-    int scrollback_cap;
+    int scrollback_cap; /* capacity in rows; never above VT_SCROLLBACK_MAX. */
+    /* Monotonic counters so the view can render incrementally: seq
+     * counts every line ever pushed into scrollback, dropped counts
+     * the lines that fell off the front once the cap was reached.
+     * The view remembers both at its last render and only appends
+     * the lines with a higher seq, deleting the dropped ones from
+     * the front of its text. Neither is reset by a scrollback clear
+     * (a clear is detected by the count shrinking, not by the seq). */
+    uint64_t scrollback_seq;
+    uint64_t scrollback_dropped;
     int dirty; /* grid or scrollback changed since last render. */
+    int bell; /* BEL (0x07) received since the view last checked. Set
+                 by vt_put_char; the view clears it when it rings the
+                 bell, so a bell is never rung twice or lost. */
     int pending_wrap; /* cursor past the last column: wrap on the next
                          printable char instead of at once (deferred
                          wrap, as xterm does). */
@@ -63,5 +83,13 @@ void vt_feed(vt_t *vt, const uint8_t *bytes, size_t len);
 /* Rendered text: scrollback lines then the grid, trailing spaces trimmed.
  * Caller frees the result. Returns NULL on allocation failure. */
 char *vt_render(vt_t *vt);
+/* Decode one UTF-8 sequence starting at p (len bytes available).
+ * Returns the bytes consumed (1-4) for a complete valid sequence and
+ * sets *cp; returns 0 if the bytes are invalid; returns -1 if the
+ * buffer ends mid-sequence. Strict: rejects overlongs, surrogates,
+ * and code points above U+10FFFF. This is the one UTF-8 decoder: the
+ * incremental parser in vt_feed and any whole-string decoder both
+ * use it, so the validation rules cannot drift apart. */
+int vt_utf8_decode(const uint8_t *p, size_t len, uint32_t *cp);
 
 #endif
