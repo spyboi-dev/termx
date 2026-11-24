@@ -217,6 +217,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     BOOL _didClearScreenOnBoot; // clear-on-boot already done for this terminal instance
     CGPoint _exitPanStart; // where the top-edge exit drag began
     BOOL _exitPanAtTop;    // scrollback already at its top when the drag began
+    CGFloat _pinchStartSize; // font size when the current pinch began (Termux-style zoom)
     NSTimer *_repeatTimer; // arrow key repeat (NewTerm 2.4: hold to repeat)
     NSData *_repeatData;
 }
@@ -503,6 +504,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     exitPan.delegate = self;
     [_output addGestureRecognizer:exitPan];
 
+    // Pinch to zoom, Termux-style: two fingers change the font size,
+    // so the user can zoom out to fit a wide line (fastfetch in
+    // portrait) or zoom in to read small text. The size persists
+    // across launches. The pinch and the exit pan are different
+    // gestures (two fingers vs one), so they never fight.
+    UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onPinch:)];
+    [_output addGestureRecognizer:pinch];
+
     [self termXEngineDidChangeState:_engine.state status:_engine.statusText];
 }
 
@@ -761,6 +771,34 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
                 fabs(translation.y) > fabs(translation.x)) {
                 [self dismissViewControllerAnimated:YES completion:nil];
             }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// Pinch to zoom, Termux-style: two fingers scale the font size, so
+// the user can zoom out to fit a wide line (fastfetch in portrait)
+// or zoom in to read small text. The scale is relative to the size
+// when the pinch began, not cumulative, so a slow pinch does not
+// run away. The new size is saved at once, so it survives a relaunch
+// and the next terminal opens at the same size. The flush re-renders
+// the whole scrollback at the new size; the content and scroll
+// position are preserved by flushTerminal.
+- (void)onPinch:(UIPinchGestureRecognizer *)pinch {
+    switch (pinch.state) {
+        case UIGestureRecognizerStateBegan:
+            _pinchStartSize = TXTermFontSize();
+            break;
+        case UIGestureRecognizerStateChanged: {
+            CGFloat size = _pinchStartSize * pinch.scale;
+            if (size < 10) size = 10;
+            if (size > 24) size = 24;
+            if (fabs(size - TXTermFontSize()) < 0.5) return;
+            TXSetTermFontSize(size);
+            _output.font = TXTermFont();
+            [self flushTerminal];
             break;
         }
         default:

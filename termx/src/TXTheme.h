@@ -31,12 +31,29 @@ static inline UIColor *TXThemeAccentColor(void) {
     return [UIColor colorWithRed:0x2A / 255.0 green:0xB3 / 255.0 blue:0xA3 / 255.0 alpha:1.0];
 }
 
-// The one terminal font: 14 pt system monospace. The text view, the
-// placeholder, and the flush renderer must all use this — a size or
-// weight set in only one place is how the placeholder once rendered
-// in the wrong colour and the grid in another size.
+// The terminal font size, persisted across launches. Default 14 pt.
+// Pinch to zoom changes it (see TerminalViewController); the font is
+// built from this size everywhere, so one change re-renders the whole
+// terminal. Clamped to 10–24 pt: smaller and the text is unreadable,
+// larger and a single line no longer fits the screen.
+static inline CGFloat TXTermFontSize(void) {
+    CGFloat size = [[NSUserDefaults standardUserDefaults] doubleForKey:@"termx.fontSize"];
+    if (size < 10 || size > 24) return 14;
+    return size;
+}
+static inline void TXSetTermFontSize(CGFloat size) {
+    if (size < 10) size = 10;
+    if (size > 24) size = 24;
+    [[NSUserDefaults standardUserDefaults] setDouble:size forKey:@"termx.fontSize"];
+}
+
+// The one terminal font: system monospace at the current size. The
+// text view, the placeholder, and the flush renderer must all use
+// this — a size or weight set in only one place is how the
+// placeholder once rendered in the wrong colour and the grid in
+// another size.
 static inline UIFont *TXTermFont(void) {
-    return [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
+    return [UIFont monospacedSystemFontOfSize:TXTermFontSize() weight:UIFontWeightRegular];
 }
 
 NS_ASSUME_NONNULL_END
