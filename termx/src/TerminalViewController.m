@@ -555,13 +555,32 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         // to the guest without typing a command: the runtime boot
         // struct has no kernel command line field, so the guest
         // cannot read it at its own boot either.
-        static const uint8_t ed2[] = { 0x1B, '[', '2', 'J' };
-        vt_feed(&_vt, ed2, sizeof(ed2));
-        // Ask the guest for a fresh prompt on the clean screen: bash
-        // prints a new prompt for the newline. A bare newline is not
-        // a command, it only requests the prompt.
-        uint8_t nl = '\n';
-        [_engine sendConsoleInput:[NSData dataWithBytes:&nl length:1]];
+        //
+        // The clear and the fresh prompt run async on the main queue,
+        // not synchronously here. Console output arrives on the
+        // runtime thread and is fed to the VT via dispatch_async to
+        // the main queue, so a prompt that was already queued lands
+        // AFTER a synchronous clear — the clear wipes the replayed
+        // prompt, the queued prompt reappears, and the newline below
+        // prints a second one, which is the double prompt the user
+        // saw. Queuing the clear after the pending output means the
+        // clear wipes everything, and the newline prints exactly one
+        // fresh prompt. The delay is one run-loop turn, so the boot
+        // log never visibly flashes.
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            static const uint8_t ed2[] = { 0x1B, '[', '2', 'J' };
+            vt_feed(&strongSelf->_vt, ed2, sizeof(ed2));
+            // Ask the guest for a fresh prompt on the clean screen:
+            // bash prints a new prompt for the newline. A bare
+            // newline is not a command, it only requests the prompt.
+            uint8_t nl = '\n';
+            [strongSelf->_engine sendConsoleInput:[NSData dataWithBytes:&nl length:1]];
+            [strongSelf flushTerminal];
+            if ([strongSelf isPinnedToBottom]) [strongSelf scrollToBottomAnimated:NO];
+        });
     }
     // First render with final geometry: the 60 ms timer will flush
     // anyway, but this guarantees the view starts pinned to the live
@@ -579,8 +598,20 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     b.translatesAutoresizingMaskIntoConstraints = NO;
     [b setTitle:title forState:UIControlStateNormal];
     b.titleLabel.font = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightMedium];
-    b.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1.0];
-    b.layer.cornerRadius = 7;
+    // Match the iOS keyboard keys: a medium grey key with white text
+    // and a rounded corner, not the old dark key with blue text. The
+    // keyboard letter keys are a mid grey over a near-black board;
+    // white 0.30 lands on the same grey, and white text reads as a
+    // key label instead of a link. The corner radius matches the
+    // keyboard's, and the small shadow below the key gives the same
+    // depth the keyboard keys have.
+    b.backgroundColor = [UIColor colorWithWhite:0.30 alpha:1.0];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.layer.cornerRadius = 6;
+    b.layer.shadowColor = [UIColor blackColor].CGColor;
+    b.layer.shadowOffset = CGSizeMake(0, 1);
+    b.layer.shadowRadius = 1;
+    b.layer.shadowOpacity = 0.35;
     // Slim horizontal insets: the primary row holds ten keys, and
     // 10 pt insets overflowed a 430 pt screen once Paste joined it.
     b.contentEdgeInsets = UIEdgeInsetsMake(6, 7, 6, 7);
