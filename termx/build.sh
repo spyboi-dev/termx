@@ -23,14 +23,35 @@
 # Produces build/TermX.ipa: an adhoc-signed IPA. The installer
 # (SideStore, or sign-ipa.sh on a Mac) signs the whole bundle at
 # install time.
-set -e
+set -euo pipefail
 cd "$(dirname "$0")"
 SDK="$HOME/workspace/spytube-ios/sdks/iPhoneOS26.5.sdk"
 SRC=src
 OUT=build
-APP=$OUT/Payload/TermX.app
+# Absolute: the script cds into $OUT to zip, and the post-build
+# verification below still needs this path after the cd.
+APP="$(pwd)/$OUT/Payload/TermX.app"
 # 27.0: the embedded Kernarium frameworks declare MinimumOSVersion 27.0.
 MIN=27.0
+
+# Toolchain preflight: a VM restart wipes the apt tools (clang-18,
+# ld64.lld-18 live in /usr/bin, not the workspace), and without this
+# the build dies mid-way with a bare "command not found". Fail here,
+# with the restore command, instead.
+for tool in clang-18 ld64.lld-18 zip; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "ERROR: $tool is not installed." >&2
+    echo "VM restarts wipe the apt tools. Restore with:" >&2
+    echo "  sudo apt-get update -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20" >&2
+    echo "  sudo apt-get install -y clang-18 lld-18" >&2
+    exit 1
+  fi
+done
+if [ ! -d "$SDK" ]; then
+  echo "ERROR: iOS SDK not found at $SDK" >&2
+  echo "The SDKs live in the sibling spytube-ios checkout, not this repo." >&2
+  exit 1
+fi
 
 if [ ! -d "Frameworks/KRuntime_6_18_4K.framework" ]; then
   echo "ERROR: Frameworks/KRuntime_6_18_4K.framework is missing." >&2
@@ -58,7 +79,7 @@ FWSHA=$(sha256sum Frameworks/KRuntime_6_18_4K.framework/KRuntime_6_18_4K | cut -
 CFLAGS="-target arm64-apple-ios$MIN -isysroot $SDK -miphoneos-version-min=$MIN -fobjc-arc -O2 -Wno-deprecated-declarations -DTERMX_BUILD_COMMIT=\"$COMMIT\" -DTERMX_FRAMEWORK_SHA256=\"$FWSHA\" -I$SRC -F$SDK/System/Library/SubFrameworks -F$SDK/System/Library/PrivateFrameworks"
 
 echo "== compile"
-for f in main AppDelegate TerminalViewController KernEngine GuestInstall TXCrashLog TXLog TXLogViewController TXStartupViewController TXAboutViewController; do
+for f in main AppDelegate TerminalViewController KernEngine GuestInstall TXCrashLog TXLog TXLogViewController TXStartupViewController TXAboutViewController TXGuestFlow; do
   echo "   $f.m"
   $CLANG $CFLAGS -c "$SRC/$f.m" -o "$OUT/$f.o"
 done
@@ -77,7 +98,7 @@ ld64.lld-18 -arch arm64 -platform_version ios $MIN 26.5 \
   "$OUT"/main.o "$OUT"/AppDelegate.o "$OUT"/TerminalViewController.o \
   "$OUT"/KernEngine.o "$OUT"/GuestInstall.o "$OUT"/TXCrashLog.o \
   "$OUT"/TXLog.o "$OUT"/TXLogViewController.o "$OUT"/TXStartupViewController.o \
-  "$OUT"/TXAboutViewController.o \
+  "$OUT"/TXAboutViewController.o "$OUT"/TXGuestFlow.o \
   "$OUT"/vt.o \
   -framework UIKit -framework Foundation -framework CoreGraphics \
   -framework QuartzCore -framework Metal -framework MetalKit \
@@ -99,3 +120,45 @@ cd "$OUT"
 rm -f TermX.ipa
 zip -qry TermX.ipa Payload
 ls -lh TermX.ipa
+
+# Post-build verification: the build must prove what it made, not
+# just zip it. An arm64 binary for the right bundle, with the
+# version from Info.plist and the build marker baked in, and the
+# runtime framework embedded. Any failure here exits non-zero with
+# a named cause, instead of shipping an IPA that looks fine.
+echo "== verify"
+BIN="$APP/TermX"
+ARCH=$(file -b "$BIN")
+case "$ARCH" in
+  *arm64*) ;;
+  *) echo "ERROR: binary is not arm64: $ARCH" >&2; exit 1 ;;
+esac
+if [ ! -d "$APP/Frameworks/KRuntime_6_18_4K.framework" ]; then
+  echo "ERROR: KRuntime_6_18_4K.framework was not embedded in the app." >&2
+  exit 1
+fi
+if [ "$COMMIT" = "nogit" ]; then
+  echo "ERROR: no git commit — the build marker would be 'nogit' and the IPA unidentifiable." >&2
+  echo "Run the build from a git checkout." >&2
+  exit 1
+fi
+if ! grep -a -q "$COMMIT" "$BIN"; then
+  echo "ERROR: build marker '$COMMIT' not found in the binary." >&2
+  exit 1
+fi
+python3 - "$APP/Info.plist" <<'EOF'
+import plistlib, sys
+with open(sys.argv[1], 'rb') as f:
+    info = plistlib.load(f)
+bid = info.get('CFBundleIdentifier')
+ver = info.get('CFBundleShortVersionString')
+build = info.get('CFBundleVersion')
+if bid != 'app.termx.ios':
+    sys.exit('ERROR: bundle id is %r, expected app.termx.ios' % bid)
+if not ver or not build:
+    sys.exit('ERROR: Info.plist has no version/build')
+print('   bundle %s version %s (%s)' % (bid, ver, build))
+EOF
+echo "   binary $ARCH"
+echo "   marker $COMMIT"
+echo "OK: TermX.ipa verified"

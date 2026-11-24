@@ -36,6 +36,7 @@
 #import "TerminalViewController.h"
 
 #import "KernEngine.h"
+#import "TXConfig.h"
 #import "TXTheme.h"
 #import "vt.h"
 
@@ -83,7 +84,7 @@ static NSParagraphStyle *TXTermParagraphStyleForSize(CGFloat size) {
     static CGFloat styleSize = 0;
     if (!style || styleSize != size) {
         NSMutableParagraphStyle *para = [[NSMutableParagraphStyle alloc] init];
-        para.lineSpacing = size * 2.0 / 14.0;
+        para.lineSpacing = size * TXConfigTermLineSpacingPt / TXConfigTermFontSizeDefault;
         // Clip, never wrap: the layout manager takes the paragraph
         // style's line-break mode over the text container's, and the
         // default is word-wrapping — so a container set to Clipping
@@ -236,7 +237,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         const uint8_t *bytes = backlog.bytes;
         size_t remaining = backlog.length;
         while (remaining > 0) {
-            size_t chunk = remaining > 1024 ? 1024 : remaining;
+            size_t chunk = remaining > TXConfigReplayChunkBytes ? TXConfigReplayChunkBytes : remaining;
             vt_feed(&_vt, bytes, chunk);
             bytes += chunk;
             remaining -= chunk;
@@ -252,7 +253,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // set, the paragraph style's line-break mode is Clipping too
     // (the layout manager prefers it over the container's, and its
     // default is word-wrapping), and viewDidLayoutSubviews re-asserts
-    // the 10000 pt width on every layout. A wrapped line splits a
+    // the configured width on every layout. A wrapped line splits a
     // two-column layout (fastfetch's logo/info, apt's progress bars)
     // and the halves interleave, so the wrap must never happen.
     // It starts at the top of the screen: there is no bar above it
@@ -265,14 +266,14 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _output.font = TXTermFont();
     _output.textContainer.lineBreakMode = NSLineBreakByClipping;
     // Do not let the container track the view width (see above): with
-    // tracking on, the 10000 pt width is thrown away on layout and
+    // tracking on, the configured width is thrown away on layout and
     // every long line wraps at the screen edge instead of scrolling.
     // Set tracking OFF *before* the size: setting the size while
     // tracking is still on lets the next layout throw it away, and
     // 1b01285 (size first, tracking off after) did not hold on device
     // — fastfetch still wrapped at ~48 columns.
     _output.textContainer.widthTracksTextView = NO;
-    _output.textContainer.size = CGSizeMake(10000, CGFLOAT_MAX);
+    _output.textContainer.size = CGSizeMake(TXConfigTextContainerWidthPt, CGFLOAT_MAX);
     // A real margin, not the old 6 pt: the text sat flush against the
     // screen edges. 12 pt each side, 8 pt above, 6 pt below the text.
     _output.textContainerInset = UIEdgeInsetsMake(8, 12, 6, 12);
@@ -374,7 +375,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         [fnStack.trailingAnchor constraintEqualToAnchor:_fnRow.contentLayoutGuide.trailingAnchor constant:-6],
         [fnStack.topAnchor constraintEqualToAnchor:_fnRow.contentLayoutGuide.topAnchor],
         [fnStack.bottomAnchor constraintEqualToAnchor:_fnRow.contentLayoutGuide.bottomAnchor],
-        [fnStack.heightAnchor constraintEqualToConstant:34],
+        [fnStack.heightAnchor constraintEqualToConstant:TXConfigKeyRowHeightPt],
     ]];
     _fnRow.hidden = YES;
     [rows addArrangedSubview:_fnRow];
@@ -463,7 +464,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIButton *kbd = [self keyButton:@"⌨"];
     kbd.titleLabel.font = [UIFont monospacedSystemFontOfSize:16 weight:UIFontWeightMedium];
     kbd.accessibilityHint = @"Hides the keyboard. Tap the terminal to show it again.";
-    [kbd.widthAnchor constraintEqualToConstant:44].active = YES;
+    [kbd.widthAnchor constraintEqualToConstant:TXConfigHideKeyboardKeyWidthPt].active = YES;
     [kbd addTarget:self action:@selector(onKeyboard) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:kbd];
     [rows addArrangedSubview:primary];
@@ -480,9 +481,9 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         [rows.trailingAnchor constraintEqualToAnchor:toolbar.trailingAnchor constant:-4],
         [rows.topAnchor constraintEqualToAnchor:toolbar.topAnchor constant:5],
         [rows.bottomAnchor constraintEqualToAnchor:toolbar.bottomAnchor constant:-4],
-        [_fnRow.heightAnchor constraintEqualToConstant:34],
-        [_secondaryRow.heightAnchor constraintEqualToConstant:34],
-        [primary.heightAnchor constraintEqualToConstant:34],
+        [_fnRow.heightAnchor constraintEqualToConstant:TXConfigKeyRowHeightPt],
+        [_secondaryRow.heightAnchor constraintEqualToConstant:TXConfigKeyRowHeightPt],
+        [primary.heightAnchor constraintEqualToConstant:TXConfigKeyRowHeightPt],
     ]];
     // The toolbar rides above the software keyboard when it appears.
     _toolbarBottom = [toolbar.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-4];
@@ -490,7 +491,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
     // Render the terminal at most every 60 ms; the guest sends a few bytes
     // at a time and redrawing on every one would thrash.
-    _flushTimer = [NSTimer scheduledTimerWithTimeInterval:0.06 repeats:YES block:^(NSTimer *t) {
+    _flushTimer = [NSTimer scheduledTimerWithTimeInterval:TXConfigTerminalFlushIntervalSec repeats:YES block:^(NSTimer *t) {
         (void)t;
         [self flushTerminal];
     }];
@@ -546,11 +547,11 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // Re-assert the wide text container on every layout. 1b01285 set
     // widthTracksTextView = NO, but fastfetch still wrapped on device,
     // so something in layout resets the container to the view width;
-    // this puts it back to 10000 pt before the next flush renders.
-    // The guard breaks the loop: setting the size triggers one more
-    // layout, which sees 10000 and does nothing.
-    if (_output.textContainer.size.width != 10000) {
-        _output.textContainer.size = CGSizeMake(10000, CGFLOAT_MAX);
+    // this puts it back to the configured width before the next flush
+    // renders. The guard breaks the loop: setting the size triggers
+    // one more layout, which sees the configured width and does nothing.
+    if (_output.textContainer.size.width != TXConfigTextContainerWidthPt) {
+        _output.textContainer.size = CGSizeMake(TXConfigTextContainerWidthPt, CGFLOAT_MAX);
     }
 }
 
@@ -871,7 +872,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     _repeatData = data;
     [self sendKeyData:data];
     __weak typeof(self) weakSelf = self;
-    _repeatTimer = [NSTimer scheduledTimerWithTimeInterval:0.08 repeats:YES block:^(NSTimer *t) {
+    _repeatTimer = [NSTimer scheduledTimerWithTimeInterval:TXConfigArrowRepeatIntervalSec repeats:YES block:^(NSTimer *t) {
         (void)t;
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) { [t invalidate]; return; }
@@ -883,7 +884,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     // run loop in tracking mode, and a timer in the default mode
     // never fires there, so hold-to-repeat silently sent once.
     [[NSRunLoop mainRunLoop] addTimer:_repeatTimer forMode:NSRunLoopCommonModes];
-    [_repeatTimer setFireDate:[NSDate dateWithTimeIntervalSinceNow:0.4]];
+    [_repeatTimer setFireDate:[NSDate dateWithTimeIntervalSinceNow:TXConfigArrowRepeatInitialDelaySec]];
 }
 
 - (void)stopKeyRepeat {
@@ -988,7 +989,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 // paste in one write overflows the guest tty's 4096-byte input buffer.
 - (void)sendPasteChunk:(NSData *)data offset:(NSUInteger)offset {
     if (offset >= data.length) return;
-    NSUInteger len = MIN(1024, data.length - offset);
+    NSUInteger len = MIN(TXConfigPasteChunkBytes, data.length - offset);
     [_engine sendConsoleInput:[data subdataWithRange:NSMakeRange(offset, len)]];
     if (offset + len < data.length) {
         __weak typeof(self) weakSelf = self;
@@ -1081,7 +1082,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
             break;
         case UIGestureRecognizerStateEnded: {
             CGPoint translation = [pan translationInView:_output];
-            if (_exitPanAtTop && _exitPanStart.y < 44 && translation.y > 80 &&
+            if (_exitPanAtTop && _exitPanStart.y < TXConfigExitPanTopStripPt && translation.y > TXConfigExitPanTranslationThresholdPt &&
                 fabs(translation.y) > fabs(translation.x)) {
                 [self dismissViewControllerAnimated:YES completion:nil];
             }
@@ -1113,12 +1114,12 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
             break;
         case UIGestureRecognizerStateChanged: {
             CGFloat size = _pinchStartSize * pinch.scale;
-            if (size < 10) size = 10;
-            if (size > 24) size = 24;
-            // A small dead zone (0.1 pt) keeps recognizer jitter
-            // from re-rendering on every tiny movement; the old
-            // 0.5 pt zone made small pinches feel unresponsive.
-            if (fabs(size - TXTermFontSize()) < 0.1) return;
+            if (size < TXConfigTermFontSizeMin) size = TXConfigTermFontSizeMin;
+            if (size > TXConfigTermFontSizeMax) size = TXConfigTermFontSizeMax;
+            // A small dead zone keeps recognizer jitter from
+            // re-rendering on every tiny movement; the old 0.5 pt
+            // zone made small pinches feel unresponsive.
+            if (fabs(size - TXTermFontSize()) < TXConfigPinchDeadZonePt) return;
             TXSetTermFontSize(size);
             _output.font = TXTermFont();
             _fullRebuildNeeded = YES; // the whole text re-renders at the new size
@@ -1502,7 +1503,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 - (BOOL)isPinnedToBottom {
     CGFloat bottomOffset = _output.contentSize.height + _output.contentInset.bottom - _output.bounds.size.height;
     if (bottomOffset <= 0) return YES;
-    return _output.contentOffset.y >= bottomOffset - 16.0;
+    return _output.contentOffset.y >= bottomOffset - TXConfigPinnedToBottomThresholdPt;
 }
 
 - (void)scrollToBottomAnimated:(BOOL)animated {

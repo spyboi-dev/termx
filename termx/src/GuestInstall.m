@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "GuestInstall.h"
+#import "TXConfig.h"
 #import "TXLog.h"
 #import <CommonCrypto/CommonDigest.h>
 #import <UIKit/UIKit.h> // UIApplicationDidReceiveMemoryWarningNotification
@@ -59,8 +60,7 @@ static NSString* const kDownloadSessionIdentifier = @"app.termx.ios.rootfs-downl
 // install needs both alive at once, plus headroom for the OS, so refuse
 // to start (or to extract) when the phone is too full, with the numbers
 // in the error, instead of dying halfway through with ENOSPC.
-static const unsigned long long kFreeSpaceNeededBeforeDownload = 1ULL << 30; // 1 GiB
-static const unsigned long long kFreeSpaceNeededBeforeExtract = 3ULL << 29;  // 1.5 GiB
+// Thresholds in TXConfig.h.
 // Log a line every 10% of the download and every 256 MiB of the
 // extract/verify steps, so the next crash leaves the exact phase and
 // byte count in engine.log.
@@ -398,14 +398,14 @@ static TXRootfsDownload* s_activeDownload = nil;
         // download delegate just moved the file there), so this read is
         // real — and the helper fails open if the measurement ever fails.
         unsigned long long free = TXFreeSpaceAtPath(gzPath);
-        if (free < kFreeSpaceNeededBeforeExtract) {
+        if (free < TXConfigFreeSpaceNeededBeforeExtractBytes) {
             TXLogEngine(@"Not enough free space to extract: %@ free, need %@",
-                        TXFormatBytes(free), TXFormatBytes(kFreeSpaceNeededBeforeExtract));
+                        TXFormatBytes(free), TXFormatBytes(TXConfigFreeSpaceNeededBeforeExtractBytes));
             // Keep the verified archive: the user frees space and the
             // next Install reuses it instead of downloading again.
             [self finish:NO error:[NSString stringWithFormat:
                 @"not enough free space — the install needs %@ free, this phone has %@",
-                TXFormatBytes(kFreeSpaceNeededBeforeExtract), TXFormatBytes(free)]];
+                TXFormatBytes(TXConfigFreeSpaceNeededBeforeExtractBytes), TXFormatBytes(free)]];
             return;
         }
         [self reportProgress:0.7 step:@"Extracting the image…"];
@@ -497,12 +497,12 @@ static TXRootfsDownload* s_activeDownload = nil;
     // the image file: it was deleted a few lines up, and measuring a
     // deleted path always reads 0 B free (every Install failed on it).
     unsigned long long free = TXFreeSpaceAtPath(guestDir);
-    if (free < kFreeSpaceNeededBeforeDownload) {
+    if (free < TXConfigFreeSpaceNeededBeforeDownloadBytes) {
         TXLogEngine(@"Not enough free space to install: %@ free, need %@",
-                    TXFormatBytes(free), TXFormatBytes(kFreeSpaceNeededBeforeDownload));
+                    TXFormatBytes(free), TXFormatBytes(TXConfigFreeSpaceNeededBeforeDownloadBytes));
         [self finish:NO error:[NSString stringWithFormat:
             @"not enough free space — the install needs %@ free, this phone has %@",
-            TXFormatBytes(kFreeSpaceNeededBeforeDownload), TXFormatBytes(free)]];
+            TXFormatBytes(TXConfigFreeSpaceNeededBeforeDownloadBytes), TXFormatBytes(free)]];
         return;
     }
 

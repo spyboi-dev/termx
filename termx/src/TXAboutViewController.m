@@ -3,6 +3,7 @@
 #import "TXAboutViewController.h"
 #import "GuestInstall.h"
 #import "KernEngine.h"
+#import "TXLog.h"
 #import "TXTheme.h"
 
 @interface TXAboutViewController ()
@@ -78,6 +79,12 @@
         @[@"Framework SHA-256", frameworkShort],
     ]];
 
+    // Diagnostics: the debug logging switch. Off by default; when
+    // on, engine.log also gets the verbose lines (memory sampler,
+    // session record dumps) for diagnosis. Takes effect at once,
+    // no restart (see TXLogDebug).
+    UIView *diagnosticsCard = [self diagnosticsCard];
+
     // Two honest notes, in plain words. The device-info one is the
     // answer to "why does fastfetch say Unknown": the app never
     // types commands into the terminal at boot, and the runtime's
@@ -91,7 +98,7 @@
         @"TermX is free software under the GPL-2.0-or-later, built on the Kernarium Linux runtime."];
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        titleLabel, taglineLabel, appCard, imageCard, runtimeCard, deviceNote, licenseNote]];
+        titleLabel, taglineLabel, appCard, imageCard, runtimeCard, diagnosticsCard, deviceNote, licenseNote]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 20;
     [stack setCustomSpacing:8 afterView:titleLabel];
@@ -188,6 +195,75 @@
     row.alignment = UIStackViewAlignmentTop;
     row.translatesAutoresizingMaskIntoConstraints = NO;
     return row;
+}
+
+// Diagnostics card: one switch row, styled like the other cards.
+// The switch writes the debug flag (kTXDebugLoggingDefaultsKey);
+// TXLogDebug reads it fresh on every call, so the change takes
+// effect at once. The toggle itself is logged, so the log shows
+// when diagnosis started.
+- (UIView *)diagnosticsCard {
+    UIView *card = [[UIView alloc] init];
+    card.backgroundColor = [UIColor colorWithWhite:0.11 alpha:1.0];
+    card.layer.cornerRadius = 24;
+    card.layer.masksToBounds = YES;
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *titleLabel = [[UILabel alloc] init];
+    titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    titleLabel.textColor = TXThemeAccentColor();
+    titleLabel.text = [@"Diagnostics" uppercaseString];
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *keyLabel = [[UILabel alloc] init];
+    keyLabel.font = [UIFont systemFontOfSize:15];
+    keyLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+    keyLabel.text = @"Debug logging";
+    keyLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *detailLabel = [[UILabel alloc] init];
+    detailLabel.font = [UIFont systemFontOfSize:13];
+    detailLabel.textColor = [UIColor colorWithWhite:0.45 alpha:1.0];
+    detailLabel.text = @"Verbose sampler and session lines in the log. Off by default; takes effect at once.";
+    detailLabel.numberOfLines = 0;
+    detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIStackView *labels = [[UIStackView alloc] initWithArrangedSubviews:@[keyLabel, detailLabel]];
+    labels.axis = UILayoutConstraintAxisVertical;
+    labels.spacing = 2;
+    labels.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UISwitch *debugSwitch = [[UISwitch alloc] init];
+    debugSwitch.on = TXLogDebugEnabled();
+    debugSwitch.onTintColor = TXThemeAccentColor();
+    debugSwitch.accessibilityLabel = @"Debug logging";
+    debugSwitch.accessibilityHint = @"Writes verbose sampler and session lines to the log for diagnosis.";
+    [debugSwitch addTarget:self action:@selector(debugSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    debugSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[labels, debugSwitch]];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.spacing = 12;
+    row.alignment = UIStackViewAlignmentCenter;
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIStackView *cardStack = [[UIStackView alloc] initWithArrangedSubviews:@[titleLabel, row]];
+    cardStack.axis = UILayoutConstraintAxisVertical;
+    cardStack.spacing = 12;
+    cardStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:cardStack];
+    [NSLayoutConstraint activateConstraints:@[
+        [cardStack.topAnchor constraintEqualToAnchor:card.topAnchor constant:18],
+        [cardStack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
+        [cardStack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-20],
+        [cardStack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-18],
+    ]];
+    return card;
+}
+
+- (void)debugSwitchChanged:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:kTXDebugLoggingDefaultsKey];
+    TXLogEngine(@"Debug logging %@", sender.isOn ? @"on" : @"off");
 }
 
 - (UILabel *)noteLabelWithText:(NSString *)text {

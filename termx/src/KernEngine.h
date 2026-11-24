@@ -17,6 +17,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import <Foundation/Foundation.h>
 #import <MetalKit/MetalKit.h>
+#import "TXGuestFlow.h"
 
 typedef NS_ENUM(NSInteger, TermXState) {
     TermXStateIdle = 0,       // nothing installed, nothing running
@@ -167,6 +168,15 @@ extern NSString* const kTermXStateChanged;
 // if a newer image is available the guest is held stopped and the
 // Update button is the choice, not a race with the auto-boot.
 @property (nonatomic, readonly) BOOL launchUpdateCheckInFlight;
+
+// The startup flow state for this launch (TXGuestFlow): the one
+// automatic boot, the one automatic retry, the terminal presented
+// once, the pending update. The engine owns the guest state
+// (TermXState); the flow state lives here too, so one object
+// answers "what is the guest doing and what happens next". The
+// startup screen still owns the flow *decisions* (see TXGuestFlow.h
+// for why that split remains).
+@property (nonatomic, strong, readonly) TXGuestFlow *flow;
 
 // True when a valid rootfs image exists on disk — any release. A
 // version difference is an update, not a failure: the image boots

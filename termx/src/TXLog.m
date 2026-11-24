@@ -173,6 +173,23 @@ void TXLogEngine(NSString *format, ...) {
     });
 }
 
+NSString * const kTXDebugLoggingDefaultsKey = @"termx.debugLogging";
+
+BOOL TXLogDebugEnabled(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kTXDebugLoggingDefaultsKey];
+}
+
+void TXLogDebug(NSString *format, ...) {
+    if (!TXLogDebugEnabled()) return;
+    if (!format.length) return;
+    va_list args;
+    va_start(args, format);
+    NSString *line = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    if (!line.length) return;
+    TXLogEngine(@"%@", line);
+}
+
 void TXLogFlush(void) {
     dispatch_sync(TXLogQueue(), ^{});
 }

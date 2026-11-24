@@ -27,6 +27,19 @@ NS_ASSUME_NONNULL_BEGIN
 // Safe from any thread.
 void TXLogEngine(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 
+// Debug logging, off by default. The NSUserDefaults key is
+// kTXDebugLoggingDefaultsKey ("termx.debugLogging"); the About
+// screen exposes it as a switch, so it can be turned on for
+// diagnosis without a rebuild. TXLogDebug writes to engine.log
+// only when the flag is on, and reads it fresh on every call, so
+// flipping the switch takes effect at once. It gates the verbose
+// diagnostic lines only: the memory sampler and the session-record
+// slot dumps. Errors, state changes, boot progress and the guest
+// console always log, whatever the flag says.
+extern NSString * const kTXDebugLoggingDefaultsKey;
+BOOL TXLogDebugEnabled(void);
+void TXLogDebug(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+
 // Block until every line queued so far is on disk. Safe from any
 // thread except the log queue itself. Use at phase boundaries where
 // the next step can kill the process (see GuestInstall): without it

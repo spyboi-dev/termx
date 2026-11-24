@@ -2,6 +2,7 @@
 #import "KernEngine.h"
 #import "KernariumRuntime.h"
 #import "GuestInstall.h"
+#import "TXConfig.h"
 #import "TXLog.h"
 #import <CommonCrypto/CommonDigest.h>
 #import <dlfcn.h>
@@ -159,8 +160,8 @@ static const uint64_t kDefaultDataDiskGiB = 2;
 
 // The console replay buffer keeps the most recent output (the boot
 // log and the login prompt are ~10-20 KiB); older bytes are dropped
-// from the front, so the buffer never grows without bound.
-static const NSUInteger kConsoleBufferMaxBytes = 128 * 1024;
+// from the front, so the buffer never grows without bound. Size in
+// TXConfig.h.
 
 static NSString* TXStateName(TermXState state) {
     switch (state) {
@@ -187,8 +188,8 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
     @synchronized (engine) {
         if (!engine.consoleBuffer) engine.consoleBuffer = [NSMutableData data];
         [engine.consoleBuffer appendData:data];
-        if (engine.consoleBuffer.length > kConsoleBufferMaxBytes) {
-            [engine.consoleBuffer replaceBytesInRange:NSMakeRange(0, engine.consoleBuffer.length - kConsoleBufferMaxBytes)
+        if (engine.consoleBuffer.length > TXConfigConsoleBufferMaxBytes) {
+            [engine.consoleBuffer replaceBytesInRange:NSMakeRange(0, engine.consoleBuffer.length - TXConfigConsoleBufferMaxBytes)
                                             withBytes:NULL length:0];
         }
     }
@@ -284,6 +285,10 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         _state = TermXStateIdle;
         _bootPhase = TXBootPhaseIdle;
         _failedStep = -1;
+        // The startup flow state for this launch (see TXGuestFlow.h):
+        // created once here, read by the startup screen through the
+        // engine, so the flow state and the guest state are one place.
+        _flow = [[TXGuestFlow alloc] init];
         // Ordinary failures earn the one automatic retry; only a
         // corrupt data disk clears this (see bootOnView:). BOOL
         // ivars default to NO, so this must be set explicitly.
@@ -433,7 +438,7 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
             // acts on (see after this if/else), not just logs.
             NSString* endWord = nil, *messageText = nil;
             if (!knownLayout) {
-                TXLogEngine(@"Session record (unrecognized layout, whole file):\n%@", [record stringByTrimmingCharactersInSet:pad]);
+                TXLogDebug(@"Session record (unrecognized layout, whole file):\n%@", [record stringByTrimmingCharactersInSet:pad]);
             } else {
                 NSString* memoryText = TXSessionSlice(0, memoryBytes);
                 NSString* stallText = (stallOffset == NSNotFound) ? @"" : TXSessionSlice(stallOffset, 4096);
@@ -441,23 +446,23 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
                 NSString* storageText = (storageOffset == NSNotFound) ? @"" : TXSessionSlice(storageOffset, 256);
                 NSString* cameraText = (cameraOffset == NSNotFound) ? @"" : TXSessionSlice(cameraOffset, 1024);
                 NSString* stateText = TXSessionSlice(stateOffset, recordData.length - MIN(stateOffset, recordData.length));
-                if (memoryText.length) TXLogEngine(@"Session memory slot:\n%@", memoryText);
-                if (stallText.length) TXLogEngine(@"Session stall slot:\n%@", stallText);
-                if (networkText.length) TXLogEngine(@"Session network slot:\n%@", networkText);
-                if (storageText.length) TXLogEngine(@"Session storage slot:\n%@", storageText);
-                if (cameraText.length) TXLogEngine(@"Session camera slot:\n%@", cameraText);
-                if (stateText.length) TXLogEngine(@"Session state:\n%@", stateText);
+                if (memoryText.length) TXLogDebug(@"Session memory slot:\n%@", memoryText);
+                if (stallText.length) TXLogDebug(@"Session stall slot:\n%@", stallText);
+                if (networkText.length) TXLogDebug(@"Session network slot:\n%@", networkText);
+                if (storageText.length) TXLogDebug(@"Session storage slot:\n%@", storageText);
+                if (cameraText.length) TXLogDebug(@"Session camera slot:\n%@", cameraText);
+                if (stateText.length) TXLogDebug(@"Session state:\n%@", stateText);
                 // One-line summaries, readable at a glance.
                 NSString* memoryFirstLine = [[memoryText componentsSeparatedByString:@"\n"] firstObject] ?: @"";
-                if (memoryFirstLine.length) TXLogEngine(@"Session memory: %@", memoryFirstLine);
+                if (memoryFirstLine.length) TXLogDebug(@"Session memory: %@", memoryFirstLine);
                 NSString* stallFirstLine = [[stallText componentsSeparatedByString:@"\n"] firstObject] ?: @"";
                 NSRange totalRange = [stallFirstLine rangeOfString:@" total "];
                 if (totalRange.location != NSNotFound) {
                     NSString* afterTotal = [stallFirstLine substringFromIndex:totalRange.location + totalRange.length];
                     NSString* total = [[afterTotal componentsSeparatedByString:@" "] firstObject] ?: @"?";
-                    TXLogEngine(@"Session stall: total %@ recorded", total);
+                    TXLogDebug(@"Session stall: total %@ recorded", total);
                 } else if (stallFirstLine.length) {
-                    TXLogEngine(@"Session stall: %@", stallFirstLine);
+                    TXLogDebug(@"Session stall: %@", stallFirstLine);
                 }
                 NSString* bootWord = nil;
                 for (NSString* line in [stateText componentsSeparatedByString:@"\n"]) {
@@ -465,9 +470,9 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
                     else if ([line hasPrefix:@"boot "]) bootWord = [line substringFromIndex:5];
                     else if ([line hasPrefix:@"message "]) messageText = [line substringFromIndex:8];
                 }
-                if (endWord.length) TXLogEngine(@"Session end state: %@", endWord);
-                if (bootWord.length) TXLogEngine(@"Session boot: %@", bootWord);
-                if (messageText.length) TXLogEngine(@"Session message: %@", messageText);
+                if (endWord.length) TXLogDebug(@"Session end state: %@", endWord);
+                if (bootWord.length) TXLogDebug(@"Session boot: %@", bootWord);
+                if (messageText.length) TXLogDebug(@"Session message: %@", messageText);
             }
             // Act on the record, not just log it (Phase 3): a crash
             // is a fact the next launch must show, and a kill is a
@@ -659,11 +664,17 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
         host_statistics64(mach_host_self(), HOST_VM_INFO, (host_info_t)&hostInfo, &hostCount) == KERN_SUCCESS) {
         sysFree = (unsigned long long)(hostInfo.free_count + hostInfo.inactive_count) * (unsigned long long)pageSize;
     }
-    TXLogEngine(@"SAMPLER footprint=%@ (%llu B) headroom=%@ (%llu B) sysfree=%@ (%llu B)",
-                TXFormatBytes(footprint), footprint,
-                TXFormatBytes(headroom), headroom,
-                TXFormatBytes(sysFree), sysFree);
-    TXLogFlush(); // synchronously on disk: a kill a millisecond later must leave this line
+    // Debug only: the sampler's lines are the verbose diagnostic
+    // log, and off by default they must not wake the disk every
+    // 100 ms to write nothing. The flush stays with the line: a
+    // kill a millisecond later must leave this line on disk.
+    if (TXLogDebugEnabled()) {
+        TXLogDebug(@"SAMPLER footprint=%@ (%llu B) headroom=%@ (%llu B) sysfree=%@ (%llu B)",
+                    TXFormatBytes(footprint), footprint,
+                    TXFormatBytes(headroom), headroom,
+                    TXFormatBytes(sysFree), sysFree);
+        TXLogFlush();
+    }
 }
 
 - (void)startMemorySampler {
@@ -679,11 +690,11 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
         });
         dispatch_source_set_timer(_samplerTimer,
                                   dispatch_time(DISPATCH_TIME_NOW, 0),
-                                  (uint64_t)(100 * NSEC_PER_MSEC),
+                                  (uint64_t)(TXConfigSamplerIntervalBootMs * NSEC_PER_MSEC),
                                   (uint64_t)(10 * NSEC_PER_MSEC));
         dispatch_resume(_samplerTimer);
     }
-    TXLogEngine(@"SAMPLER started (100 ms)");
+    TXLogDebug(@"SAMPLER started (%d ms)", TXConfigSamplerIntervalBootMs);
 }
 
 // Slow the sampler down once the guest is up: one line every 5 s
@@ -700,7 +711,7 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
                                   ms * NSEC_PER_MSEC,
                                   (uint64_t)(500 * NSEC_PER_MSEC));
     }
-    TXLogEngine(@"SAMPLER slowed to %llu ms", (unsigned long long)ms);
+    TXLogDebug(@"SAMPLER slowed to %llu ms", (unsigned long long)ms);
 }
 
 - (void)stopMemorySampler {
@@ -712,7 +723,7 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
             _samplerTimer = nil;
         }
     }
-    if (wasRunning) TXLogEngine(@"SAMPLER stopped");
+    if (wasRunning) TXLogDebug(@"SAMPLER stopped");
 }
 
 - (void)setState:(TermXState)state {
@@ -735,7 +746,7 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
     BOOL isUp = (state == TermXStateRunning || state == TermXStateStopping ||
                  state == TermXStateSuspended);
     if (isUp && !wasUp) {
-        [self setMemorySamplerIntervalMs:5000];
+        [self setMemorySamplerIntervalMs:TXConfigSamplerIntervalRunningMs];
     } else if (state == TermXStateStopped || state == TermXStateFailed ||
                state == TermXStateIdle || state == TermXStateReady) {
         [self stopMemorySampler];

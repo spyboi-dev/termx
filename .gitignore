@@ -8,9 +8,20 @@ upstream-newterm/
 bootbase-work/
 bootbase-out/
 bootbase-build*.log
-# The Android runtime framework is reference-only bulk (43 MB);
-# the Android sources in attic-android/ are tracked.
-termx/attic-android/*.framework
+# The Linux runtime framework (53 MB, built by CI from the pinned
+# Kernarium commit): not in git — a `git add -A` must never stage it.
+# Its provenance (upstream commit, SHA-256) is recorded in
+# termx/Frameworks/README.md, and the app bakes the hash in at build
+# time so About can show it.
+termx/Frameworks/KRuntime_6_18_4K.framework/
+# Slim image build outputs (large, reproducible from the scripts)
+rootfs-build/rootfs-slim/
+rootfs-build/*.ext4
+rootfs-build/*.ext4.gz
+rootfs-build/tmp/
+rootfs-build/*.log
+# Crash logs are diagnosis scratch, not source
+termx/CRASH-*.txt
 *.ipa
 *.dSYM
 .DS_Store

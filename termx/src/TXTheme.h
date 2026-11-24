@@ -12,6 +12,7 @@
 // into the screen instead of reading as holes.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import <UIKit/UIKit.h>
+#import "TXConfig.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -38,12 +39,12 @@ static inline UIColor *TXThemeAccentColor(void) {
 // larger and a single line no longer fits the screen.
 static inline CGFloat TXTermFontSize(void) {
     CGFloat size = [[NSUserDefaults standardUserDefaults] doubleForKey:@"termx.fontSize"];
-    if (size < 10 || size > 24) return 14;
+    if (size < TXConfigTermFontSizeMin || size > TXConfigTermFontSizeMax) return TXConfigTermFontSizeDefault;
     return size;
 }
 static inline void TXSetTermFontSize(CGFloat size) {
-    if (size < 10) size = 10;
-    if (size > 24) size = 24;
+    if (size < TXConfigTermFontSizeMin) size = TXConfigTermFontSizeMin;
+    if (size > TXConfigTermFontSizeMax) size = TXConfigTermFontSizeMax;
     [[NSUserDefaults standardUserDefaults] setDouble:size forKey:@"termx.fontSize"];
 }
 

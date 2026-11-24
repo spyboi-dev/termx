@@ -38,20 +38,13 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 // Background note: the honest one-liner about the guest pausing
 // when the app backgrounds (see KernEngine enterBackground).
 @property (nonatomic, strong) UILabel *infoLabel;
-@property (nonatomic, assign) BOOL crashAcknowledged; // user chose Start anyway / Start fresh for this launch's crash
-@property (nonatomic, assign) BOOL crashChoiceShown; // refreshCrashNotice's verdict, read by refreshButtons in the same refresh pass
+@property (nonatomic, assign) BOOL crashChoiceShown; // refreshCrashNotice's verdict, read by refreshButtons in the same refresh pass. Derived scratch, not flow state: it is recomputed every refresh, so it stays here.
 @property (nonatomic, strong) MTKView *guestView; // the guest framebuffer; never seen
 @property (nonatomic, strong) UIButton *actionButton; // Install (or Start when the guest is powered off), by state
 // Secondary action, visible only when the guest is stopped and an
 // update is available: boots the installed image as-is, so the user
 // is never forced to update. The update stays available afterwards.
 @property (nonatomic, strong) UIButton *startButton;
-// Auto-boot bookkeeping: one automatic boot per launch, plus one
-// automatic retry if a boot fails. The user never taps Boot.
-@property (nonatomic, assign) BOOL autoBootDone;
-@property (nonatomic, assign) BOOL bootRetryUsed;
-@property (nonatomic, assign) BOOL bootRetryScheduled;
-@property (nonatomic, strong, nullable) NSDate *autoBootDeferredSince; // first tick the guest view had no size
 @property (nonatomic, strong) UIButton *eraseButton; // small destructive text button
 @property (nonatomic, strong) NSMutableArray<UIView *> *rowIcons;
 @property (nonatomic, strong) NSMutableArray<UIImageView *> *rowChecks;
@@ -61,14 +54,6 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 @property (nonatomic, strong, nullable) NSTimer *pollTimer;
 @property (nonatomic, strong, nullable) id stateChangeObserver; // block-observer token: removeObserver:self does NOT remove a block observer, so the token itself must be kept and removed in dealloc
 @property (nonatomic, strong) NSDate *startTime;
-@property (nonatomic, assign) BOOL terminalPresented; // shown once per Running state
-@property (nonatomic, assign) BOOL presentAfterLogCloses;
-// Update flow: YES once the user tapped Update while the guest was
-// running and the guest was asked to stop; the install starts when
-// the state actually reaches Stopped (see maybeStartPendingUpdate).
-// The pipeline replaces the image file, which must never happen
-// under a running guest.
-@property (nonatomic, assign) BOOL updateAfterStop;
 // Download rate: bytes and time of the last poll tick, so the
 // "MB/s" figure is measured, not guessed.
 @property (nonatomic, assign) int64_t lastReceived;
@@ -305,7 +290,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     // would re-present the terminal the user just swiped away from.
     if ([KernEngine shared].state != TermXStateRunning &&
         [KernEngine shared].state != TermXStateSuspended) {
-        self.terminalPresented = NO;
+        [KernEngine shared].flow.terminalPresented = NO;
     }
     [self maybePresentTerminal];
     // The automatic boot lives in refresh() (see maybeAutoBoot),
@@ -575,7 +560,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 // is the verdict refreshButtons reads in the same refresh pass.
 - (void)refreshCrashNotice {
     KernEngine *engine = [KernEngine shared];
-    BOOL show = engine.lastSessionCrashed && !self.crashAcknowledged &&
+    BOOL show = engine.lastSessionCrashed && !engine.flow.crashAcknowledged &&
                 (engine.state == TermXStateReady || engine.state == TermXStateStopped);
     self.crashChoiceShown = show;
     self.crashLabel.hidden = !show;
@@ -775,7 +760,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 - (void)maybeAutoBoot {
     KernEngine *engine = [KernEngine shared];
     if (engine.state != TermXStateReady) return;
-    if (self.autoBootDone) return;
+    if (engine.flow.autoBootDone) return;
     if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
     // Wait for the launch update check to settle before auto-booting:
     // if a newer image is available the engine holds the guest
@@ -788,7 +773,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     // session ended in a guest panic or kernel abort, the auto-boot
     // waits until the user chooses Start anyway or Start fresh on
     // this screen. The choice is recorded in crashAcknowledged.
-    if (engine.lastSessionCrashed && !self.crashAcknowledged) return;
+    if (engine.lastSessionCrashed && !engine.flow.crashAcknowledged) return;
     // Never hand run() a zero-sized view: the runtime refuses a
     // zero display geometry with -1, and a boot on the first tick
     // before layout would burn the one automatic boot on exactly
@@ -796,20 +781,20 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     // has no size after 10 s, boot anyway so the pre-flight names
     // the failure on screen instead of waiting forever.
     if (self.guestView.bounds.size.width <= 0 || self.guestView.bounds.size.height <= 0) {
-        if (!self.autoBootDeferredSince) {
-            self.autoBootDeferredSince = [NSDate date];
+        if (!engine.flow.autoBootDeferredSince) {
+            engine.flow.autoBootDeferredSince = [NSDate date];
             TXLogEngine(@"Auto-boot deferred: guest view has no size yet — waiting for layout");
-        } else if ([[NSDate date] timeIntervalSinceDate:self.autoBootDeferredSince] > 10.0) {
+        } else if ([[NSDate date] timeIntervalSinceDate:engine.flow.autoBootDeferredSince] > 10.0) {
             TXLogEngine(@"Auto-boot: guest view still has no size after 10 s — booting anyway so the failure is named");
-            self.autoBootDeferredSince = nil;
-            self.autoBootDone = YES;
+            engine.flow.autoBootDeferredSince = nil;
+            engine.flow.autoBootDone = YES;
             TXLogEngine(@"Auto-boot: guest is ready, starting the engine");
             [engine bootOnView:self.guestView];
         }
         return;
     }
-    self.autoBootDeferredSince = nil;
-    self.autoBootDone = YES;
+    engine.flow.autoBootDeferredSince = nil;
+    engine.flow.autoBootDone = YES;
     TXLogEngine(@"Auto-boot: guest is ready, starting the engine");
     [engine bootOnView:self.guestView];
 }
@@ -824,25 +809,25 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 - (void)maybeScheduleBootRetry {
     KernEngine *engine = [KernEngine shared];
     if (engine.state != TermXStateFailed) {
-        self.bootRetryScheduled = NO;
+        engine.flow.bootRetryScheduled = NO;
         return;
     }
     if (engine.failedStep == TXBootStepImage) return;
     // A corrupt data disk is not retried: the retry would fail
     // identically, and the remedy is Erase, not another boot.
     if (!engine.lastFailureRetryable) return;
-    if (self.bootRetryScheduled || self.bootRetryUsed) return;
-    self.bootRetryScheduled = YES;
+    if (engine.flow.bootRetryScheduled || engine.flow.bootRetryUsed) return;
+    engine.flow.bootRetryScheduled = YES;
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong typeof(self) strongSelf = weakSelf;
         if (!strongSelf) return;
-        strongSelf.bootRetryScheduled = NO;
         KernEngine *engine2 = [KernEngine shared];
+        engine2.flow.bootRetryScheduled = NO;
         if (engine2.state != TermXStateFailed) return;
         if (engine2.failedStep == TXBootStepImage) return;
-        if (strongSelf.bootRetryUsed) return;
-        strongSelf.bootRetryUsed = YES;
+        if (engine2.flow.bootRetryUsed) return;
+        engine2.flow.bootRetryUsed = YES;
         // Retry on the existing disk: a kernel or storage failure
         // does not prove the disk is at fault, and erasing it would
         // delete the user's installed packages and files. Erase
@@ -858,17 +843,15 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 // safe once the guest is off. If the stop itself failed instead,
 // drop the pending update: the user can tap Update again.
 - (void)maybeStartPendingUpdate {
-    if (!self.updateAfterStop) return;
     KernEngine *engine = [KernEngine shared];
+    if (!engine.flow.updateAfterStop) return;
     if (engine.state == TermXStateStopped) {
-        self.updateAfterStop = NO;
-        self.autoBootDone = NO;
-        self.bootRetryUsed = NO;
-        self.bootRetryScheduled = NO;
+        engine.flow.updateAfterStop = NO;
+        [engine.flow resetForInstall];
         TXLogEngine(@"Update: guest stopped, installing the new image");
         [engine installGuestWithCompletion:nil];
     } else if (engine.state == TermXStateFailed) {
-        self.updateAfterStop = NO;
+        engine.flow.updateAfterStop = NO;
         TXLogEngine(@"Update: the guest failed to stop — update cancelled, tap Update to try again");
     }
 }
@@ -880,14 +863,14 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 // the top edge) does not re-trigger this: the user chose to return.
 - (void)maybePresentTerminal {
     if ([KernEngine shared].state != TermXStateRunning) return;
-    if (self.terminalPresented) return;
-    self.terminalPresented = YES;
+    if ([KernEngine shared].flow.terminalPresented) return;
+    [KernEngine shared].flow.terminalPresented = YES;
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return;
         if (strongSelf.presentedViewController) {
-            strongSelf.presentAfterLogCloses = YES;
+            [KernEngine shared].flow.presentAfterLogCloses = YES;
             return;
         }
         [strongSelf presentTerminalWithClearScreen:YES];
@@ -916,7 +899,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 // only, never automatic.
 - (void)startTapped {
     KernEngine *engine = [KernEngine shared];
-    if (engine.lastSessionCrashed && !self.crashAcknowledged &&
+    if (engine.lastSessionCrashed && !engine.flow.crashAcknowledged &&
         (engine.state == TermXStateReady || engine.state == TermXStateStopped)) {
         NSString *error = nil;
         if (![engine eraseDataDiskWithError:&error]) {
@@ -927,27 +910,24 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             return;
         }
         TXLogEngine(@"Start fresh: data disk erased after the last run crashed — booting clean");
-        self.crashAcknowledged = YES;
-        self.bootRetryUsed = NO;
-        self.bootRetryScheduled = NO;
+        [engine.flow acknowledgeCrash];
+        [engine.flow resetRetry];
         [engine bootOnView:self.guestView];
         return;
     }
     if (engine.state != TermXStateStopped) return;
-    self.bootRetryUsed = NO;
-    self.bootRetryScheduled = NO;
+    [engine.flow resetRetry];
     [engine bootOnView:self.guestView];
 }
 
 - (void)actionTapped {
     KernEngine *engine = [KernEngine shared];
-    if (engine.lastSessionCrashed && !self.crashAcknowledged && engine.state == TermXStateReady) {
+    if (engine.lastSessionCrashed && !engine.flow.crashAcknowledged && engine.state == TermXStateReady) {
         // Start anyway: the user chose to boot into whatever crashed
         // last time. A manual start earns a fresh automatic retry
         // if this boot fails.
-        self.crashAcknowledged = YES;
-        self.bootRetryUsed = NO;
-        self.bootRetryScheduled = NO;
+        [engine.flow acknowledgeCrash];
+        [engine.flow resetRetry];
         [engine bootOnView:self.guestView];
         return;
     }
@@ -963,14 +943,12 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         // way) it must stop first; the install starts from the poll
         // tick once the state actually reaches Stopped.
         if (engine.state == TermXStateRunning || engine.state == TermXStateSuspended) {
-            self.updateAfterStop = YES;
+            engine.flow.updateAfterStop = YES;
             TXLogEngine(@"Update: stopping the guest first");
             [engine stopGuest];
             return;
         }
-        self.autoBootDone = NO;
-        self.bootRetryUsed = NO;
-        self.bootRetryScheduled = NO;
+        [engine.flow resetForInstall];
         [engine installGuestWithCompletion:nil];
         return;
     }
@@ -990,9 +968,8 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         // start earns a fresh automatic retry if this boot fails.
         // Tapping Start here is also choosing Start anyway when the
         // crash choice is showing.
-        self.crashAcknowledged = YES;
-        self.bootRetryUsed = NO;
-        self.bootRetryScheduled = NO;
+        [engine.flow acknowledgeCrash];
+        [engine.flow resetRetry];
         [engine bootOnView:self.guestView];
         return;
     }
@@ -1006,9 +983,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         // exists it is reused at its own size, so there is nothing
         // to ask and the install starts at once.
         if ([[NSFileManager defaultManager] fileExistsAtPath:engine.dataDiskPath]) {
-            self.autoBootDone = NO;
-            self.bootRetryUsed = NO;
-            self.bootRetryScheduled = NO;
+            [engine.flow resetForInstall];
             [engine installGuestWithCompletion:nil];
             return;
         }
@@ -1035,9 +1010,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             if (!strongSelf) return;
             [KernEngine setDataDiskGiB:[size integerValue]];
             TXLogEngine(@"Data disk size set to %@ GiB for this install", size);
-            strongSelf.autoBootDone = NO;
-            strongSelf.bootRetryUsed = NO;
-            strongSelf.bootRetryScheduled = NO;
+            [[KernEngine shared].flow resetForInstall];
             [[KernEngine shared] installGuestWithCompletion:nil];
         }]];
     }
@@ -1076,8 +1049,8 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     [self dismissViewControllerAnimated:YES completion:^{
         // The shell came up while the log was open: go to the
         // terminal now.
-        if (weakSelf.presentAfterLogCloses) {
-            weakSelf.presentAfterLogCloses = NO;
+        if ([KernEngine shared].flow.presentAfterLogCloses) {
+            [KernEngine shared].flow.presentAfterLogCloses = NO;
             [weakSelf presentTerminalWithClearScreen:YES];
         }
     }];
