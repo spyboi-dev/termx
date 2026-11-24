@@ -1,4 +1,10 @@
 # TermX — BUILD-NOTE
+>
+> **This file is a chronological diary, not a build guide.** It records
+> how each build happened, including dead ends. To build an IPA from
+> scratch, follow [BUILD.md](BUILD.md); to ship a new guest image,
+> run `rootfs-build/rebuild-image.sh`. The architecture is in
+> `PORT-NOTE.md`.
 
 TermX is a Linux terminal on iOS on the Kernarium runtime: it boots a
 minimal Debian (trixie) rootfs straight to a shell prompt in a

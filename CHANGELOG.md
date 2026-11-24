@@ -40,6 +40,25 @@ A refactoring release: no behaviour changes, only structure.
   post-build verification (arm64, bundle id, version, build
   marker present, framework embedded). `set -euo pipefail`.
 
+### Phase 6: developer experience and docs (docs and tooling only — no app behaviour change)
+
+- README updated to the fix6 image (150 MB, correct hashes) and
+  to the current Limitations: fastfetch Unknown on a fresh install
+  and why, fixed 48-col width with no winsize channel, guest
+  pauses in background, standard memory limit.
+- `BUILD.md`: a step-by-step guide to build an IPA from a fresh
+  clone (SDKs, framework via the CI workflow, toolchain restore
+  after a VM restart, build, verify). `BUILD-NOTE.md` is now
+  marked as a diary, not a guide.
+- `rootfs-build/rebuild-image.sh`: the image iteration loop in one
+  command (patch → drift check → `mke2fs` → `e2fsck` → `gzip` →
+  hashes → `SHA256SUMS-slim` → publish → update the app
+  constants), with a `--dry-run` mode. It refuses to proceed on
+  drift between the live tree and `configure-rootfs-slim.sh`.
+- `rootfs-build/README.md` documents the image directory: which
+  file is the source of truth, and the rule that tree and script
+  must never drift.
+
 ## 0.2.0 — 2026-11-24 — Phase 4: first run and guest environment
 
 - About screen: app version, build commit, installed image
