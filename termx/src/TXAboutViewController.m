@@ -28,16 +28,16 @@
 
     // System image: the installed release when it is this build's,
     // "older release" when it is a valid older one (its tag is not
-    // known — only the current release's hash is pinned), and "not
-    // installed" when there is no image at all. The release this
-    // build installs is always named, so the user can see whether
-    // an update is waiting.
+    // known — only the current release's hash is pinned — so no tag
+    // can be named here), and "not installed" when there is no image
+    // at all. The release this build installs is always named, so
+    // the user can see whether an update is waiting.
     NSString *installedRelease = engine.installedImageRelease;
     NSString *installedText;
     if (installedRelease) {
         installedText = installedRelease;
     } else if ([engine guestInstalled]) {
-        installedText = @"Older release — update available";
+        installedText = @"Older release — newer release available";
     } else {
         installedText = @"Not installed";
     }

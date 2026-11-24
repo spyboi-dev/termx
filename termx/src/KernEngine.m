@@ -788,7 +788,17 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
         case TermXStateSuspended:
             return 1.0;
         case TermXStateFailed:
-            return self.progress; // keep the last real value
+            // 0, not the stale download fraction: self.progress is the
+            // install fraction, 1.0 after a successful install, so a
+            // failed first boot showed a full bar under a "Failed"
+            // header. The boot-phase mapping cannot rescue it either:
+            // every failure path sets bootPhase to TXBootPhaseFailed
+            // before it sets the Failed state, so the phase the boot
+            // died in is already lost — and failures before boot at
+            // all (download, verify, storage) have no boot phase, so
+            // 0.35 "kernel booting" would be a lie for them too. A
+            // failed boot made no progress toward a running guest.
+            return 0.0;
         default:
             return 0.0;
     }

@@ -37,6 +37,7 @@
 
 #import "KernEngine.h"
 #import "TXConfig.h"
+#import "TXLog.h"
 #import "TXTheme.h"
 #import "vt.h"
 
@@ -217,6 +218,14 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     BOOL _cursorBlinkChanged;
     UIImpactFeedbackGenerator *_keyHaptic;  // light tap on key presses
     UIImpactFeedbackGenerator *_bellHaptic; // medium tap when the guest rings BEL
+    UIButton *_copyButton; // secondary-row Copy, kept so onCopyAll can show "Copied"
+    UILabel *_guestStatusLabel; // "Guest stopped/failed" notice over the terminal
+    // Font-size ratio for the next rebuild (new size / old size, 1 when
+    // no size change is pending): a pinch zoom or double-tap reset
+    // rebuilds the text at a new size, and the saved scroll offset in
+    // points has to be scaled by this or the view lands on a
+    // different line. Consumed (reset to 1) by restoreTerminalPosition.
+    CGFloat _rebuildOffsetScale;
 }
 
 - (void)viewDidLoad {
@@ -225,6 +234,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     vt_init(&_vt);
     _cursorBlinkOn = YES; // the cursor starts visible; the blink timer toggles it
     _fullRebuildNeeded = YES; // first render builds the whole string (see flushTerminal)
+    _rebuildOffsetScale = 1; // no size change pending (see the ivar comment)
     _keyHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     [_keyHaptic prepare];
     _bellHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
@@ -376,7 +386,13 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         NSData *data = [NSData dataWithBytes:kFnBytes[i] length:kFnLens[i]];
         [b addAction:[UIAction actionWithHandler:^(__kindof UIAction *action) {
             (void)action;
-            [self sendKeyData:data];
+            // Weak capture: the button retains the action, the action
+            // retains this block, and a strong self here would retain
+            // the VC — a cycle dealloc (which frees the VT) never
+            // breaks. Same pattern as the blink and arrow-repeat timers.
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf sendKeyData:data];
         }] forControlEvents:UIControlEventTouchUpInside];
         [fnStack addArrangedSubview:b];
     }
@@ -414,9 +430,12 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // clipboard, so copying does not depend only on the long-press
     // menu — which is awkward while output streams, because the
     // flush rebuilds the text under the selection.
-    UIButton *copyButton = [self keyButton:@"copy"];
-    [copyButton addTarget:self action:@selector(onCopyAll) forControlEvents:UIControlEventTouchUpInside];
-    [_secondaryRow addArrangedSubview:copyButton];
+    _copyButton = [self keyButton:@"copy"];
+    // Not "Sends this key to the terminal": Copy sends nothing, it
+    // copies the transcript to the clipboard.
+    _copyButton.accessibilityHint = @"Copies the whole transcript.";
+    [_copyButton addTarget:self action:@selector(onCopyAll) forControlEvents:UIControlEventTouchUpInside];
+    [_secondaryRow addArrangedSubview:_copyButton];
     UIView *sp3 = [[UIView alloc] init];
     [_secondaryRow addArrangedSubview:sp3];
     _fnButton = [self keyButton:@"fn"];
@@ -507,9 +526,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
     // Render the terminal at most every 60 ms; the guest sends a few bytes
     // at a time and redrawing on every one would thrash.
+    // Weak capture: the run loop retains the timer, the timer retains
+    // this block, and a strong self here would retain the VC — a cycle
+    // dealloc (which invalidates the timer and frees the VT) never
+    // breaks. Same pattern as the blink and arrow-repeat timers.
     _flushTimer = [NSTimer scheduledTimerWithTimeInterval:TXConfigTerminalFlushIntervalSec repeats:YES block:^(NSTimer *t) {
         (void)t;
-        [self flushTerminal];
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf flushTerminal];
     }];
     // The flush must run while the user holds a key (tracking mode),
     // or output would not render until the finger lifts. It is added
@@ -544,6 +569,11 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIPanGestureRecognizer *exitPan = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(onExitPan:)];
     exitPan.delegate = self;
+    // One finger only: without this the recognizer can see a
+    // two-finger pinch as well (it recognises simultaneously with
+    // the text view's gestures), so a pinch starting in the top
+    // strip and travelling down could dismiss the terminal.
+    exitPan.maximumNumberOfTouches = 1;
     [_output addGestureRecognizer:exitPan];
 
     // Pinch to zoom, Termux-style: two fingers change the font size,
@@ -554,6 +584,31 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc]
         initWithTarget:self action:@selector(onPinch:)];
     [_output addGestureRecognizer:pinch];
+
+    // Guest-dead notice: if the guest fails or stops while the
+    // terminal is open, the screen would otherwise just go dead
+    // with no explanation. A small label at the top says what
+    // happened and how to get back (see termXEngineDidChangeState:);
+    // it never dismisses the terminal and sends nothing to the
+    // guest. Taps pass through it to the terminal below. Hidden
+    // while the guest runs.
+    _guestStatusLabel = [[UILabel alloc] init];
+    _guestStatusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _guestStatusLabel.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.92];
+    _guestStatusLabel.textColor = TXThemeForegroundColor();
+    _guestStatusLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    _guestStatusLabel.textAlignment = NSTextAlignmentCenter;
+    _guestStatusLabel.numberOfLines = 2;
+    _guestStatusLabel.layer.cornerRadius = 8;
+    _guestStatusLabel.clipsToBounds = YES;
+    _guestStatusLabel.userInteractionEnabled = NO;
+    _guestStatusLabel.hidden = YES;
+    [self.view addSubview:_guestStatusLabel];
+    [NSLayoutConstraint activateConstraints:@[
+        [_guestStatusLabel.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
+        [_guestStatusLabel.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [_guestStatusLabel.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+    ]];
 
     [self termXEngineDidChangeState:_engine.state status:_engine.statusText];
 }
@@ -747,6 +802,19 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [self flushTerminal];
 }
 
+// The cursor blink restarts visible on input: typing while the
+// cursor is in its hidden phase would otherwise leave it invisible
+// for up to another half second. Only wakes a flush when the cursor
+// was actually hidden, so a keypress during the visible phase costs
+// nothing. Called from every input funnel (sendKeyData, sendBackspace,
+// the typing delegate, onPaste).
+- (void)resetCursorBlink {
+    if (!_cursorBlinkOn) {
+        _cursorBlinkOn = YES;
+        _cursorBlinkChanged = YES;
+    }
+}
+
 // BEL: a short vibration, no sound. The guest rings the bell for
 // tab completion with no matches, a backspace at an empty line, and
 // similar "no" answers — a sound would be intrusive in a terminal,
@@ -764,10 +832,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 // so a toggled-off key came back visibly darker than its siblings.
 static UIColor *TXKeyBackground(BOOL on, BOOL pressed) {
     if (pressed) {
-        return on ? [UIColor colorWithRed:0.30 green:0.55 blue:0.95 alpha:1.0]
+        // Pressed ON is a lighter teal, so the press still reads on
+        // a latched toggle; pressed OFF is the same light grey as before.
+        return on ? [UIColor colorWithRed:0.35 green:0.80 blue:0.72 alpha:1.0]
                   : [UIColor colorWithWhite:0.45 alpha:1.0];
     }
-    return on ? [UIColor colorWithRed:0.2 green:0.45 blue:0.85 alpha:1.0]
+    // ON is the app accent teal (#2AB3A3, TXThemeAccentColor), not
+    // blue: a blue toggle on a teal-accent app reads as a different
+    // app's colour.
+    return on ? TXThemeAccentColor()
               : [UIColor colorWithWhite:0.30 alpha:1.0];
 }
 
@@ -819,12 +892,15 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     // Slim horizontal insets: the primary row holds eleven equal
     // keys, and 10 pt insets overflowed a 430 pt screen once Paste
     // joined it. The titles shrink to fit instead of clipping: with
-    // equal widths a four-letter label ("ctrl", "more") is wider
-    // than its key, so the title scales down to ~12 pt rather than
-    // truncating — the three-letter keys stay at full size.
-    b.contentEdgeInsets = UIEdgeInsetsMake(6, 4, 6, 4);
+    // equal widths a four-letter label ("ctrl", "more", ~33.2 pt at
+    // 14 pt) is wider than its key, so the title scales down rather
+    // than truncating. 2 pt insets and a 0.6 floor keep it fitting
+    // even on a 320 pt screen: each key is ~25.6 pt, leaving ~21.6 pt
+    // for the label, and 33.2 pt at 0.6 scale is ~19.9 pt. The
+    // three-letter keys stay at full size.
+    b.contentEdgeInsets = UIEdgeInsetsMake(6, 2, 6, 2);
     b.titleLabel.adjustsFontSizeToFitWidth = YES;
-    b.titleLabel.minimumScaleFactor = 0.75;
+    b.titleLabel.minimumScaleFactor = 0.6;
     // Pressed state: the key lightens while the finger is down, on
     // top of the default title dim. TouchDown fires before the
     // key's own action, TouchUp restores the colour before the
@@ -866,6 +942,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 // repeat timer sends with feedback NO, or holding an arrow would
 // buzz the haptic at 12 Hz.
 - (void)sendKeyData:(NSData *)data withFeedback:(BOOL)feedback {
+    [self resetCursorBlink]; // input restarts the blink visible (see resetCursorBlink)
     if (feedback) {
         [[UIDevice currentDevice] playInputClick];
         [self keyHaptic];
@@ -898,6 +975,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 // release a latched Ctrl here, or it would stay latched and turn the
 // next typed letter into a control byte.
 - (void)sendBackspace {
+    [self resetCursorBlink]; // input restarts the blink visible (see resetCursorBlink)
     if (_altLatched) {
         uint8_t esc = 0x1B;
         [_engine sendConsoleInput:[NSData dataWithBytes:&esc length:1]];
@@ -911,9 +989,16 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 - (void)addKey:(UIStackView *)row title:(NSString *)title bytes:(const char *)bytes length:(size_t)length {
     UIButton *b = [self keyButton:title];
     NSData *data = [NSData dataWithBytes:bytes length:length];
+    // Weak capture: the button retains the action, the action retains
+    // this block, and a strong self here would retain the VC — a cycle
+    // dealloc (which frees the VT) never breaks. Same pattern as the
+    // blink and arrow-repeat timers.
+    __weak typeof(self) weakSelf = self;
     [b addAction:[UIAction actionWithHandler:^(__kindof UIAction *action) {
         (void)action;
-        [self sendKeyData:data];
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf sendKeyData:data];
     }] forControlEvents:UIControlEventTouchUpInside];
     [row addArrangedSubview:b];
 }
@@ -1045,6 +1130,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     if (text.length == 0) return;
     NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
     if (!data.length) return;
+    [self resetCursorBlink]; // input restarts the blink visible (see resetCursorBlink)
     // A paste is not a key: a latched modifier releases once, on
     // the first chunk, the way sendKeyData does for a key button —
     // not once per chunk.
@@ -1064,9 +1150,28 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     NSString *transcript = [NSString stringWithUTF8String:text];
     free(text);
     if (!transcript) transcript = @"";
+    // vt_render emits a "\n" for every row, so a transcript whose
+    // last rows are blank ends in a run of newlines — up to 24 of
+    // them on an empty screen. Trim the trailing newlines here, in
+    // the transcript only: vt_render's output is untouched, so no
+    // other caller sees a difference.
+    while ([transcript hasSuffix:@"\n"]) {
+        transcript = [transcript substringToIndex:transcript.length - 1];
+    }
     [UIPasteboard generalPasteboard].string = transcript;
     [[UIDevice currentDevice] playInputClick];
     [self keyHaptic];
+    // Brief confirmation, the Log screen's pattern (TXLogViewController
+    // copyTapped): the button reads "Copied" for 1.5 s, then goes
+    // back to "copy". The button itself is the feedback — a toast
+    // would need a new view for one word.
+    [_copyButton setTitle:@"Copied" forState:UIControlStateNormal];
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->_copyButton setTitle:@"copy" forState:UIControlStateNormal];
+    });
 }
 
 // One 1 KiB chunk of a paste, then the next chunk on the next
@@ -1120,8 +1225,15 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     if (ch < 0 || ch >= (NSInteger)text.length) return nil;
     NSRange lineRange = [text lineRangeForRange:NSMakeRange((NSUInteger)ch, 0)];
     NSString *line = [text substringWithRange:lineRange];
-    NSError *error = nil;
-    NSDataDetector *detector = [NSDataDetector dataDetectorWithTypes:NSTextCheckingTypeLink error:&error];
+    // Cached: building a detector parses the data-detector rules,
+    // and doing it on every tap is wasteful. A detector is stateless
+    // once built, so one shared instance is safe (and urlAtPoint
+    // only ever runs on the main thread).
+    static NSDataDetector *detector = nil;
+    static dispatch_once_t detectorOnce;
+    dispatch_once(&detectorOnce, ^{
+        detector = [NSDataDetector dataDetectorWithTypes:NSTextCheckingTypeLink error:NULL];
+    });
     if (!detector) return nil;
     NSArray<NSTextCheckingResult *> *matches = [detector matchesInString:line options:0 range:NSMakeRange(0, line.length)];
     for (NSTextCheckingResult *match in matches) {
@@ -1139,11 +1251,15 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     return nil;
 }
 
-// Double-tap resets the pinch zoom to the default 14 pt.
+// Double-tap resets the pinch zoom to the default size.
 - (void)onDoubleTapTerminal:(UITapGestureRecognizer *)tap {
     (void)tap;
-    if (TXTermFontSize() == 14) return;
-    TXSetTermFontSize(14);
+    if (TXTermFontSize() == TXConfigTermFontSizeDefault) return;
+    // The rebuild below re-renders at the new size: remember the
+    // size ratio so the scroll position survives it (see
+    // restoreTerminalPosition).
+    _rebuildOffsetScale = TXConfigTermFontSizeDefault / TXTermFontSize();
+    TXSetTermFontSize(TXConfigTermFontSizeDefault);
     _output.font = TXTermFont();
     _fullRebuildNeeded = YES; // the whole text re-renders at the new size
     [self flushTerminal];
@@ -1205,6 +1321,10 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
             // re-rendering on every tiny movement; the old 0.5 pt
             // zone made small pinches feel unresponsive.
             if (fabs(size - TXTermFontSize()) < TXConfigPinchDeadZonePt) return;
+            // The rebuild below re-renders at the new size: remember
+            // the size ratio so the scroll position survives it (see
+            // restoreTerminalPosition).
+            _rebuildOffsetScale = size / TXTermFontSize();
             TXSetTermFontSize(size);
             _output.font = TXTermFont();
             _fullRebuildNeeded = YES; // the whole text re-renders at the new size
@@ -1227,12 +1347,33 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 #pragma mark - Engine delegate
 
 - (void)termXEngineDidChangeState:(TermXState)state status:(NSString *)status {
-    (void)status;
     // The only thing the terminal itself does with state: focus the
     // keyboard once the shell is up, so the user can type at once.
     if (state == TermXStateRunning) {
         dispatch_async(dispatch_get_main_queue(), ^{
+            self->_guestStatusLabel.hidden = YES;
             [self->_input becomeFirstResponder];
+        });
+        return;
+    }
+    // Failed or Stopped while the terminal is open: without this the
+    // screen just goes dead and the user has no idea why. Show a
+    // label over the terminal with what happened and how to get
+    // back — never auto-dismiss (the user may want the scrollback)
+    // and never send anything to the guest. The engine's statusText
+    // is appended when it is short enough to read; a long one stays
+    // in engine.log. (State changes can arrive off the main thread,
+    // hence the dispatch.)
+    if (state == TermXStateFailed || state == TermXStateStopped) {
+        NSString *headline = state == TermXStateFailed
+            ? @"Guest failed — swipe down to return"
+            : @"Guest stopped — swipe down to return";
+        NSString *detail = (status.length > 0 && status.length <= 100)
+            ? [NSString stringWithFormat:@"\n%@", status] : @"";
+        NSString *text = [headline stringByAppendingString:detail];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_guestStatusLabel.text = text;
+            self->_guestStatusLabel.hidden = NO;
         });
     }
 }
@@ -1281,6 +1422,15 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     // (The timer is in the common modes so it fires during a key
     // hold; a drag is the only time a flush is skipped.)
     if (_output.isTracking || _output.isDragging || _output.isDecelerating) return;
+    // Do not rebuild while the user has text selected or the edit
+    // menu is open: rebuilding the text storage clears the selection
+    // and dismisses the Copy/Select menu, so copying while output
+    // streams is impossible. The dirty flag (and the blink flag)
+    // stay set, so nothing is lost — the next 60 ms tick after the
+    // selection clears renders the output. The selection restore in
+    // restoreTerminalPosition stays as a fallback for a selection
+    // made between this check and the rebuild.
+    if (_output.selectedRange.length > 0 || [[UIMenuController sharedMenuController] isMenuVisible]) return;
     _vt.dirty = 0;
     _cursorBlinkChanged = NO;
     // Full rebuild when the render state cannot be trusted: the font
@@ -1492,6 +1642,16 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
         // comes back the "bottom" moves past the text by exactly
         // that amount and the terminal opens black. Keep it zero.
         CGPoint restored = savedOffset;
+        // A font-size change (pinch zoom, double-tap reset) rebuilt
+        // the text at a new size, so the old offset in points no
+        // longer points at the same line: line height scales with
+        // the font size, so scale the offset by the size ratio (new
+        // / old, set by onPinch/onDoubleTapTerminal). Pinned is
+        // handled above by scrollToBottom, so only the scrolled-up
+        // case needs this.
+        if (_rebuildOffsetScale > 0 && _rebuildOffsetScale != 1) {
+            restored.y *= _rebuildOffsetScale;
+        }
         if (droppedLines > 0) {
             CGFloat lineHeight = font.lineHeight + TXTermParagraphStyleForSize(font.pointSize).lineSpacing;
             restored.y -= (CGFloat)droppedLines * lineHeight;
@@ -1501,6 +1661,10 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
         restored.y = MIN(MAX(restored.y, minY), MAX(maxOffset, minY));
         _output.contentOffset = restored;
     }
+    // The size ratio is consumed by this render, whichever branch
+    // ran: a pinch while pinned still rebuilt at the new size, so a
+    // stale ratio must not scale a later flush's offset.
+    _rebuildOffsetScale = 1;
 }
 
 // One scrollback row (cells) plus its newline. The row is trimmed
@@ -1531,10 +1695,20 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     for (int r = 0; r < VT_ROWS; r++) {
         int last = VT_COLS - 1;
         while (last >= 0 && _vt.grid[r][last].ch == 0) last--;
-        if (r == _vt.cy && _vt.cx > last && cursorShown) last = _vt.cx; // keep the cursor cell
+        // The cursor past the last column (cx == 80, deferred wrap
+        // in vt_put_char) is not a cell that exists: extending the
+        // row to column 80 would read cells[80] — the next row's
+        // first cell for rows 0-23, and past the grid (into saved_cx,
+        // saved_cy and the fields after it) for row 24. Clamp the
+        // cursor to the last column instead, so the block renders on
+        // the final cell and nothing is read out of bounds. vt.c's
+        // deferred wrap is untouched: cx stays 80 until the next
+        // printable char wraps.
+        int cursorCol = (r == _vt.cy) ? MIN(_vt.cx, VT_COLS - 1) : -1;
+        if (r == _vt.cy && _vt.cx > last && cursorShown) last = cursorCol; // keep the cursor cell
         if (last >= 0) {
             [self appendCellRow:_vt.grid[r] count:last + 1 font:font
-                       cursorAt:(r == _vt.cy ? _vt.cx : -1) cursorVisible:cursorShown
+                       cursorAt:cursorCol cursorVisible:cursorShown
                              to:grid];
         }
         if (r < VT_ROWS - 1) [grid appendAttributedString:newline];
@@ -1552,6 +1726,13 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
              cursorAt:(int)cursorCol cursorVisible:(BOOL)cursorVisible
                    to:(NSMutableAttributedString *)out {
     if (count <= 0) return;
+    // A row is VT_COLS cells: never read past it. The grid path
+    // clamps the cursor to the last column (see
+    // gridAttributedStringWithFont), but a count past the row would
+    // read the next row's first cell — or, on the last row, past the
+    // grid entirely. Clamp here too, so no caller can ever drive
+    // this loop out of bounds.
+    if (count > VT_COLS) count = VT_COLS;
     NSMutableString *runText = [NSMutableString string];
     vt_cell runCell = cells[0];
     BOOL haveRun = NO;
@@ -1640,6 +1821,10 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     // modifiers: Ctrl turns a letter into its control byte (and
     // Return into Ctrl-J), Alt prefixes ESC to whatever the key
     // produces. Both latches release on use.
+    // A typed key is input too, and it bypasses sendKeyData: (it
+    // sends straight to the engine below), so the blink resets here
+    // as well as in sendKeyData:.
+    [self resetCursorBlink];
     NSData *toSend = nil;
     if ([string isEqualToString:@"\n"]) {
         // NewTerm sends carriage return, not line feed — unless Ctrl
@@ -1708,13 +1893,24 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     CGFloat height = MAX(0, safeBottom - inView.origin.y);
     _toolbarBottom.constant = -4 - height;
     NSTimeInterval duration = [note.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
-    [UIView animateWithDuration:duration animations:^{
+    // The keyboard's own animation curve: without it the toolbar
+    // moves on the default ease-in-out while the keyboard moves on
+    // its curve, and the two visibly separate. The curve value maps
+    // to animation options by shifting it into the options field.
+    NSInteger curveValue = [note.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue];
+    UIViewAnimationOptions options = (UIViewAnimationOptions)(curveValue << 16);
+    [UIView animateWithDuration:duration delay:0 options:options animations:^{
         [self.view layoutIfNeeded];
         if (wasPinned) [self scrollToBottomAnimated:NO];
-    }];
+    } completion:nil];
 }
 
 - (void)dealloc {
+    // Observable in engine.log: with the flush-timer cycle fixed,
+    // this line proves the VC (and its VT) is actually freed when
+    // the terminal is dismissed. Its absence after a dismiss means
+    // a retain cycle is still holding it.
+    TXLogEngine(@"TerminalViewController dealloc");
     [_flushTimer invalidate];
     [_blinkTimer invalidate];
     [_repeatTimer invalidate];

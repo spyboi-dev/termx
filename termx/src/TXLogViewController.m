@@ -8,12 +8,25 @@
 @property (nonatomic, strong) UITextView *logTextView;
 @property (nonatomic, strong) UIButton *shareLogButton;
 @property (nonatomic, strong, nullable) NSTimer *refreshTimer;
+// Serial queue for the log-file reads: TXLogFullText() reads up to
+// 1 MB (two 512 KB capped files), so it runs here instead of on the
+// main thread, where it stalled scrolling every tick. Serial, so
+// reads stay in order — a newer read can never be overwritten by an
+// older one finishing late.
+@property (nonatomic, strong) dispatch_queue_t logReadQueue;
+// Length and hash of the text currently shown, so the refresh can
+// tell on the main thread whether new text differs without laying
+// out up to 1 MB of text again. Both are main-thread only: written
+// when the text view is set, read in the refresh's main-queue hop.
+@property (nonatomic) NSUInteger displayedLogLength;
+@property (nonatomic) NSUInteger displayedLogHash;
 @end
 
 @implementation TXLogViewController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    self.logReadQueue = dispatch_queue_create("app.termx.ios.log-read", DISPATCH_QUEUE_SERIAL);
     self.title = @"Logs";
     self.view.backgroundColor = TXThemeBackgroundColor();
 
@@ -91,18 +104,38 @@
 
 // Only auto-scrolls to the newest lines if the user is already
 // near the bottom, so reading an earlier line is not yanked away.
+// The file read runs on logReadQueue (up to 1 MB off the main
+// thread); only the compare-and-display runs on the main thread.
+// The text view is rebuilt only when the new text differs — judged
+// by length plus hash, both computed off the main thread — so an
+// unchanged tick costs no layout of up to 1 MB of text. Equal
+// strings have equal hashes, so a length + hash match means the
+// display is already current; a hash collision would only skip one
+// tick, and the next append changes the length and the display
+// catches up.
 - (void)refreshLog {
-    NSString *text = TXLogFullText();
-    if ([text isEqualToString:self.logTextView.text]) return;
-    CGFloat bottom = self.logTextView.contentOffset.y + self.logTextView.bounds.size.height;
-    BOOL nearBottom = (self.logTextView.contentSize.height - bottom) < 60;
-    self.logTextView.text = text;
-    if (nearBottom) {
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.logReadQueue, ^{
+        NSString *text = TXLogFullText();
+        NSUInteger length = text.length;
+        NSUInteger hash = text.hash;
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSRange end = NSMakeRange(self.logTextView.text.length, 0);
-            [self.logTextView scrollRangeToVisible:end];
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if (length == strongSelf.displayedLogLength && hash == strongSelf.displayedLogHash) return;
+            CGFloat bottom = strongSelf.logTextView.contentOffset.y + strongSelf.logTextView.bounds.size.height;
+            BOOL nearBottom = (strongSelf.logTextView.contentSize.height - bottom) < 60;
+            strongSelf.logTextView.text = text;
+            strongSelf.displayedLogLength = length;
+            strongSelf.displayedLogHash = hash;
+            if (nearBottom) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSRange end = NSMakeRange(strongSelf.logTextView.text.length, 0);
+                    [strongSelf.logTextView scrollRangeToVisible:end];
+                });
+            }
         });
-    }
+    });
 }
 
 - (void)copyTapped {

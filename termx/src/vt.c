@@ -545,6 +545,11 @@ char *vt_render(vt_t *vt) {
     }
     if (!out) { out = malloc(1); if (out) out[0] = '\0'; return out; }
     out[len] = '\0';
-    vt->dirty = 0;
+    /* No vt->dirty = 0 here: vt_render is a read-only transcript
+     * builder (its only caller is the Copy button), and clearing
+     * dirty here would swallow a screen update the real render path
+     * has not drawn yet — a Copy tap while output streams would
+     * silently drop the pending flush. Only the flush clears dirty,
+     * after it actually renders. */
     return out;
 }

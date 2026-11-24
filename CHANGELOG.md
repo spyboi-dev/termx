@@ -7,6 +7,115 @@ grouped under 0.1.0 by date and commit.
 
 ## 0.3.0 — 2026-11-24 — Phase 5: architecture and code quality
 
+### UI bug-fix round: leaks, stale flags, and polish
+
+Three fresh audits of the 81d40f4 build found one real leak, one
+out-of-bounds read, and a long tail of smaller bugs. All fixed
+here; nothing in this section changes the guest image, the
+state machine, or the clear-on-boot gating.
+
+- The terminal view controller leaked on every presentation:
+  the 60 ms flush timer's block and the Fn-row and `addKey:`
+  `UIAction` blocks all captured `self` strongly, so `dealloc`
+  (which invalidates the timers and frees the VT) never ran.
+  Every open leaked a VC, its ~2 MB scrollback, and a timer
+  that kept firing forever. All three now use `weakSelf`, the
+  pattern the blink and arrow-repeat timers already used, and
+  `dealloc` logs so the fix is visible in engine.log.
+- A line exactly 80 columns full with the cursor past the last
+  column (`cx == 80`, deferred wrap) extended the rendered row
+  to 81 cells and read `cells[80]` — the next row's first cell
+  for rows 0–23, past the grid into adjacent struct fields for
+  row 24, rendered inverted as a garbage cursor cell. The cursor
+  is now clamped to column 79 when rendering, and `appendCellRow`
+  clamps its count to `VT_COLS` as well. vt.c's deferred wrap is
+  untouched.
+- The stale `presentAfterLogCloses` flag could yank the user
+  into a cleared terminal: the 0.7 s auto-present block set it
+  whenever *any* screen was presented, and About never consumed
+  it. It is now set only when the Log screen is presented, the
+  delayed block re-checks that the guest is still Running or
+  Suspended, and the flag is cleared on any manual terminal
+  presentation, on About Done, and on swipe-dismiss (iPad).
+- If the guest fails or stops while the terminal is open, a
+  label now says so over the terminal ("Guest failed/stopped —
+  swipe down to return", plus the short status text). The
+  terminal is never auto-dismissed and nothing is sent to the
+  guest.
+- Erasing the data disk no longer fails silently: a failure
+  shows an alert ("Couldn't erase the data disk") instead of
+  only a log line, in both the Erase button and the Start fresh
+  path. Erase is disabled when no data disk exists.
+- A corrupt data disk no longer dead-ends on Install: when the
+  failed step is Storage and a disk exists, the action button
+  reads "Erase data disk and start fresh" and runs the erase
+  confirmation flow. After a successful erase it goes back to
+  Install. Other failure steps are unchanged.
+- Tapping Copy could swallow a pending screen update:
+  `vt_render` cleared the dirty flag as a side effect although
+  it is only a transcript builder. Only the flush clears dirty
+  now. Copy also trims the up-to-24 trailing blank lines from
+  the transcript, shows "Copied" for 1.5 s (the Log screen's
+  pattern), and its VoiceOver hint says it copies the transcript
+  instead of claiming it sends a key.
+- Selecting text while output streams no longer fights the
+  flush: the rebuild is skipped while a selection is active or
+  the edit menu is open, and the dirty flag stays set so the
+  next tick renders the output.
+- Pinch zoom (and double-tap reset) preserves the scroll
+  position when scrolled up: the saved offset is scaled by the
+  font-size ratio. Pinned-to-bottom still goes through
+  scroll-to-bottom.
+- The progress bar no longer lies on failure: the Failed case
+  returned the stale download fraction (1.0 after an install),
+  so a failed first boot showed a full bar under a "Failed"
+  header. It now returns 0 — the boot-phase mapping cannot
+  rescue it, because every failure path overwrites the phase
+  before setting the state.
+- The Log screen no longer re-reads up to 1 MB on the main
+  thread every second: reads run on a serial background queue,
+  and the text view is rebuilt only when length plus hash show
+  the content changed. Scroll preservation is unchanged.
+- Download detail wraps to two lines instead of truncating the
+  transfer rate on a 430 pt screen, and a stalled download
+  drops the rate to 0 after a second with no new bytes instead
+  of showing a stale MB/s forever.
+- The header says "Not installed" (grey) when nothing is
+  installed instead of "Ready". The elapsed timer resets when a
+  boot or install starts instead of showing the app's lifetime.
+  Storage reads "X used of Y" in both branches. The pending
+  image detail reads "116 MiB", not "116 MB". The failure reason
+  is capped at 200 chars like the crash notice. The crash notice
+  is plain words now — the raw kernel panic line stays in the
+  log only. The update row and About name the installed release
+  alongside the update when its tag is known; an older image's
+  tag is not pinned anywhere, so it reads "older release"
+  rather than guessing.
+- Smaller terminal fixes: double-tap reset uses
+  `TXConfigTermFontSizeDefault` instead of a literal 14; the
+  `NSDataDetector` for tap-URL is cached instead of rebuilt per
+  tap; the cursor blink restarts visible on input (typed keys,
+  backspace, paste, key buttons); the four-letter key labels fit
+  down to a 320 pt screen (2 pt insets, 0.6 minimum scale); the
+  toggle ON colour is the teal accent, not blue; the keyboard
+  animation uses the keyboard's own curve; the exit pan is one
+  finger only, so a pinch cannot dismiss the terminal.
+- Checklist rows now tell VoiceOver their state ("System image,
+  done" / "Linux kernel, in progress" / "Storage, failed").
+
+Left undone, deliberately: the hardcoded kernel version
+("6.18.60") and upstream commit ("fbe12ee") stay — the runtime
+header exposes no kernel version, the framework Info.plist
+carries only "6.18" and the ABI version, and no binary symbol
+reports the commit, so there is no real source to read them
+from. Dynamic Type on the startup, About, and Log screens
+needs a layout rework (fixed 68 pt rows, fixed spacer) and was
+not half-done. The clear-on-boot gate's residual timing hole
+(silence is not proof the prompt is coming) is unconfirmed in
+practice and the gating logic is untouched. The vt.c OOM path
+and DECSTBM items from the audits were unconfirmed and are
+untouched.
+
 ### Double prompt after boot, fixed for real
 
 - The clear-on-boot no longer sends its newline unconditionally:

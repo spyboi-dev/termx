@@ -24,7 +24,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     TXStartupRowUpdate   // done, but a newer image is available: teal check, detail in teal
 };
 
-@interface TXStartupViewController ()
+@interface TXStartupViewController () <UIAdaptivePresentationControllerDelegate>
 @property (nonatomic, strong) UIView *statusDot;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UILabel *timerLabel;
@@ -51,9 +51,17 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 @property (nonatomic, strong) NSMutableArray<UIActivityIndicatorView *> *rowSpinners;
 @property (nonatomic, strong) NSMutableArray<UILabel *> *rowTitles;
 @property (nonatomic, strong) NSMutableArray<UILabel *> *rowDetails;
+// The row container views, in the same order: VoiceOver reads the
+// row's state from the container's accessibilityLabel (see setRow:),
+// so the containers must be kept, not just their subviews.
+@property (nonatomic, strong) NSMutableArray<UIView *> *rowViews;
 @property (nonatomic, strong, nullable) NSTimer *pollTimer;
 @property (nonatomic, strong, nullable) id stateChangeObserver; // block-observer token: removeObserver:self does NOT remove a block observer, so the token itself must be kept and removed in dealloc
 @property (nonatomic, strong) NSDate *startTime;
+// The state seen on the previous refresh, so the elapsed timer
+// resets only on the transition into a boot/install (see refresh),
+// not on every refresh or foreground return.
+@property (nonatomic, assign) TermXState previousState;
 // Download rate: bytes and time of the last poll tick, so the
 // "MB/s" figure is measured, not guessed.
 @property (nonatomic, assign) int64_t lastReceived;
@@ -72,6 +80,8 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     self.rowSpinners = [NSMutableArray array];
     self.rowTitles = [NSMutableArray array];
     self.rowDetails = [NSMutableArray array];
+    self.rowViews = [NSMutableArray array];
+    self.previousState = [KernEngine shared].state;
 
     // The guest's Metal view sits behind everything, full screen. The
     // runtime refuses a null view, and the startup screen and the
@@ -349,6 +359,12 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     UILabel *detailLabel = [[UILabel alloc] init];
     detailLabel.font = [UIFont systemFontOfSize:14];
     detailLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+    // Wraps to two lines: a download detail such as "Downloading…
+    // 42% · 56 MiB of 116 MiB · 2.1 MiB/s" is ~49 chars (~360 pt)
+    // in a ~298 pt area, so one line truncates it on iPhone 15
+    // Plus. The 68 pt row still fits: title (17 pt) + spacing +
+    // two detail lines (14 pt each) is ~56 pt.
+    detailLabel.numberOfLines = 0;
     detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
     UIStackView *labels = [[UIStackView alloc] initWithArrangedSubviews:@[titleLabel, detailLabel]];
@@ -371,6 +387,11 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     [self.rowSpinners addObject:spinner];
     [self.rowTitles addObject:titleLabel];
     [self.rowDetails addObject:detailLabel];
+    // The container is the accessibility element: its label (set in
+    // setRow:) names the row and its state, so VoiceOver does not
+    // have to infer done/active/failed from colour or icon alone.
+    row.isAccessibilityElement = YES;
+    [self.rowViews addObject:row];
     return row;
 }
 
@@ -399,6 +420,17 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 }
 
 - (void)refresh {
+    // Elapsed timer: reset when a boot or install starts, so
+    // returning from a long terminal session does not leave a large
+    // meaningless time on screen. Only on the transition into
+    // Downloading/Booting — never on every refresh — so a
+    // background/foreground return does not reset it spuriously.
+    TermXState currentState = [KernEngine shared].state;
+    if ((currentState == TermXStateDownloading || currentState == TermXStateBooting) &&
+        self.previousState != TermXStateDownloading && self.previousState != TermXStateBooting) {
+        self.startTime = [NSDate date];
+    }
+    self.previousState = currentState;
     NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:self.startTime];
     self.timerLabel.text = [NSString stringWithFormat:@"%lu:%02lu",
                             (unsigned long)(elapsed / 60), (unsigned long)((NSInteger)elapsed % 60)];
@@ -417,7 +449,10 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 }
 
 // The one button follows the engine state, and only the state:
-// Install when nothing is installed (or the last step failed),
+// Install when nothing is installed (or the last step failed —
+// except a failed Storage step with a disk present, where the
+// button offers erasing the corrupt disk instead, since
+// reinstalling the image would fail on the same disk again),
 // Update when a newer image is available and the guest is stopped
 // (or running — tapping it stops the guest first, then installs),
 // Start when the guest is installed but powered off, Terminal when
@@ -445,7 +480,17 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     switch (engine.state) {
         case TermXStateIdle:
         case TermXStateFailed:
-            [self.actionButton setTitle:@"Install" forState:UIControlStateNormal];
+            if (engine.state == TermXStateFailed && engine.failedStep == TXBootStepStorage && engine.dataDiskExists) {
+                // A damaged data disk: reinstalling the image would
+                // boot into the same broken disk and fail again.
+                // The button offers the real remedy instead — the
+                // erase confirmation flow (see actionTapped). Once
+                // the disk is gone there is nothing to erase, so the
+                // button goes back to Install.
+                [self.actionButton setTitle:@"Erase data disk and start fresh" forState:UIControlStateNormal];
+            } else {
+                [self.actionButton setTitle:@"Install" forState:UIControlStateNormal];
+            }
             self.actionButton.enabled = YES;
             break;
         case TermXStateStopped:
@@ -501,11 +546,15 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             }
             break;
     }
+    // Erase is live only when nothing is running and a data disk
+    // actually exists: with no disk there is nothing to erase, and
+    // a tap would only ever report failure.
     self.eraseButton.enabled = (engine.state != TermXStateDownloading &&
                                 engine.state != TermXStateBooting &&
                                 engine.state != TermXStateRunning &&
                                 engine.state != TermXStateStopping &&
-                                engine.state != TermXStateSuspended);
+                                engine.state != TermXStateSuspended &&
+                                engine.dataDiskExists);
 }
 
 - (void)refreshHeader {
@@ -534,8 +583,13 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             break;
         case TermXStateReady:
         case TermXStateStopped:
-        case TermXStateIdle:
             text = @"Ready"; dot = [UIColor colorWithWhite:0.5 alpha:1.0]; labelColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+            break;
+        case TermXStateIdle:
+            // Nothing installed yet: "Ready" would claim a guest
+            // that does not exist. The engine's own initial status
+            // text says "Not installed yet — tap Install".
+            text = @"Not installed"; dot = [UIColor colorWithWhite:0.5 alpha:1.0]; labelColor = [UIColor colorWithWhite:0.6 alpha:1.0];
             break;
     }
     self.statusLabel.text = text;
@@ -547,6 +601,11 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     NSString *reason = nil;
     if (engine.state == TermXStateFailed) {
         reason = engine.statusText ?: @"Something failed — check the log for the exact reason.";
+        // Cap the raw status text: it can include raw console lines,
+        // and this label is a one-line reason, not a log view.
+        if (reason.length > 200) {
+            reason = [[reason substringToIndex:200] stringByAppendingString:@"…"];
+        }
     }
     self.reasonLabel.hidden = (reason == nil);
     self.reasonLabel.text = reason ?: @"";
@@ -565,20 +624,13 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     self.crashChoiceShown = show;
     self.crashLabel.hidden = !show;
     if (show) {
-        // The message can be a kernel panic line: first line only,
-        // trimmed, capped so the label stays a notice, not a log.
-        NSString *message = engine.lastSessionMessage ?: @"";
-        NSString *firstLine = [[message componentsSeparatedByString:@"\n"] firstObject] ?: @"";
-        firstLine = [firstLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (firstLine.length > 200) {
-            firstLine = [[firstLine substringToIndex:200] stringByAppendingString:@"…"];
-        }
+        // Plain words only: the session message can be a raw kernel
+        // panic line ("Attempted to kill init!"), which means
+        // nothing to the user on this screen. The raw line stays in
+        // the log; here the user only needs to know what happened
+        // and what the two buttons do.
         NSString *what = ([engine.lastSessionEnd isEqualToString:@"kernel-abort"] ? @"kernel abort" : @"guest panic");
-        if (firstLine.length) {
-            self.crashLabel.text = [NSString stringWithFormat:@"The last run crashed (%@): %@\nStart anyway, or Start fresh to erase the data disk and begin again.", what, firstLine];
-        } else {
-            self.crashLabel.text = [NSString stringWithFormat:@"The last run crashed (%@).\nStart anyway, or Start fresh to erase the data disk and begin again.", what];
-        }
+        self.crashLabel.text = [NSString stringWithFormat:@"The last run crashed (%@). Start anyway, or Start fresh to erase the data disk and begin again.", what];
     }
 }
 
@@ -604,14 +656,25 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         [self setRow:TXBootStepImage state:TXStartupRowFailed detail:status];
     } else if ([engine guestInstalled]) {
         if (engine.updateAvailable) {
-            [self setRow:TXBootStepImage state:TXStartupRowUpdate detail:@"Update available"];
+            // Name the installed release alongside the update, so
+            // the user can see what is actually running. The tag is
+            // only known when the installed image IS this build's
+            // release (installedImageRelease); an older image's tag
+            // is not pinned anywhere, so it reads "older release"
+            // rather than guessing a tag.
+            NSString *installed = engine.installedImageRelease;
+            NSString *detail = installed
+                ? [NSString stringWithFormat:@"Update available · installed %@", installed]
+                : @"Update available · installed older release";
+            [self setRow:TXBootStepImage state:TXStartupRowUpdate detail:detail];
         } else {
             [self setRow:TXBootStepImage state:TXStartupRowDone detail:engine.imageDetail];
         }
     } else if (engine.state == TermXStateDownloading) {
         [self setRow:TXBootStepImage state:TXStartupRowActive detail:[self downloadDetail]];
     } else {
-        [self setRow:TXBootStepImage state:TXStartupRowPending detail:@"Debian trixie slim · 116 MB"];
+        // 116 MiB, not MB: the .gz is 121,424,080 bytes = 115.8 MiB.
+        [self setRow:TXBootStepImage state:TXStartupRowPending detail:@"Debian trixie slim · 116 MiB"];
     }
 
     // Linux kernel.
@@ -630,7 +693,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     if (failed && failedStep == TXBootStepStorage) {
         [self setRow:TXBootStepStorage state:TXStartupRowFailed detail:status];
     } else if (engine.dataDiskReady) {
-        NSString *detail = [NSString stringWithFormat:@"%@ of %@",
+        NSString *detail = [NSString stringWithFormat:@"%@ used of %@",
                             TXFormatBytes(engine.storageUsedBytes),
                             TXFormatBytes(engine.storageTotalBytes)];
         [self setRow:TXBootStepStorage state:TXStartupRowDone detail:detail];
@@ -666,7 +729,10 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 
 // "Downloading… 42% · 56 MB of 116 MB · 2.1 MB/s", from the real
 // byte counts the download watcher reports. The rate is measured
-// between poll ticks; it is omitted until two ticks exist.
+// between poll ticks; it is omitted until two ticks exist. The rate
+// timestamp only moves when bytes actually arrive, so a stalled
+// download (no new bytes for over a second — two poll ticks) drops
+// the rate to 0 instead of showing a stale MB/s forever.
 - (NSString *)downloadDetail {
     KernEngine *engine = [KernEngine shared];
     int64_t received = engine.downloadReceived;
@@ -674,12 +740,16 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     if (expected <= 0) return engine.statusText ?: @"Downloading…";
     double pct = (double)received / (double)expected * 100.0;
     NSDate *now = [NSDate date];
-    if (self.lastRateTime && received > self.lastReceived) {
-        NSTimeInterval dt = [now timeIntervalSinceDate:self.lastRateTime];
-        if (dt > 0) self.lastRate = (double)(received - self.lastReceived) / dt;
+    if (received > self.lastReceived) {
+        if (self.lastRateTime) {
+            NSTimeInterval dt = [now timeIntervalSinceDate:self.lastRateTime];
+            if (dt > 0) self.lastRate = (double)(received - self.lastReceived) / dt;
+        }
+        self.lastReceived = received;
+        self.lastRateTime = now;
+    } else if (self.lastRateTime && [now timeIntervalSinceDate:self.lastRateTime] > 1.0) {
+        self.lastRate = 0;
     }
-    self.lastReceived = received;
-    self.lastRateTime = now;
     NSString *base = [NSString stringWithFormat:@"Downloading… %.0f%% · %@ of %@",
                       pct, TXFormatBytes((unsigned long long)received),
                       TXFormatBytes((unsigned long long)expected)];
@@ -696,6 +766,19 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     UILabel *title = self.rowTitles[(NSUInteger)row];
     UILabel *detailLabel = self.rowDetails[(NSUInteger)row];
     detailLabel.text = detail;
+    // The state is otherwise colour, icon and spinner only, which
+    // VoiceOver cannot see: name it on the row container (see
+    // makeRowWithTitle), e.g. "System image, done".
+    NSString *stateWord = nil;
+    switch (state) {
+        case TXStartupRowDone: stateWord = @"done"; break;
+        case TXStartupRowUpdate: stateWord = @"done, update available"; break;
+        case TXStartupRowActive: stateWord = @"in progress"; break;
+        case TXStartupRowFailed: stateWord = @"failed"; break;
+        case TXStartupRowPending: stateWord = @"not started"; break;
+    }
+    self.rowViews[(NSUInteger)row].accessibilityLabel =
+        [NSString stringWithFormat:@"%@, %@", title.text, stateWord];
     switch (state) {
         case TXStartupRowDone:
             icon.backgroundColor = TXStartupTeal();
@@ -869,8 +952,34 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return;
+        KernEngine *engine = [KernEngine shared];
+        // Re-check the engine: the guest may have stopped inside
+        // the 0.7 s window, and presenting a terminal (cleared) on
+        // a stopped guest is wrong. Re-arm terminalPresented so a
+        // later Running state can still present once.
+        if (engine.state != TermXStateRunning && engine.state != TermXStateSuspended) {
+            engine.flow.terminalPresented = NO;
+            return;
+        }
         if (strongSelf.presentedViewController) {
-            [KernEngine shared].flow.presentAfterLogCloses = YES;
+            // Only the Log screen defers the presentation: the
+            // shell came up while the user was reading the log, so
+            // wait for it to close. Any other presented screen
+            // (About, the size sheet) must NOT set the flag — the
+            // user tapped Terminal within this window, or is reading
+            // About, and the flag would otherwise fire later on an
+            // unrelated Log close and present a cleared terminal,
+            // wiping scrollback.
+            UIViewController *presented = strongSelf.presentedViewController;
+            BOOL isLog = NO;
+            if ([presented isKindOfClass:[UINavigationController class]]) {
+                isLog = [[(UINavigationController *)presented topViewController] isKindOfClass:[TXLogViewController class]];
+            } else {
+                isLog = [presented isKindOfClass:[TXLogViewController class]];
+            }
+            if (isLog) {
+                engine.flow.presentAfterLogCloses = YES;
+            }
             return;
         }
         [strongSelf presentTerminalWithClearScreen:YES];
@@ -883,6 +992,10 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 // button passes NO, so the scrollback is never wiped. The boot log
 // itself is not lost: it stays in guest.log and engine.log.
 - (void)presentTerminalWithClearScreen:(BOOL)clearScreen {
+    // Any terminal presentation consumes the deferred flag: a
+    // manual Terminal tap must not leave it set for a later Log
+    // close to fire on.
+    [KernEngine shared].flow.presentAfterLogCloses = NO;
     TerminalViewController *terminal = [[TerminalViewController alloc] init];
     terminal.clearScreenOnBoot = clearScreen;
     terminal.modalPresentationStyle = UIModalPresentationFullScreen;
@@ -904,8 +1017,11 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         NSString *error = nil;
         if (![engine eraseDataDiskWithError:&error]) {
             // Do not boot into the same broken disk, and do not hide
-            // the choice: the user can still tap Start anyway.
+            // the choice: the user can still tap Start anyway. The
+            // failure is shown, not just logged, so the user knows
+            // the disk is still there.
             TXLogEngine(@"Start fresh: erase failed: %@", error ?: @"?");
+            [self showEraseFailedAlertWithError:error];
             [self refresh];
             return;
         }
@@ -973,6 +1089,16 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         [engine bootOnView:self.guestView];
         return;
     }
+    if (engine.state == TermXStateFailed && engine.failedStep == TXBootStepStorage && engine.dataDiskExists) {
+        // Corrupt data disk: reinstalling the image would boot into
+        // the same broken disk and fail again, so the button runs
+        // the erase confirmation flow (the same as Erase data disk)
+        // instead of the install flow. After a successful erase
+        // there is no disk left, so refreshButtons shows Install
+        // again.
+        [self eraseTapped];
+        return;
+    }
     if (engine.state == TermXStateIdle || engine.state == TermXStateFailed) {
         // A manual Install resets the automatic flow, so the Ready
         // state it ends in boots by itself (see maybeAutoBoot), and
@@ -1020,6 +1146,14 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     [self presentViewController:sheet animated:YES completion:nil];
 }
 
+- (void)showEraseFailedAlertWithError:(NSString *)error {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Couldn't erase the data disk"
+                                                                   message:error ?: @"The data disk could not be erased."
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
 - (void)eraseTapped {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Erase data disk?"
                                                                    message:@"This deletes everything saved in the guest — installed packages, files, all of it. The Debian system image is untouched, and the next boot starts with a fresh, empty data disk."
@@ -1028,11 +1162,21 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Erase" style:UIAlertActionStyleDestructive handler:^(__kindof UIAlertAction *action) {
         (void)action;
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
         NSString *error = nil;
         if (![[KernEngine shared] eraseDataDiskWithError:&error]) {
+            // A silent log line is not enough: the user tapped
+            // Erase expecting the disk gone, so say so on screen.
+            // Async: this handler runs while the confirmation alert
+            // itself is dismissing, so present after it is gone.
             TXLogEngine(@"Erase data disk failed: %@", error ?: @"?");
+            NSString *errorCopy = error;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [strongSelf showEraseFailedAlertWithError:errorCopy];
+            });
         }
-        [weakSelf refresh];
+        [strongSelf refresh];
     }]];
     [self presentViewController:alert animated:YES completion:nil];
 }
@@ -1041,6 +1185,9 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     TXLogViewController *logVC = [[TXLogViewController alloc] init];
     logVC.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(logDoneTapped)];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:logVC];
+    // On iPad the sheet can be swipe-dismissed instead of Done:
+    // the delegate below handles that path the same way.
+    nav.presentationController.delegate = self;
     [self presentViewController:nav animated:YES completion:nil];
 }
 
@@ -1048,22 +1195,62 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     __weak typeof(self) weakSelf = self;
     [self dismissViewControllerAnimated:YES completion:^{
         // The shell came up while the log was open: go to the
-        // terminal now.
+        // terminal now — but only if the guest is still up. If it
+        // stopped while the log was open, there is no terminal to
+        // go to.
         if ([KernEngine shared].flow.presentAfterLogCloses) {
             [KernEngine shared].flow.presentAfterLogCloses = NO;
-            [weakSelf presentTerminalWithClearScreen:YES];
+            TermXState state = [KernEngine shared].state;
+            if (state == TermXStateRunning || state == TermXStateSuspended) {
+                [weakSelf presentTerminalWithClearScreen:YES];
+            }
         }
     }];
+}
+
+// Swipe-dismissed Log sheet (iPad page sheet has no Done tap):
+// the same deferred presentation as logDoneTapped, and the same
+// state re-check. Other sheets (About, the size picker) never set
+// the flag, so nothing fires for them.
+- (void)presentationControllerDidDismiss:(UIPresentationController *)presentationController {
+    UIViewController *presented = presentationController.presentedViewController;
+    UIViewController *top = presented;
+    if ([presented isKindOfClass:[UINavigationController class]]) {
+        top = [(UINavigationController *)presented topViewController];
+    }
+    // A swipe-dismissed About sheet never runs aboutDoneTapped, so
+    // clear the deferred flag here too (same reason as there).
+    if ([top isKindOfClass:[TXAboutViewController class]]) {
+        [KernEngine shared].flow.presentAfterLogCloses = NO;
+        return;
+    }
+    BOOL isLog = [top isKindOfClass:[TXLogViewController class]];
+    if (!isLog) return;
+    if ([KernEngine shared].flow.presentAfterLogCloses) {
+        [KernEngine shared].flow.presentAfterLogCloses = NO;
+        TermXState state = [KernEngine shared].state;
+        if (state == TermXStateRunning || state == TermXStateSuspended) {
+            [self presentTerminalWithClearScreen:YES];
+        }
+    }
 }
 
 - (void)aboutTapped {
     TXAboutViewController *aboutVC = [[TXAboutViewController alloc] init];
     aboutVC.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(aboutDoneTapped)];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:aboutVC];
+    // On iPad the sheet can be swipe-dismissed instead of Done:
+    // the delegate clears the deferred flag on that path too.
+    nav.presentationController.delegate = self;
     [self presentViewController:nav animated:YES completion:nil];
 }
 
 - (void)aboutDoneTapped {
+    // About never consumes the deferred flag, so a flag set while
+    // About was open must not survive: the next Log close would
+    // otherwise present a cleared terminal for a shell that came up
+    // while the user was reading About.
+    [KernEngine shared].flow.presentAfterLogCloses = NO;
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
