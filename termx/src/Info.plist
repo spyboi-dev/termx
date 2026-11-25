@@ -72,5 +72,11 @@
 	<string>TermX keeps the Linux guest running in the background using low-precision location. Your location is never stored or shared.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>TermX keeps the Linux guest running in the background using low-precision location. Your location is never stored or shared.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_swipt._tcp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>TermX looks for the Swipt helper on this device to enable JIT.</string>
 </dict>
 </plist>

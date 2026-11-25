@@ -4,6 +4,7 @@
 #import "GuestInstall.h"
 #import "KernEngine.h"
 #import "TXBackgroundKeepAlive.h"
+#import "TXJITManager.h"
 #import "TXLocalhostProxy.h"
 #import "TXLog.h"
 #import "TXTheme.h"
@@ -16,6 +17,13 @@
 // The background keep-alive switch, synced on every appearance so
 // it shows off when the location authorization denied it.
 @property (nonatomic, strong) UISwitch *backgroundSwitch;
+// The JIT switch and status line, synced on every appearance and
+// whenever the JIT manager posts a status change, so the discovery
+// progress shows live while the view is on screen. The token row
+// only appears when the discovered Swipt server asks for one.
+@property (nonatomic, strong) UISwitch *jitSwitch;
+@property (nonatomic, strong) UILabel *jitStatusLabel;
+@property (nonatomic, strong) UIButton *jitTokenButton;
 // Refreshes the Localhost card's port list while the view is on
 // screen, so auto-detected ports appear and leave as guest
 // services start and stop.
@@ -28,6 +36,11 @@
     [super viewWillAppear:animated];
     [self refreshLocalhostPorts];
     self.backgroundSwitch.on = [[TXBackgroundKeepAlive shared] isEnabled];
+    [self syncJITCard];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(syncJITCard)
+                                                 name:TXJITManagerStatusDidChangeNotification
+                                               object:nil];
     __weak TXAboutViewController *weakSelf = self;
     self.localhostRefreshTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
                                                                  repeats:YES
@@ -38,6 +51,9 @@
 
 - (void)viewDidDisappear:(BOOL)animated {
     [super viewDidDisappear:animated];
+    [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                    name:TXJITManagerStatusDidChangeNotification
+                                                  object:nil];
     [self.localhostRefreshTimer invalidate];
     self.localhostRefreshTimer = nil;
 }
@@ -124,11 +140,16 @@
     // a low-precision location session (see TXBackgroundKeepAlive).
     UIView *backgroundCard = [self backgroundCard];
 
+    // JIT: native JIT for the guest via the Swipt helper app
+    // (see TXJITManager). The Swipt app must be installed and
+    // running on this phone; without it the status stays Not Found.
+    UIView *jitCard = [self jitCard];
+
     UILabel *licenseNote = [self noteLabelWithText:
         @"TermX is free software under the GPL-2.0-or-later, built on the Kernarium Linux runtime."];
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        titleLabel, taglineLabel, appCard, imageCard, runtimeCard, localhostCard, backgroundCard, diagnosticsCard, licenseNote]];
+        titleLabel, taglineLabel, appCard, imageCard, runtimeCard, localhostCard, backgroundCard, jitCard, diagnosticsCard, licenseNote]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 20;
     [stack setCustomSpacing:8 afterView:titleLabel];
@@ -472,6 +493,137 @@
 
 - (void)backgroundSwitchChanged:(UISwitch *)sender {
     [[TXBackgroundKeepAlive shared] setEnabled:sender.isOn];
+}
+
+// JIT card: one switch row plus a live status line, styled like the
+// Background card. The switch is the JIT control (TXJITManager):
+// on, TermX looks for the Swipt helper app on this phone and asks
+// it to enable native JIT, so JIT compilers inside the guest
+// (Node.js V8, JVM, ...) run at full speed instead of JITless.
+// Without the separate Swipt app installed and running, the status
+// stays Not Found. The token row only appears when the discovered
+// server asks for a token.
+- (UIView *)jitCard {
+    UIView *card = [[UIView alloc] init];
+    card.backgroundColor = TXThemeCardBackground();
+    card.layer.cornerRadius = TXThemeCornerRadiusCard;
+    card.layer.masksToBounds = YES;
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *titleLabel = [[UILabel alloc] init];
+    titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    titleLabel.textColor = TXThemeAccentColor();
+    titleLabel.text = [@"JIT" uppercaseString];
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *keyLabel = [[UILabel alloc] init];
+    keyLabel.font = [UIFont systemFontOfSize:15];
+    keyLabel.textColor = TXThemeSecondaryTextColor();
+    keyLabel.text = @"JIT";
+    keyLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *detailLabel = [[UILabel alloc] init];
+    detailLabel.font = [UIFont systemFontOfSize:13];
+    detailLabel.textColor = TXThemeSecondaryTextColor();
+    detailLabel.text = @"Enables native JIT for the guest (faster Node.js and other JIT compilers) via the Swipt helper app. Swipt must be installed and running on this phone.";
+    detailLabel.numberOfLines = 0;
+    detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIStackView *labels = [[UIStackView alloc] initWithArrangedSubviews:@[keyLabel, detailLabel]];
+    labels.axis = UILayoutConstraintAxisVertical;
+    labels.spacing = 2;
+    labels.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UISwitch *jitSwitch = [[UISwitch alloc] init];
+    jitSwitch.on = [[TXJITManager shared] jitEnabled];
+    jitSwitch.onTintColor = TXThemeAccentColor();
+    jitSwitch.accessibilityLabel = @"JIT";
+    jitSwitch.accessibilityHint = @"Enables native JIT for the guest via the Swipt helper app.";
+    [jitSwitch addTarget:self action:@selector(jitSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    jitSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    self.jitSwitch = jitSwitch;
+
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[labels, jitSwitch]];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.spacing = 12;
+    row.alignment = UIStackViewAlignmentCenter;
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *statusLabel = [[UILabel alloc] init];
+    statusLabel.font = [UIFont systemFontOfSize:13];
+    statusLabel.textColor = TXThemeSecondaryTextColor();
+    statusLabel.text = [[TXJITManager shared] statusText];
+    statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.jitStatusLabel = statusLabel;
+
+    UIButton *tokenButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    tokenButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    tokenButton.titleLabel.font = [UIFont systemFontOfSize:15];
+    [tokenButton setTitleColor:TXThemeSecondaryTextColor() forState:UIControlStateNormal];
+    [tokenButton addTarget:self action:@selector(jitTokenButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    tokenButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.jitTokenButton = tokenButton;
+    [self syncJITCard];
+
+    UIStackView *cardStack = [[UIStackView alloc] initWithArrangedSubviews:@[titleLabel, row, statusLabel, tokenButton]];
+    cardStack.axis = UILayoutConstraintAxisVertical;
+    cardStack.spacing = 12;
+    cardStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:cardStack];
+    [NSLayoutConstraint activateConstraints:@[
+        [cardStack.topAnchor constraintEqualToAnchor:card.topAnchor constant:18],
+        [cardStack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
+        [cardStack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-20],
+        [cardStack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-18],
+    ]];
+    return card;
+}
+
+- (void)jitSwitchChanged:(UISwitch *)sender {
+    [[TXJITManager shared] setJITEnabled:sender.isOn];
+}
+
+- (void)syncJITCard {
+    TXJITManager *jit = [TXJITManager shared];
+    if (self.jitSwitch) self.jitSwitch.on = jit.jitEnabled;
+    if (self.jitStatusLabel) {
+        self.jitStatusLabel.text = [NSString stringWithFormat:@"Status: %@", jit.statusText];
+    }
+    if (self.jitTokenButton) {
+        BOOL showToken = jit.requiresToken || jit.swiptToken.length > 0;
+        self.jitTokenButton.hidden = !showToken;
+        NSString *value = jit.swiptToken.length > 0 ? @"•••" : @"Required";
+        [self.jitTokenButton setTitle:[NSString stringWithFormat:@"Swipt Token: %@", value]
+                             forState:UIControlStateNormal];
+    }
+}
+
+- (void)jitTokenButtonTapped:(UIButton *)sender {
+    (void)sender;
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Swipt Token"
+                         message:@"Enter the token shown by the Swipt app."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.text = [[TXJITManager shared] swiptToken];
+        textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        textField.autocorrectionType = UITextAutocorrectionTypeNo;
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    __weak TXAboutViewController *weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        (void)action;
+        NSString *token = alert.textFields.firstObject.text ?: @"";
+        [[TXJITManager shared] setSwiptToken:
+            [token stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceAndNewlineCharacterSet]]];
+        [weakSelf syncJITCard];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 // Diagnostics card: one switch row, styled like the other cards.

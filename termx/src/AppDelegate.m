@@ -6,6 +6,7 @@
 #import "GuestInstall.h"
 #import "KernEngine.h"
 #import "TXBackgroundKeepAlive.h"
+#import "TXJITManager.h"
 
 @implementation AppDelegate
 
@@ -20,6 +21,9 @@
     // The background keep-alive restores its persisted switch here,
     // so it runs even when the About screen is never opened.
     [[TXBackgroundKeepAlive shared] reconcile];
+    // The JIT manager starts Swipt discovery here, so the server is
+    // found and JIT enabled without opening About.
+    [[TXJITManager shared] refresh];
     return YES;
 }
 
