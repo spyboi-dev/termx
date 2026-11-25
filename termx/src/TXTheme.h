@@ -62,7 +62,16 @@ static inline UIColor *TXThemePillBackground(void) {
 
 // Idle keyboard key background.
 static inline UIColor *TXThemeKeyBackground(void) {
-    return [UIColor colorWithWhite:0.30 alpha:1.0];
+    return [UIColor colorWithWhite:0.22 alpha:1.0];
+}
+
+// Keyboard key border: the thin light outline around each key.
+// The mockup's keys read as keys because of this edge, not just
+// the fill — a flat fill with no border blends into the black
+// toolbar. White at 0.25 alpha, so it reads on the dark fill
+// without glowing.
+static inline UIColor *TXThemeKeyBorderColor(void) {
+    return [UIColor colorWithWhite:1.0 alpha:0.25];
 }
 
 // Dimmed elements: pending row icon border and title, header dot.
@@ -77,7 +86,7 @@ static inline UIColor *TXThemeReasonTextColor(void) {
 
 // Corner radii: one token per radius. The 5 pt status dot is not
 // tokenized: it is half of the 10 pt dot, a derived value.
-static const CGFloat TXThemeCornerRadiusKey = 6.0;
+static const CGFloat TXThemeCornerRadiusKey = 9.0;
 static const CGFloat TXThemeCornerRadiusPill = 8.0;
 static const CGFloat TXThemeCornerRadiusButton = 12.0;
 static const CGFloat TXThemeCornerRadiusLog = 18.0;

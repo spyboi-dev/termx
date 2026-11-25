@@ -104,6 +104,18 @@ the SystemChromeMaterial blur, so the whole screen reads as one
 black surface. Arrow glyphs, the paste icon, and the
 hide-keyboard glyph are 18 pt to fill the taller keys.
 
+### Mockup key design and Font Awesome clipboard
+
+The keys now follow the user's mockup: a darker fill (white
+0.22, down from 0.30), a thin light border around each key
+(white 0.25 alpha) so the key reads against the black toolbar,
+a 9 pt corner radius, and white sans-serif labels instead of
+monospaced. The Paste button uses the Font Awesome solid
+clipboard icon (FAClipboard PNGs, rendered from the Font Awesome
+Free 6.7.2 clipboard SVG, CC BY 4.0), not the SF Symbol
+doc.on.clipboard. The icon's holes are transparent, so the key's
+grey shows through them.
+
 ### UI bug-fix round: leaks, stale flags, and polish
 
 Three fresh audits of the 81d40f4 build found one real leak, one

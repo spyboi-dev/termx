@@ -499,11 +499,20 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // "Paste" VoiceOver label, then the title is swapped for the
     // SF Symbol so it takes one key's width like everything else.
     // Same action, same chunked paste, same haptics as before.
+    // Paste is the Font Awesome solid clipboard icon, at the
+    // user's direction — not the SF Symbol doc.on.clipboard, which
+    // is a document with a badge. The icon is a bundled PNG
+    // (FAClipboard, rendered from the Font Awesome Free 6.7.2
+    // clipboard SVG, CC BY 4.0), white on transparent, so it
+    // renders as a template in the button's white tint. The
+    // icon's holes (the clip ring and the text line) are
+    // transparent, so the key's grey shows through them, the way
+    // the Font Awesome icon is drawn.
     UIButton *pasteButton = [self keyButton:@"paste"];
     [pasteButton setTitle:nil forState:UIControlStateNormal];
-    [pasteButton setImage:[UIImage systemImageNamed:@"doc.on.clipboard"
-                                   withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightMedium]]
-                 forState:UIControlStateNormal];
+    UIImage *pasteImage = [[UIImage imageNamed:@"FAClipboard"]
+        imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    [pasteButton setImage:pasteImage forState:UIControlStateNormal];
     pasteButton.tintColor = [UIColor whiteColor];
     pasteButton.accessibilityHint = @"Pastes the clipboard into the terminal.";
     [pasteButton addTarget:self action:@selector(onPaste) forControlEvents:UIControlEventTouchUpInside];
@@ -520,7 +529,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [self addArrowKey:primary title:@"↑" tag:1];
     [self addArrowKey:primary title:@"↓" tag:2];
     UIButton *kbd = [self keyButton:@"⌨"];
-    kbd.titleLabel.font = [UIFont monospacedSystemFontOfSize:18 weight:UIFontWeightMedium];
+    kbd.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightMedium];
     kbd.accessibilityHint = @"Hides the keyboard. Tap the terminal to show it again.";
     [kbd addTarget:self action:@selector(onKeyboard) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:kbd];
@@ -861,7 +870,7 @@ static UIColor *TXKeyBackground(BOOL on, BOOL pressed) {
         // Pressed ON is a lighter teal, so the press still reads on
         // a latched toggle; pressed OFF is the same light grey as before.
         return on ? [UIColor colorWithRed:0.35 green:0.80 blue:0.72 alpha:1.0]
-                  : [UIColor colorWithWhite:0.45 alpha:1.0];
+                  : [UIColor colorWithWhite:0.35 alpha:1.0];
     }
     // ON is the app accent teal (#2AB3A3, TXThemeAccentColor), not
     // blue: a blue toggle on a teal-accent app reads as a different
@@ -899,18 +908,22 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     b.translatesAutoresizingMaskIntoConstraints = NO;
     [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightMedium];
-    // Match the iOS keyboard keys: a medium grey key with white text
-    // and a rounded corner, not the old dark key with blue text. The
-    // keyboard letter keys are a mid grey over a near-black board;
-    // white 0.30 lands on the same grey, and white text reads as a
-    // key label instead of a link. The corner radius matches the
-    // keyboard's, and the small shadow below the key gives the same
-    // depth the keyboard keys have.
+    b.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    // The key design from the user's mockup: a dark grey key with
+    // white sans-serif text and a thin light border, not the old
+    // flat mid-grey key with monospaced text. The border is what
+    // makes the key read as a key against the black toolbar — a
+    // flat fill with no edge blends into the black. The fill is
+    // white 0.22, darker than the old 0.30, and the corner radius
+    // is 9 pt, rounder than the old 6 pt, so the keys match the
+    // mockup's pill-like roundness. The small shadow below the key
+    // gives the same depth the mockup's keys have.
     b.backgroundColor = TXKeyBackground(NO, NO);
     [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     [b setTitleColor:[UIColor whiteColor] forState:UIControlStateSelected];
     b.layer.cornerRadius = TXThemeCornerRadiusKey;
+    b.layer.borderWidth = 1;
+    b.layer.borderColor = TXThemeKeyBorderColor().CGColor;
     b.layer.shadowColor = [UIColor blackColor].CGColor;
     b.layer.shadowOffset = CGSizeMake(0, 1);
     b.layer.shadowRadius = 1;
@@ -918,15 +931,15 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     // Slim horizontal insets: the primary row holds eleven equal
     // keys at 6 pt spacing, and wider insets would overflow a 430 pt
     // screen. The titles shrink to fit instead of clipping: with
-    // equal widths a four-letter label ("ctrl", "more", ~33.2 pt at
-    // 14 pt) is wider than its key, so the title scales down rather
-    // than truncating. 1 pt insets and a 0.6 floor keep it fitting
-    // even on a 320 pt screen: each key is ~22.9 pt, leaving ~20.9 pt
-    // for the label, and 33.2 pt at 0.6 scale is ~19.9 pt. The
-    // three-letter keys stay at full size.
+    // equal widths the widest four-letter label ("more", ~36 pt at
+    // 16 pt sans-serif) is wider than its key, so the title scales
+    // down rather than truncating. 1 pt insets and a 0.5 floor keep
+    // it fitting even on a 320 pt screen: each key is ~22.9 pt,
+    // leaving ~20.9 pt for the label, and 36 pt at 0.5 scale is
+    // 18 pt. The three-letter keys stay at full size.
     b.contentEdgeInsets = UIEdgeInsetsMake(6, 1, 6, 1);
     b.titleLabel.adjustsFontSizeToFitWidth = YES;
-    b.titleLabel.minimumScaleFactor = 0.6;
+    b.titleLabel.minimumScaleFactor = 0.5;
     // Pressed state: the key lightens while the finger is down, on
     // top of the default title dim. TouchDown fires before the
     // key's own action, TouchUp restores the colour before the
@@ -1046,7 +1059,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 - (void)addArrowKey:(UIStackView *)row title:(NSString *)title tag:(NSInteger)tag {
     UIButton *b = [self keyButton:title];
     b.tag = tag;
-    b.titleLabel.font = [UIFont monospacedSystemFontOfSize:18 weight:UIFontWeightMedium];
+    b.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightMedium];
     b.contentEdgeInsets = UIEdgeInsetsMake(6, 5, 6, 5);
     [b addTarget:self action:@selector(arrowTouchDown:) forControlEvents:UIControlEventTouchDown];
     [b addTarget:self action:@selector(arrowTouchUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
