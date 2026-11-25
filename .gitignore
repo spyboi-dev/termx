@@ -25,3 +25,7 @@ termx/CRASH-*.txt
 *.ipa
 *.dSYM
 .DS_Store
+# The localhost bridge binary (a build output from
+# rootfs-build/tx-vsock-bridge.c; rebuild with
+# aarch64-linux-gnu-gcc -static -O2 -o tx-vsock-bridge tx-vsock-bridge.c).
+rootfs-build/tx-vsock-bridge

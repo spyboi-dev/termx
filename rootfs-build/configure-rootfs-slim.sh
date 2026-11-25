@@ -206,6 +206,39 @@ cat > /etc/resolv.conf <<'EOF'
 nameserver 10.0.2.3
 EOF
 
+echo "== localhost bridge: vsock to guest loopback (native localhost)"
+# A service on guest 127.0.0.1:PORT is not reachable from the iPhone:
+# the guest sits behind slirp NAT, outbound only, and the runtime's
+# public API has no port-forward call. The runtime does expose a
+# vsock stream to the guest, so tx-vsock-bridge listens on vsock
+# 5999; the TermX app listens on the iPhone's 127.0.0.1:PORT and
+# proxies each connection here, and the bridge forwards it to guest
+# 127.0.0.1:PORT. The result is that a guest localhost service
+# answers at the iPhone's localhost, the way it would on a native
+# OS — for any port, any tool, any agent. The binary is staged at
+# /root/tx-vsock-bridge by the build (see build-rootfs-slim.sh); it
+# is a static aarch64 binary built from rootfs-build/tx-vsock-bridge.c.
+cp /root/tx-vsock-bridge /usr/local/bin/tx-vsock-bridge
+chmod 755 /usr/local/bin/tx-vsock-bridge
+cat > /etc/systemd/system/tx-vsock-bridge.service <<'EOF'
+[Unit]
+Description=TermX localhost bridge (vsock to guest loopback)
+Documentation=https://github.com/spyboi-dev/termx
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tx-vsock-bridge
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 644 /etc/systemd/system/tx-vsock-bridge.service
+systemctl enable tx-vsock-bridge.service
+
 echo "== console: hide kernel suspend/resume chatter"
 mkdir -p /etc/sysctl.d
 cat > /etc/sysctl.d/99-termx.conf <<'EOF'
@@ -228,7 +261,8 @@ You are user "termx" (passwordless sudo). apt works, fastfetch is
 installed (try "fastfetch"), and Docker runs too once installed:
 "sudo apt install docker.io", then "sudo docker run hello-world".
 Pinch to zoom the terminal; your files and installs live on the
-data disk and survive reboots.
+data disk and survive reboots. A service on guest localhost
+(127.0.0.1) is reachable from the iPhone at the same address.
 EOF
 
 echo "== pip: allow system-wide installs like TermX (PEP 668 off)"
@@ -329,13 +363,14 @@ echo "== config file permissions (644; sudoers stays 440)"
 # needs it cannot read it (see the 2026-11-23 660 breakage above).
 chmod 644 /etc/hosts /etc/timezone \
   /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf \
+  /etc/systemd/system/tx-vsock-bridge.service \
   /etc/systemd/network/10-eth0.network /etc/resolv.conf \
   /etc/sysctl.d/99-termx.conf /etc/fstab /etc/motd \
   /etc/apt/sources.list /etc/hostname /etc/pip.conf \
   /home/termx/.config/fastfetch/config.jsonc
 
 echo "== verify the units parse"
-systemd-analyze verify default.target multi-user.target serial-getty@ttyS0.service systemd-networkd.service systemd-resolved.service || echo "systemd-analyze verify reported issues (see above)"
+systemd-analyze verify default.target multi-user.target serial-getty@ttyS0.service systemd-networkd.service systemd-resolved.service tx-vsock-bridge.service || echo "systemd-analyze verify reported issues (see above)"
 
 echo "== versions"
 /usr/lib/systemd/systemd --version | head -1  # no /usr/bin/systemd in Debian

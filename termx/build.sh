@@ -79,7 +79,7 @@ FWSHA=$(sha256sum Frameworks/KRuntime_6_18_4K.framework/KRuntime_6_18_4K | cut -
 CFLAGS="-target arm64-apple-ios$MIN -isysroot $SDK -miphoneos-version-min=$MIN -fobjc-arc -O2 -Wno-deprecated-declarations -DTERMX_BUILD_COMMIT=\"$COMMIT\" -DTERMX_FRAMEWORK_SHA256=\"$FWSHA\" -I$SRC -F$SDK/System/Library/SubFrameworks -F$SDK/System/Library/PrivateFrameworks"
 
 echo "== compile"
-for f in main AppDelegate TerminalViewController KernEngine GuestInstall TXCrashLog TXLog TXLogViewController TXStartupViewController TXAboutViewController TXGuestFlow; do
+for f in main AppDelegate TerminalViewController KernEngine GuestInstall TXCrashLog TXLog TXLogViewController TXStartupViewController TXAboutViewController TXGuestFlow TXLocalhostProxy; do
   echo "   $f.m"
   $CLANG $CFLAGS -c "$SRC/$f.m" -o "$OUT/$f.o"
 done
@@ -98,7 +98,7 @@ ld64.lld-18 -arch arm64 -platform_version ios $MIN 26.5 \
   "$OUT"/main.o "$OUT"/AppDelegate.o "$OUT"/TerminalViewController.o \
   "$OUT"/KernEngine.o "$OUT"/GuestInstall.o "$OUT"/TXCrashLog.o \
   "$OUT"/TXLog.o "$OUT"/TXLogViewController.o "$OUT"/TXStartupViewController.o \
-  "$OUT"/TXAboutViewController.o "$OUT"/TXGuestFlow.o \
+  "$OUT"/TXAboutViewController.o "$OUT"/TXGuestFlow.o "$OUT"/TXLocalhostProxy.o \
   "$OUT"/vt.o \
   -framework UIKit -framework Foundation -framework CoreGraphics \
   -framework QuartzCore -framework Metal -framework MetalKit \

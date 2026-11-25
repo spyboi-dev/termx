@@ -141,6 +141,11 @@ echo "== second stage done"
 echo "== configure inside chroot"
 cp configure-rootfs-slim.sh "$ROOTFS/root/configure-rootfs-slim.sh"
 chmod +x "$ROOTFS/root/configure-rootfs-slim.sh"
+# Stage the localhost bridge binary for the configure script, which
+# installs it at /usr/local/bin/tx-vsock-bridge (see
+# configure-rootfs-slim.sh, "localhost bridge"). Built from
+# rootfs-build/tx-vsock-bridge.c; rebuild it first if the source changed.
+cp tx-vsock-bridge "$ROOTFS/root/tx-vsock-bridge"
 # The chroot's apt resolves the egress proxy hostname to a dead IPv4
 # backend (apt ignores the IPv6-only /etc/hosts pin: its resolver path is
 # IPv4-only). Give the chroot the proxy as an IPv6 literal, which needs no

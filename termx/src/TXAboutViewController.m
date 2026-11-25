@@ -3,10 +3,15 @@
 #import "TXAboutViewController.h"
 #import "GuestInstall.h"
 #import "KernEngine.h"
+#import "TXLocalhostProxy.h"
 #import "TXLog.h"
 #import "TXTheme.h"
 
 @interface TXAboutViewController ()
+// The ports list inside the Localhost card, rebuilt when the user
+// adds or removes a port. The add field stays fixed below it.
+@property (nonatomic, strong) UIStackView *localhostPortsStack;
+@property (nonatomic, strong) UITextField *localhostPortField;
 @end
 
 @implementation TXAboutViewController
@@ -85,11 +90,15 @@
     // no restart (see TXLogDebug).
     UIView *diagnosticsCard = [self diagnosticsCard];
 
+    // Localhost: the guest's 127.0.0.1 services, reachable from the
+    // iPhone at the same address while the guest is running.
+    UIView *localhostCard = [self localhostCard];
+
     UILabel *licenseNote = [self noteLabelWithText:
         @"TermX is free software under the GPL-2.0-or-later, built on the Kernarium Linux runtime."];
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        titleLabel, taglineLabel, appCard, imageCard, runtimeCard, diagnosticsCard, licenseNote]];
+        titleLabel, taglineLabel, appCard, imageCard, runtimeCard, localhostCard, diagnosticsCard, licenseNote]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 20;
     [stack setCustomSpacing:8 afterView:titleLabel];
@@ -186,6 +195,145 @@
     row.alignment = UIStackViewAlignmentTop;
     row.translatesAutoresizingMaskIntoConstraints = NO;
     return row;
+}
+
+// Localhost card: the guest's 127.0.0.1 services, reachable from
+// the iPhone at the same address while the guest is running. The
+// port list is the proxy's configured ports (TXLocalhostProxy);
+// tapping a port's Remove takes it out, and the field adds one.
+// Changes take effect at once when the guest is up (the engine
+// restarts the proxy); when it is not up, they apply on the next
+// boot. The card's port rows are rebuilt on every change.
+- (UIView *)localhostCard {
+    UIView *card = [[UIView alloc] init];
+    card.backgroundColor = TXThemeCardBackground();
+    card.layer.cornerRadius = TXThemeCornerRadiusCard;
+    card.layer.masksToBounds = YES;
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *titleLabel = [[UILabel alloc] init];
+    titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    titleLabel.textColor = TXThemeAccentColor();
+    titleLabel.text = [@"Localhost" uppercaseString];
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *detailLabel = [[UILabel alloc] init];
+    detailLabel.font = [UIFont systemFontOfSize:13];
+    detailLabel.textColor = TXThemeSecondaryTextColor();
+    detailLabel.numberOfLines = 0;
+    detailLabel.text = @"A service on guest localhost (127.0.0.1) answers at the iPhone's localhost too, while the guest is running — so any tool or agent's pairing page and web UI just open in Safari.";
+    detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    self.localhostPortsStack = [[UIStackView alloc] init];
+    self.localhostPortsStack.axis = UILayoutConstraintAxisVertical;
+    self.localhostPortsStack.spacing = 0;
+    self.localhostPortsStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [self refreshLocalhostPorts];
+
+    UITextField *field = [[UITextField alloc] init];
+    field.placeholder = @"Port, e.g. 3000";
+    field.keyboardType = UIKeyboardTypeNumberPad;
+    field.font = [UIFont systemFontOfSize:15];
+    field.textColor = [UIColor whiteColor];
+    field.backgroundColor = TXThemeButtonBackground();
+    field.layer.cornerRadius = 8;
+    field.layer.masksToBounds = YES;
+    field.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 0)];
+    field.leftViewMode = UITextFieldViewModeAlways;
+    field.translatesAutoresizingMaskIntoConstraints = NO;
+    [field.heightAnchor constraintEqualToConstant:44].active = YES;
+    self.localhostPortField = field;
+
+    UIButton *addButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [addButton setTitle:@"Add" forState:UIControlStateNormal];
+    addButton.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    [addButton setTitleColor:TXThemeAccentColor() forState:UIControlStateNormal];
+    [addButton addTarget:self action:@selector(localhostAddPort) forControlEvents:UIControlEventTouchUpInside];
+    addButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [addButton setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+
+    UIStackView *addRow = [[UIStackView alloc] initWithArrangedSubviews:@[field, addButton]];
+    addRow.axis = UILayoutConstraintAxisHorizontal;
+    addRow.spacing = 12;
+    addRow.alignment = UIStackViewAlignmentCenter;
+    addRow.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIStackView *cardStack = [[UIStackView alloc] initWithArrangedSubviews:@[
+        titleLabel, detailLabel, self.localhostPortsStack, addRow]];
+    cardStack.axis = UILayoutConstraintAxisVertical;
+    cardStack.spacing = 12;
+    cardStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:cardStack];
+    [NSLayoutConstraint activateConstraints:@[
+        [cardStack.topAnchor constraintEqualToAnchor:card.topAnchor constant:18],
+        [cardStack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
+        [cardStack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-20],
+        [cardStack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-18],
+    ]];
+    return card;
+}
+
+- (void)refreshLocalhostPorts {
+    for (UIView *view in self.localhostPortsStack.arrangedSubviews) {
+        [self.localhostPortsStack removeArrangedSubview:view];
+        [view removeFromSuperview];
+    }
+    NSArray<NSNumber *> *ports = [TXLocalhostProxy configuredPorts];
+    UIView *previousRow = nil;
+    for (NSNumber *port in ports) {
+        UILabel *portLabel = [[UILabel alloc] init];
+        portLabel.font = [UIFont systemFontOfSize:15];
+        portLabel.textColor = [UIColor whiteColor];
+        portLabel.text = [NSString stringWithFormat:@"127.0.0.1:%@", port];
+        portLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+        UIButton *removeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        [removeButton setTitle:@"Remove" forState:UIControlStateNormal];
+        removeButton.titleLabel.font = [UIFont systemFontOfSize:15];
+        [removeButton setTitleColor:TXThemeSecondaryTextColor() forState:UIControlStateNormal];
+        removeButton.tag = [port intValue];
+        [removeButton addTarget:self action:@selector(localhostRemovePort:) forControlEvents:UIControlEventTouchUpInside];
+        removeButton.translatesAutoresizingMaskIntoConstraints = NO;
+
+        UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[portLabel, removeButton]];
+        row.axis = UILayoutConstraintAxisHorizontal;
+        row.spacing = 12;
+        row.alignment = UIStackViewAlignmentCenter;
+        row.translatesAutoresizingMaskIntoConstraints = NO;
+        [self.localhostPortsStack addArrangedSubview:row];
+        if (previousRow) {
+            UIView *sep = [[UIView alloc] init];
+            sep.backgroundColor = TXThemeSeparatorColor();
+            sep.translatesAutoresizingMaskIntoConstraints = NO;
+            [self.localhostPortsStack addArrangedSubview:sep];
+            [sep.heightAnchor constraintEqualToConstant:1].active = YES;
+        }
+        previousRow = row;
+    }
+}
+
+- (void)localhostAddPort {
+    NSInteger port = [self.localhostPortField.text integerValue];
+    self.localhostPortField.text = @"";
+    [self.localhostPortField resignFirstResponder];
+    if (port < 1 || port > 65535) return;
+    NSMutableArray<NSNumber *> *ports = [[TXLocalhostProxy configuredPorts] mutableCopy];
+    if (![ports containsObject:@(port)]) {
+        [ports addObject:@(port)];
+        [TXLocalhostProxy setConfiguredPorts:ports];
+        [[KernEngine shared] restartLocalhostProxy];
+    }
+    self.localhostPortField.text = @"";
+    [self.localhostPortField resignFirstResponder];
+    [self refreshLocalhostPorts];
+}
+
+- (void)localhostRemovePort:(UIButton *)sender {
+    NSMutableArray<NSNumber *> *ports = [[TXLocalhostProxy configuredPorts] mutableCopy];
+    [ports removeObject:@(sender.tag)];
+    [TXLocalhostProxy setConfiguredPorts:ports];
+    [[KernEngine shared] restartLocalhostProxy];
+    [self refreshLocalhostPorts];
 }
 
 // Diagnostics card: one switch row, styled like the other cards.

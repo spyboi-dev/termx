@@ -116,6 +116,38 @@ Free 6.7.2 clipboard SVG, CC BY 4.0), not the SF Symbol
 doc.on.clipboard. The icon's holes are transparent, so the key's
 grey shows through them.
 
+### Native localhost: guest 127.0.0.1 reachable from the iPhone
+
+A service on guest localhost was not reachable from the iPhone:
+the guest sits behind slirp NAT, outbound only, and the runtime's
+public API has no port-forward call, so a pairing URL like
+http://127.0.0.1:3773 opened in Safari went nowhere. The runtime
+does expose a vsock stream to the guest, so TermX now proxies
+localhost over vsock: the app listens on the iPhone's 127.0.0.1
+for each configured port and forwards each connection to the
+guest bridge, which forwards it to guest 127.0.0.1. A guest
+localhost service answers at the iPhone's localhost, the way it
+would on a native OS — for any port, any tool, any agent.
+
+- Guest bridge `tx-vsock-bridge` (static aarch64, rootfs-build):
+  listens on vsock 5999, reads the target TCP port from the first
+  two bytes of each stream, connects to guest 127.0.0.1, and
+  shuttles both ways with clean half-close handling. Runs as a
+  systemd service from boot (image fix7). Verified end to end on
+  the VM (TCP test variant): byte-exact at 1 MB, clean EOF on a
+  refused port, five concurrent connections.
+- App proxy `TXLocalhostProxy`: listeners on 127.0.0.1, vsock
+  connect with a retry for the bridge's boot race, clean close
+  (drain, so a refused connection is an EOF, not a reset). Runs
+  only while the guest is up, so a stopped guest reads as a clean
+  refused connection in Safari.
+- About screen gains a Localhost card: the forwarded ports, with
+  add and remove. Defaults are 3000, 3773, 4096, 5000, 8000, 8080,
+  8888; changes take effect at once while the guest is up.
+- Guest image fix7 (rootfs-20261125-slim-fix7) carries the bridge
+  and its service; the motd notes the new behaviour. Phones on
+  fix6 are offered fix7 as an Update.
+
 ### UI bug-fix round: leaks, stale flags, and polish
 
 Three fresh audits of the 81d40f4 build found one real leak, one

@@ -3,6 +3,7 @@
 #import "KernariumRuntime.h"
 #import "GuestInstall.h"
 #import "TXConfig.h"
+#import "TXLocalhostProxy.h"
 #import "TXLog.h"
 #import <CommonCrypto/CommonDigest.h>
 #import <dlfcn.h>
@@ -140,6 +141,10 @@ static const uint64_t kDefaultDataDiskGiB = 2;
 @property (nonatomic, readwrite) BOOL lastSessionCrashed;
 @property (nonatomic, readwrite) int64_t downloadReceived;
 @property (nonatomic, readwrite) int64_t downloadExpected;
+// The localhost proxy (guest 127.0.0.1 reachable from the iPhone's
+// 127.0.0.1). Owned here, started when the guest comes up and
+// stopped when it goes down (see setState:).
+@property (nonatomic, strong) TXLocalhostProxy *localhostProxy;
 // Console output buffered since boot for the terminal's replay (see
 // bufferedConsoleOutput). Appended on the runtime thread, read on
 // the main thread, so every access is under @synchronized(self).
@@ -767,9 +772,20 @@ static BOOL TXPathUsableOnKernelCommandLine(NSString* path) {
                  state == TermXStateSuspended);
     if (isUp && !wasUp) {
         [self setMemorySamplerIntervalMs:TXConfigSamplerIntervalRunningMs];
+        // The guest is up, so its localhost services are reachable:
+        // start the proxy that answers the iPhone's 127.0.0.1 for
+        // each configured port (see TXLocalhostProxy). It needs the
+        // loaded runtime API for the vsock stream to the guest.
+        if (_api) {
+            if (!self.localhostProxy) self.localhostProxy = [[TXLocalhostProxy alloc] init];
+            [self.localhostProxy startWithAPI:_api];
+        }
     } else if (state == TermXStateStopped || state == TermXStateFailed ||
                state == TermXStateIdle || state == TermXStateReady) {
         [self stopMemorySampler];
+        // The guest is off: nothing listens on the iPhone's
+        // localhost, so a browser gets a clean refused connection.
+        [self.localhostProxy stop];
     }
     [[NSNotificationCenter defaultCenter] postNotificationName:kTermXStateChanged object:nil];
     id<KernEngineDelegate> delegate = self.delegate;
@@ -1772,6 +1788,20 @@ static uint32_t TXComputeGuestMemoryMiB(void) {
         self.statusText = @"Stopping the guest…";
         self.state = TermXStateStopping;
         _api->request_stop();
+    }
+}
+
+- (void)restartLocalhostProxy {
+    // Only the up-states run the proxy; when the guest is not up
+    // there is nothing to restart, and the next boot starts it
+    // with the new list.
+    if (self.state != TermXStateRunning && self.state != TermXStateStopping &&
+        self.state != TermXStateSuspended) {
+        return;
+    }
+    if (_api) {
+        if (!self.localhostProxy) self.localhostProxy = [[TXLocalhostProxy alloc] init];
+        [self.localhostProxy startWithAPI:_api];
     }
 }
 

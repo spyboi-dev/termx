@@ -196,6 +196,12 @@ extern NSString* const kTermXStateChanged;
 - (void)bootOnView:(MTKView*)view;
 - (void)stopGuest;
 
+// Restart the localhost proxy with the currently configured ports
+// (TXLocalhostProxy +configuredPorts). A no-op when the guest is not
+// up: the proxy starts with the new list on the next boot. Called
+// from the About screen after the user adds or removes a port.
+- (void)restartLocalhostProxy;
+
 // End the guest before the process dies (best effort, bounded
 // 3 s): the runtime's request_stop, so run() returns and the
 // session record ends "stopped" instead of "running" + suspended.
