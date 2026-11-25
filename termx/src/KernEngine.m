@@ -2,6 +2,7 @@
 #import "KernEngine.h"
 #import "KernariumRuntime.h"
 #import "GuestInstall.h"
+#import "TXBackgroundKeepAlive.h"
 #import "TXConfig.h"
 #import "TXLocalhostProxy.h"
 #import "TXLog.h"
@@ -1023,6 +1024,18 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
 // words. A future reader tempted to "fix" backgrounding by adding a
 // mode should re-read this first.
 //
+// Opt-in exception (TXBackgroundKeepAlive): the About screen has a
+// "Keep running in background" switch, off by default. When it is
+// on and the location session is actually running with Always
+// authorization, enterBackground returns early and the guest keeps
+// running. That is the point of the switch, and the user asked for
+// it. It is the only background mode the app declares
+// (UIBackgroundModes location), and the session is 3 km accuracy
+// with the distance filter at maximum, so no GPS fix is ever taken
+// and the location itself is never read. When the switch is off, or
+// the authorization is only WhenInUse, the suspend path below is
+// unchanged.
+//
 // The edges: a boot interrupted by backgrounding fails cleanly and
 // retries on the return (see below); a download survives on its own
 // background URL session; a force-quit never calls
@@ -1049,6 +1062,15 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
     // survives on its own background session, a stop in flight ends
     // run() on its own, and a suspended guest is already settled.
     if (!_api || !_running) return;
+    // Background keep-alive (opt-in, TXBackgroundKeepAlive): when
+    // the location session is running with Always authorization,
+    // iOS keeps the app alive, so the guest keeps running and
+    // there is nothing to quiesce — including a boot in flight,
+    // which can now finish instead of being failed below. The
+    // foreground resume is a no-op when the guest never quiesced
+    // (see enterForeground). When the session is not running (off,
+    // or only WhenInUse), the suspend path below runs as before.
+    if ([[TXBackgroundKeepAlive shared] isKeepingAlive]) return;
     if (self.state == TermXStateBooting) {
         // Fail the partial boot cleanly: request_stop ends run(),
         // the state goes Failed with a retryable reason, and the

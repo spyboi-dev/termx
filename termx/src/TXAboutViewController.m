@@ -3,6 +3,7 @@
 #import "TXAboutViewController.h"
 #import "GuestInstall.h"
 #import "KernEngine.h"
+#import "TXBackgroundKeepAlive.h"
 #import "TXLocalhostProxy.h"
 #import "TXLog.h"
 #import "TXTheme.h"
@@ -12,6 +13,9 @@
 // adds or removes a port. The add field stays fixed below it.
 @property (nonatomic, strong) UIStackView *localhostPortsStack;
 @property (nonatomic, strong) UITextField *localhostPortField;
+// The background keep-alive switch, synced on every appearance so
+// it shows off when the location authorization denied it.
+@property (nonatomic, strong) UISwitch *backgroundSwitch;
 // Refreshes the Localhost card's port list while the view is on
 // screen, so auto-detected ports appear and leave as guest
 // services start and stop.
@@ -23,6 +27,7 @@
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self refreshLocalhostPorts];
+    self.backgroundSwitch.on = [[TXBackgroundKeepAlive shared] isEnabled];
     __weak TXAboutViewController *weakSelf = self;
     self.localhostRefreshTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
                                                                  repeats:YES
@@ -115,11 +120,15 @@
     // iPhone at the same address while the guest is running.
     UIView *localhostCard = [self localhostCard];
 
+    // Background: keep the guest running when the app is left, with
+    // a low-precision location session (see TXBackgroundKeepAlive).
+    UIView *backgroundCard = [self backgroundCard];
+
     UILabel *licenseNote = [self noteLabelWithText:
         @"TermX is free software under the GPL-2.0-or-later, built on the Kernarium Linux runtime."];
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        titleLabel, taglineLabel, appCard, imageCard, runtimeCard, localhostCard, diagnosticsCard, licenseNote]];
+        titleLabel, taglineLabel, appCard, imageCard, runtimeCard, localhostCard, backgroundCard, diagnosticsCard, licenseNote]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 20;
     [stack setCustomSpacing:8 afterView:titleLabel];
@@ -392,6 +401,77 @@
     [TXLocalhostProxy setConfiguredPorts:ports];
     [[KernEngine shared] restartLocalhostProxy];
     [self refreshLocalhostPorts];
+}
+
+// Background card: one switch row, styled like the Diagnostics
+// card. The switch is the keep-alive control
+// (TXBackgroundKeepAlive): on, the guest keeps running when the app
+// is left, with a low-precision location session. It only keeps the
+// guest running with Location set to Always; with WhenInUse the
+// guest still suspends, and with location denied the switch turns
+// itself off (synced in viewWillAppear).
+- (UIView *)backgroundCard {
+    UIView *card = [[UIView alloc] init];
+    card.backgroundColor = TXThemeCardBackground();
+    card.layer.cornerRadius = TXThemeCornerRadiusCard;
+    card.layer.masksToBounds = YES;
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *titleLabel = [[UILabel alloc] init];
+    titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    titleLabel.textColor = TXThemeAccentColor();
+    titleLabel.text = [@"Background" uppercaseString];
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *keyLabel = [[UILabel alloc] init];
+    keyLabel.font = [UIFont systemFontOfSize:15];
+    keyLabel.textColor = TXThemeSecondaryTextColor();
+    keyLabel.text = @"Keep running in background";
+    keyLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *detailLabel = [[UILabel alloc] init];
+    detailLabel.font = [UIFont systemFontOfSize:13];
+    detailLabel.textColor = TXThemeSecondaryTextColor();
+    detailLabel.text = @"The guest keeps running when you leave the app, with a low-precision location session (3 km, no GPS fix). Needs Location set to Always in Settings; the location is never stored or shared.";
+    detailLabel.numberOfLines = 0;
+    detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIStackView *labels = [[UIStackView alloc] initWithArrangedSubviews:@[keyLabel, detailLabel]];
+    labels.axis = UILayoutConstraintAxisVertical;
+    labels.spacing = 2;
+    labels.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UISwitch *backgroundSwitch = [[UISwitch alloc] init];
+    backgroundSwitch.on = [[TXBackgroundKeepAlive shared] isEnabled];
+    backgroundSwitch.onTintColor = TXThemeAccentColor();
+    backgroundSwitch.accessibilityLabel = @"Keep running in background";
+    backgroundSwitch.accessibilityHint = @"Keeps the guest running when the app is left, using a low-precision location session.";
+    [backgroundSwitch addTarget:self action:@selector(backgroundSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    backgroundSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    self.backgroundSwitch = backgroundSwitch;
+
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[labels, backgroundSwitch]];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.spacing = 12;
+    row.alignment = UIStackViewAlignmentCenter;
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIStackView *cardStack = [[UIStackView alloc] initWithArrangedSubviews:@[titleLabel, row]];
+    cardStack.axis = UILayoutConstraintAxisVertical;
+    cardStack.spacing = 12;
+    cardStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:cardStack];
+    [NSLayoutConstraint activateConstraints:@[
+        [cardStack.topAnchor constraintEqualToAnchor:card.topAnchor constant:18],
+        [cardStack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
+        [cardStack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-20],
+        [cardStack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-18],
+    ]];
+    return card;
+}
+
+- (void)backgroundSwitchChanged:(UISwitch *)sender {
+    [[TXBackgroundKeepAlive shared] setEnabled:sender.isOn];
 }
 
 // Diagnostics card: one switch row, styled like the other cards.

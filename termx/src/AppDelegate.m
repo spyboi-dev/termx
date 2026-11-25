@@ -5,6 +5,7 @@
 #import "TXLog.h"
 #import "GuestInstall.h"
 #import "KernEngine.h"
+#import "TXBackgroundKeepAlive.h"
 
 @implementation AppDelegate
 
@@ -16,6 +17,9 @@
     // really ready. No control lives on the terminal window at all.
     self.window.rootViewController = [[TXStartupViewController alloc] init];
     [self.window makeKeyAndVisible];
+    // The background keep-alive restores its persisted switch here,
+    // so it runs even when the About screen is never opened.
+    [[TXBackgroundKeepAlive shared] reconcile];
     return YES;
 }
 

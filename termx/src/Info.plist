@@ -64,5 +64,13 @@
 	</array>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+	</array>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>TermX keeps the Linux guest running in the background using low-precision location. Your location is never stored or shared.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>TermX keeps the Linux guest running in the background using low-precision location. Your location is never stored or shared.</string>
 </dict>
 </plist>

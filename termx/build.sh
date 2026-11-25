@@ -76,10 +76,10 @@ COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
 # The runtime framework's SHA-256, baked in the same way, so the
 # About screen can show it without hashing a 53 MB file at runtime.
 FWSHA=$(sha256sum Frameworks/KRuntime_6_18_4K.framework/KRuntime_6_18_4K | cut -d' ' -f1)
-CFLAGS="-target arm64-apple-ios$MIN -isysroot $SDK -miphoneos-version-min=$MIN -fobjc-arc -O2 -Wno-deprecated-declarations -DTERMX_BUILD_COMMIT=\"$COMMIT\" -DTERMX_FRAMEWORK_SHA256=\"$FWSHA\" -I$SRC -F$SDK/System/Library/SubFrameworks -F$SDK/System/Library/PrivateFrameworks"
+CFLAGS="-target arm64-apple-ios$MIN -isysroot $SDK -miphoneos-version-min=$MIN -fobjc-arc -O2 -Wno-deprecated-declarations -DTERMX_BUILD_COMMIT=\"$COMMIT\" -DTERMX_FRAMEWORK_SHA256=\"$FWSHA\" -I$SRC -IFrameworks/Ghostty/include -F$SDK/System/Library/SubFrameworks -F$SDK/System/Library/PrivateFrameworks"
 
 echo "== compile"
-for f in main AppDelegate TerminalViewController KernEngine GuestInstall TXCrashLog TXLog TXLogViewController TXStartupViewController TXAboutViewController TXGuestFlow TXLocalhostProxy; do
+for f in main AppDelegate TerminalViewController KernEngine GuestInstall TXCrashLog TXLog TXLogViewController TXStartupViewController TXAboutViewController TXGuestFlow TXLocalhostProxy TXGhosttyView TXBackgroundKeepAlive; do
   echo "   $f.m"
   $CLANG $CFLAGS -c "$SRC/$f.m" -o "$OUT/$f.o"
 done
@@ -99,9 +99,12 @@ ld64.lld-18 -arch arm64 -platform_version ios $MIN 26.5 \
   "$OUT"/KernEngine.o "$OUT"/GuestInstall.o "$OUT"/TXCrashLog.o \
   "$OUT"/TXLog.o "$OUT"/TXLogViewController.o "$OUT"/TXStartupViewController.o \
   "$OUT"/TXAboutViewController.o "$OUT"/TXGuestFlow.o "$OUT"/TXLocalhostProxy.o \
+  "$OUT"/TXGhosttyView.o "$OUT"/TXBackgroundKeepAlive.o \
   "$OUT"/vt.o \
+  Frameworks/Ghostty/libghostty.a \
   -framework UIKit -framework Foundation -framework CoreGraphics \
   -framework QuartzCore -framework Metal -framework MetalKit \
+  -framework CoreText -framework CoreLocation -framework IOSurface \
   -lz -lobjc -lSystem -lc++ \
   -o "$APP/TermX"
 
