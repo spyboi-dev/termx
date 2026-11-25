@@ -202,6 +202,12 @@ extern NSString* const kTermXStateChanged;
 // from the About screen after the user adds or removes a port.
 - (void)restartLocalhostProxy;
 
+// The ports the guest is currently listening on, as last polled by
+// the localhost proxy (the auto-mirror). Empty when the guest is
+// not up or before the first poll. The About screen shows these
+// alongside the configured ports.
+- (NSArray<NSNumber *> *)localhostAutoPorts;
+
 // End the guest before the process dies (best effort, bounded
 // 3 s): the runtime's request_stop, so run() returns and the
 // session record ends "stopped" instead of "running" + suspended.

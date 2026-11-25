@@ -147,6 +147,21 @@ would on a native OS — for any port, any tool, any agent.
 - Guest image fix7 (rootfs-20261125-slim-fix7) carries the bridge
   and its service; the motd notes the new behaviour. Phones on
   fix6 are offered fix7 as an Update.
+- Auto-mirror (image fix8): the configured list is now only the
+  manual override. The proxy polls the bridge once a second for
+  the guest's listening TCP ports (a port-0 control request; the
+  bridge scans LISTEN sockets with sock_diag, falling back to
+  /proc/net/tcp when the kernel lacks the TCP diag handler) and
+  forwards those too, so any tool or agent that starts listening
+  in the guest is reachable at the same 127.0.0.1 port on the
+  iPhone within about a second, with no configuration. When a
+  service stops, its port is dropped again. The bridge also falls
+  back to the slirp guest IP 10.0.2.15 when forwarding, so a
+  service bound to that address only still answers. About shows
+  auto-detected ports as read-only Auto rows, refreshed live.
+  Verified on the VM (TCP test variant): the scan finds
+  127.0.0.1 and 0.0.0.0 listeners, the forward still works, and a
+  refused port still closes cleanly.
 
 ### UI bug-fix round: leaks, stale flags, and polish
 

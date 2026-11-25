@@ -1805,6 +1805,12 @@ static uint32_t TXComputeGuestMemoryMiB(void) {
     }
 }
 
+- (NSArray<NSNumber *> *)localhostAutoPorts {
+    TXLocalhostProxy *proxy = self.localhostProxy;
+    if (!proxy || !proxy.running) return @[];
+    return proxy.autoPorts;
+}
+
 - (NSData*)bufferedConsoleOutput {
     @synchronized (self) {
         return [self.consoleBuffer copy] ?: [NSData data];

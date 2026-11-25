@@ -18,6 +18,17 @@
  * connect fails the bridge closes the vsock stream at once, so the
  * app sees EOF and the iPhone side gets a refused connection.
  *
+ * Port 0 is a control request: list the guest's listening TCP
+ * ports (the auto-mirror). The bridge replies with 2 bytes,
+ * big-endian uint16_t, the count N, then N times 2 bytes,
+ * big-endian uint16_t, one listening port each, sorted, and
+ * closes. The list comes from a netlink sock_diag scan of TCP
+ * LISTEN sockets, filtered to services reachable on guest
+ * localhost: bound to 127.0.0.1, 0.0.0.0, or the slirp guest IP
+ * 10.0.2.15. A forward then tries 127.0.0.1 first and falls back
+ * to 10.0.2.15, so a service bound to the slirp address only
+ * still answers.
+ *
  * Vsock port 5999: one listener handles every forwarded port, so
  * the app never needs a new guest listener per port. The bridge
  * binds VMADDR_CID_ANY, so it answers the host whatever CID the
@@ -37,7 +48,11 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/inet_diag.h>
+#include <linux/netlink.h>
+#include <linux/sock_diag.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -232,8 +247,189 @@ static void tx_close_cleanly(int fd) {
     close(fd);
 }
 
+/* Write all bytes, retrying on EINTR and partial writes. Returns
+ * 0 on success, -1 on failure. */
+static int tx_write_all(int fd, const void *buf, size_t len) {
+    const unsigned char *p = buf;
+    while (len > 0) {
+        ssize_t w = write(fd, p, len);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += (size_t)w;
+        len -= (size_t)w;
+    }
+    return 0;
+}
+
+/* The slirp guest IP, host byte order: 10.0.2.15. A service bound
+ * to it only is not on loopback, so a forward falls back to it. */
+#define TX_SLIRP_GUEST_IP 0x0a00020f
+
+/* --- listening-port scan, /proc/net/tcp fallback ---
+ * sock_diag needs the kernel's TCP diag handler; some kernels
+ * (and the VM's) lack it, and the request then fails with ENOENT.
+ * /proc/net/tcp lists every TCP socket in the namespace and is
+ * always there, so it is the fallback. Format per line:
+ *   sl local_address rem_address st ...
+ * local_address is hex IP:hex port, the IP's octets reversed
+ * (0100007F is 127.0.0.1); st is hex, 0A is TCP_LISTEN. */
+static int tx_scan_proc_net_tcp(uint16_t **ports_out, size_t *count_out,
+                                size_t *cap_out) {
+    FILE *fp = fopen("/proc/net/tcp", "re");
+    if (!fp) return -1;
+    char line[512];
+    /* Skip the header line. */
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return -1;
+    }
+    int found_any = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char addr_hex[16];
+        unsigned int st;
+        /* local_address is field 2, state is field 4. */
+        if (sscanf(line, "%*d: %15s %*s %x", addr_hex, &st) != 2) continue;
+        if (st != TCP_LISTEN) continue;
+        char *colon = strchr(addr_hex, ':');
+        if (!colon) continue;
+        *colon = '\0';
+        unsigned int v = (unsigned int)strtoul(addr_hex, NULL, 16);
+        unsigned int port = (unsigned int)strtoul(colon + 1, NULL, 16);
+        if (port == 0 || port > 65535) continue;
+        /* Octets are reversed in the hex: low byte is the first. */
+        unsigned char o0 = (unsigned char)(v & 0xff);
+        unsigned char o1 = (unsigned char)((v >> 8) & 0xff);
+        unsigned char o2 = (unsigned char)((v >> 16) & 0xff);
+        unsigned char o3 = (unsigned char)((v >> 24) & 0xff);
+        if (!((o0 == 127 && o1 == 0 && o2 == 0 && o3 == 1) ||
+              (o0 == 0 && o1 == 0 && o2 == 0 && o3 == 0) ||
+              (o0 == 10 && o1 == 0 && o2 == 2 && o3 == 15)))
+            continue;
+        found_any = 1;
+        int found = 0;
+        for (size_t i = 0; i < *count_out; i++) {
+            if ((*ports_out)[i] == (uint16_t)port) { found = 1; break; }
+        }
+        if (found) continue;
+        if (*count_out == *cap_out) {
+            size_t ncap = *cap_out ? *cap_out * 2 : 32;
+            uint16_t *np = realloc(*ports_out, ncap * sizeof(*np));
+            if (!np) {
+                fclose(fp);
+                return -1;
+            }
+            *ports_out = np;
+            *cap_out = ncap;
+        }
+        (*ports_out)[(*count_out)++] = (uint16_t)port;
+    }
+    fclose(fp);
+    return found_any ? 0 : -1;
+}
+
+static int tx_port_cmp(const void *a, const void *b) {
+    uint16_t x = *(const uint16_t *)a;
+    uint16_t y = *(const uint16_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* Scan the guest's TCP LISTEN sockets and return the sorted,
+ * deduped list of ports whose service is reachable on guest
+ * localhost: bound to 127.0.0.1, 0.0.0.0 (both answer on
+ * loopback), or the slirp guest IP 10.0.2.15. Tries netlink
+ * sock_diag first, /proc/net/tcp when the kernel lacks the TCP
+ * diag handler. Returns the count, or -1 on failure. The caller
+ * frees *ports_out. */
+static int tx_scan_listening_ports(uint16_t **ports_out) {
+    *ports_out = NULL;
+    uint16_t *ports = NULL;
+    size_t count = 0, cap = 0;
+    /* Netlink sock_diag first. Any failure here (no socket, no
+     * send, an error reply, a short read) falls through to the
+     * /proc/net/tcp fallback below; the netlink path is only a
+     * fast path, never a single point of failure. */
+    int nl = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_SOCK_DIAG);
+    if (nl >= 0) {
+        struct {
+            struct nlmsghdr nlh;
+            struct inet_diag_req_v2 req;
+        } msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.nlh.nlmsg_len = sizeof(msg);
+        msg.nlh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+        msg.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+        msg.req.sdiag_family = AF_INET;
+        msg.req.sdiag_protocol = IPPROTO_TCP;
+        msg.req.idiag_states = 1U << TCP_LISTEN;
+        int result = -1;
+        if (send(nl, &msg, sizeof(msg), 0) >= 0) {
+            uint8_t buf[16384];
+            for (;;) {
+                ssize_t n = recv(nl, buf, sizeof(buf), 0);
+                if (n <= 0) break;
+                for (struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+                     NLMSG_OK(nlh, (unsigned int)n);
+                     nlh = NLMSG_NEXT(nlh, n)) {
+                    if (nlh->nlmsg_type == NLMSG_DONE) {
+                        result = (int)count;
+                        break;
+                    }
+                    if (nlh->nlmsg_type == NLMSG_ERROR) break;
+                    if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(struct inet_diag_msg))) continue;
+                    const struct inet_diag_msg *dm = NLMSG_DATA(nlh);
+                    uint16_t port = ntohs(dm->id.idiag_sport);
+                    if (port == 0) continue;
+                    uint32_t src;
+                    memcpy(&src, dm->id.idiag_src, sizeof(src));
+                    src = ntohl(src);
+                    if (src != 0x7f000001 && src != 0x00000000 &&
+                        src != TX_SLIRP_GUEST_IP)
+                        continue;
+                    int found = 0;
+                    for (size_t i = 0; i < count; i++) {
+                        if (ports[i] == port) { found = 1; break; }
+                    }
+                    if (found) continue;
+                    if (count == cap) {
+                        size_t ncap = cap ? cap * 2 : 32;
+                        uint16_t *np = realloc(ports, ncap * sizeof(*np));
+                        if (!np) { result = -1; break; }
+                        ports = np;
+                        cap = ncap;
+                    }
+                    ports[count++] = port;
+                }
+                if (result >= 0) break;
+                /* NLMSG_ERROR or a short read: stop the dump. */
+                break;
+            }
+        }
+        close(nl);
+        if (result >= 0) {
+            if (count > 1) qsort(ports, count, sizeof(*ports), tx_port_cmp);
+            *ports_out = ports;
+            return (int)count;
+        }
+        /* Netlink failed: fall through to /proc/net/tcp. */
+        free(ports);
+        ports = NULL;
+        count = 0;
+        cap = 0;
+    }
+    if (tx_scan_proc_net_tcp(&ports, &count, &cap) != 0) {
+        free(ports);
+        return -1;
+    }
+    if (count > 1) qsort(ports, count, sizeof(*ports), tx_port_cmp);
+    *ports_out = ports;
+    return (int)count;
+}
+
 /* One proxied connection: read the 2-byte target port, connect to
- * guest localhost, shuttle until both sides close. */
+ * guest localhost, shuttle until both sides close. Port 0 is a
+ * control request: list the guest's listening TCP ports. */
 static void tx_handle(int vsock_fd) {
     unsigned char port_bytes[2];
     size_t got = 0;
@@ -248,7 +444,25 @@ static void tx_handle(int vsock_fd) {
     }
     uint16_t target_port = (uint16_t)((port_bytes[0] << 8) | port_bytes[1]);
     if (target_port == 0) {
-        tx_close_cleanly(vsock_fd);
+        /* Control request: list the guest's listening TCP ports. */
+        uint16_t *ports = NULL;
+        int nports = tx_scan_listening_ports(&ports);
+        if (nports < 0) nports = 0;
+        unsigned char hdr[2] = {
+            (unsigned char)((nports >> 8) & 0xff),
+            (unsigned char)(nports & 0xff),
+        };
+        if (tx_write_all(vsock_fd, hdr, sizeof(hdr)) == 0) {
+            for (int i = 0; i < nports; i++) {
+                unsigned char pb[2] = {
+                    (unsigned char)((ports[i] >> 8) & 0xff),
+                    (unsigned char)(ports[i] & 0xff),
+                };
+                if (tx_write_all(vsock_fd, pb, sizeof(pb)) != 0) break;
+            }
+        }
+        free(ports);
+        close(vsock_fd);
         return;
     }
 
@@ -261,14 +475,19 @@ static void tx_handle(int vsock_fd) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(target_port);
+    /* Loopback first (127.0.0.1 and 0.0.0.0 services), then the
+     * slirp guest IP (a service bound to 10.0.2.15 only). */
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(tcp_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        /* Nothing listens on that guest localhost port: close the
-         * vsock stream cleanly so the app side sees EOF, not RST. */
-        close(tcp_fd);
-        tx_close_cleanly(vsock_fd);
-        return;
+        addr.sin_addr.s_addr = htonl(TX_SLIRP_GUEST_IP);
+        if (connect(tcp_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            /* Nothing listens on that guest port: close the vsock
+             * stream cleanly so the app side sees EOF, not RST. */
+            close(tcp_fd);
+            tx_close_cleanly(vsock_fd);
+            return;
+        }
     }
     tx_shuttle(vsock_fd, tcp_fd);
     close(tcp_fd);

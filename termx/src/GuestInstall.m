@@ -35,7 +35,7 @@
 // refuses an image whose hash does not match.
 //
 // NOTE: these four constants are the SLIM image (release
-// rootfs-20261125-slim-fix7). The local filename kRootfsName is deliberately
+// rootfs-20261125-slim-fix8). The local filename kRootfsName is deliberately
 // UNCHANGED from the old full image: the slim image replaces the full
 // one at the same path. A phone holding an older image does NOT fail:
 // a version difference is an update, not corruption — the installed
@@ -45,10 +45,10 @@
 // reinstall. The persistent data disk (termx-data.ext4) is a separate
 // file and is never touched by the image switch.
 NSString* const kRootfsURL =
-    @"https://github.com/spyboi-dev/termx/releases/download/rootfs-20261125-slim-fix7/termx-debian-trixie-arm64-slim.ext4.gz";
+    @"https://github.com/spyboi-dev/termx/releases/download/rootfs-20261125-slim-fix8/termx-debian-trixie-arm64-slim.ext4.gz";
 NSString* const kRootfsName = @"termx-debian-trixie-arm64.ext4";
-NSString* const kRootfsGzSHA256 = @"8641b51afed63f8f2b3b8d0373ca4266ddf1dc86d2b0be170d1d3818c4308e92";
-NSString* const kRootfsSHA256 = @"c0424ab19a291a5fb7448e184bca8c909a7906718066382f45d19bf93838446a";
+NSString* const kRootfsGzSHA256 = @"d65c4bb2590a627f7a330e98386c6eb12b612af94402a64c9cfda10d73aa9703";
+NSString* const kRootfsSHA256 = @"1c4977042feda4c573356ba8f40f5f1a41e6c6043c67c113c9a8591edbc2daca";
 const long long kRootfsSize = 1073741824; // extracted image size in bytes (exactly 1 GiB)
 
 // Background session: one identifier for the process lifetime, so a

@@ -215,9 +215,13 @@ echo "== localhost bridge: vsock to guest loopback (native localhost)"
 # proxies each connection here, and the bridge forwards it to guest
 # 127.0.0.1:PORT. The result is that a guest localhost service
 # answers at the iPhone's localhost, the way it would on a native
-# OS — for any port, any tool, any agent. The binary is staged at
-# /root/tx-vsock-bridge by the build (see build-rootfs-slim.sh); it
-# is a static aarch64 binary built from rootfs-build/tx-vsock-bridge.c.
+# OS — for any port, any tool, any agent. The bridge also answers
+# a port-0 control request with the guest's listening TCP ports
+# (sock_diag, falling back to /proc/net/tcp), so the app mirrors
+# them automatically with no per-port configuration. The binary is
+# staged at /root/tx-vsock-bridge by the build (see
+# build-rootfs-slim.sh); it is a static aarch64 binary built from
+# rootfs-build/tx-vsock-bridge.c.
 cp /root/tx-vsock-bridge /usr/local/bin/tx-vsock-bridge
 chmod 755 /usr/local/bin/tx-vsock-bridge
 cat > /etc/systemd/system/tx-vsock-bridge.service <<'EOF'

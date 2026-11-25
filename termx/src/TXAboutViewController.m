@@ -12,9 +12,30 @@
 // adds or removes a port. The add field stays fixed below it.
 @property (nonatomic, strong) UIStackView *localhostPortsStack;
 @property (nonatomic, strong) UITextField *localhostPortField;
+// Refreshes the Localhost card's port list while the view is on
+// screen, so auto-detected ports appear and leave as guest
+// services start and stop.
+@property (nonatomic, strong) NSTimer *localhostRefreshTimer;
 @end
 
 @implementation TXAboutViewController
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self refreshLocalhostPorts];
+    __weak TXAboutViewController *weakSelf = self;
+    self.localhostRefreshTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
+                                                                 repeats:YES
+                                                                   block:^(NSTimer *timer) {
+        [weakSelf refreshLocalhostPorts];
+    }];
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    [self.localhostRefreshTimer invalidate];
+    self.localhostRefreshTimer = nil;
+}
 
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -221,7 +242,7 @@
     detailLabel.font = [UIFont systemFontOfSize:13];
     detailLabel.textColor = TXThemeSecondaryTextColor();
     detailLabel.numberOfLines = 0;
-    detailLabel.text = @"A service on guest localhost (127.0.0.1) answers at the iPhone's localhost too, while the guest is running — so any tool or agent's pairing page and web UI just open in Safari.";
+    detailLabel.text = @"A service on guest localhost (127.0.0.1) answers at the iPhone's localhost too, while the guest is running — so any tool or agent's pairing page and web UI just open in Safari. Ports the guest is listening on are forwarded automatically (Auto); the list below is the manual override, always forwarded.";
     detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
     self.localhostPortsStack = [[UIStackView alloc] init];
@@ -279,6 +300,15 @@
         [view removeFromSuperview];
     }
     NSArray<NSNumber *> *ports = [TXLocalhostProxy configuredPorts];
+    // Auto-detected ports the guest is listening on right now,
+    // excluding the configured ones (those already have a row).
+    // These are read-only: they appear when a guest service starts
+    // listening and leave when it stops.
+    NSSet<NSNumber *> *configured = [NSSet setWithArray:ports];
+    NSMutableArray<NSNumber *> *autoPorts = [NSMutableArray array];
+    for (NSNumber *port in [[KernEngine shared] localhostAutoPorts]) {
+        if (![configured containsObject:port]) [autoPorts addObject:port];
+    }
     UIView *previousRow = nil;
     for (NSNumber *port in ports) {
         UILabel *portLabel = [[UILabel alloc] init];
@@ -296,6 +326,34 @@
         removeButton.translatesAutoresizingMaskIntoConstraints = NO;
 
         UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[portLabel, removeButton]];
+        row.axis = UILayoutConstraintAxisHorizontal;
+        row.spacing = 12;
+        row.alignment = UIStackViewAlignmentCenter;
+        row.translatesAutoresizingMaskIntoConstraints = NO;
+        [self.localhostPortsStack addArrangedSubview:row];
+        if (previousRow) {
+            UIView *sep = [[UIView alloc] init];
+            sep.backgroundColor = TXThemeSeparatorColor();
+            sep.translatesAutoresizingMaskIntoConstraints = NO;
+            [self.localhostPortsStack addArrangedSubview:sep];
+            [sep.heightAnchor constraintEqualToConstant:1].active = YES;
+        }
+        previousRow = row;
+    }
+    for (NSNumber *port in autoPorts) {
+        UILabel *portLabel = [[UILabel alloc] init];
+        portLabel.font = [UIFont systemFontOfSize:15];
+        portLabel.textColor = [UIColor whiteColor];
+        portLabel.text = [NSString stringWithFormat:@"127.0.0.1:%@", port];
+        portLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+        UILabel *autoLabel = [[UILabel alloc] init];
+        autoLabel.font = [UIFont systemFontOfSize:13];
+        autoLabel.textColor = TXThemeAccentColor();
+        autoLabel.text = @"Auto";
+        autoLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+        UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[portLabel, autoLabel]];
         row.axis = UILayoutConstraintAxisHorizontal;
         row.spacing = 12;
         row.alignment = UIStackViewAlignmentCenter;
