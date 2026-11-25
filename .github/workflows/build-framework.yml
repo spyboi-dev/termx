@@ -5,8 +5,12 @@
 #
 # Pipeline (adapted from spyboi-dev/opencode-inbuilt's
 # .github/workflows/build-kernarium.yml on its kernarium-engine branch,
-# same pinned Kernarium commit, same order):
-#   1. Clone Kernarium at the pinned commit fbe12ee (no vendoring).
+# same order, but cloning this project's Termx-Kernel fork instead of
+# upstream imxieyi/Kernarium):
+#   1. Clone Termx-Kernel at the pinned commit 57f56a935 (no
+#      vendoring). The fork already carries the TermX patches (the
+#      boot-ramdisk persistent-upper change) and the localhost proxy,
+#      so no patch step runs here.
 #   2. Build the upstream artifacts the runtime needs, in order:
 #      - dependency prefixes: apple-gpu-vulkan-experiment (Mesa/Zink/
 #        KosmicKrisp/libepoxy/virglrenderer), ios-network (GLib/libslirp),
@@ -217,25 +221,14 @@ jobs:
             python3 -m pip install --user mako packaging pyyaml || \
             python3 -m pip install --break-system-packages mako packaging pyyaml
 
-      - name: Clone Kernarium (pinned commit)
+      - name: Clone Termx-Kernel (pinned commit)
         run: |
           git init kernarium
           cd kernarium
-          git remote add origin https://github.com/imxieyi/Kernarium.git
-          git fetch --depth 1 origin fbe12ee72d195f0241c4fc24090a98b259026604
+          git remote add origin https://github.com/spyboi-dev/Termx-Kernel.git
+          git fetch --depth 1 origin 57f56a9359d0eb5e0cfc1d53ec92f4d887dbc936
           git checkout FETCH_HEAD
-          test "$(git rev-parse HEAD)" = fbe12ee72d195f0241c4fc24090a98b259026604
-
-      - name: Apply TermX runtime patches
-        run: |
-          cd kernarium
-          # The stock boot-ramdisk /init formats the overlay upper
-          # layer on every boot, so nothing installed or saved in a
-          # session survives a reboot. TermX keeps a persistent data
-          # disk instead: format only when the device holds no ext4
-          # filesystem yet, reuse it on later boots.
-          git apply "$GITHUB_WORKSPACE/patches/kernarium-boot-ramdisk-persistent-upper.patch"
-          git diff --stat
+          test "$(git rev-parse HEAD)" = 57f56a9359d0eb5e0cfc1d53ec92f4d887dbc936
 
       - name: Restore build cache
         uses: actions/cache@v4
@@ -245,15 +238,13 @@ jobs:
             kernarium/.build/kernel-cache
             kernarium/.build/dependencies
             kernarium/.build/kernel/artifacts
-          # v2: the v1 entry is stale and actions/cache never updates
-          # an entry once its exact key exists, so it still lacks the
-          # GPU prefix (run 44719664275's verify-only found the prefix
-          # missing and rebuilt it) even though later runs built it.
-          # Bump the key whenever the workflow or the pinned commit
-          # changes in a way that must invalidate the cache.
-          key: kernarium-deps-fbe12ee-v2
+          # v1 for the Termx-Kernel fork (the fbe12ee-v2 entry was for
+          # upstream). Bump the key whenever the workflow or the
+          # pinned commit changes in a way that must invalidate the
+          # cache.
+          key: kernarium-deps-termx-kernel-57f56a935-v1
           restore-keys: |
-            kernarium-deps-fbe12ee-
+            kernarium-deps-termx-kernel-
 
       - name: Create case-sensitive volume
         run: |
@@ -478,8 +469,8 @@ jobs:
           # The entry point TermX calls.
           nm -gU "$FW/KRuntime_6_18_4K" | grep -q ' _kernarium_runtime_get_api_v28' \
             || { echo "runtime API symbol missing"; exit 1; }
-          # The TermX boot-ramdisk patch must be embedded: the per-run
-          # /init lives in __uml_boot_init, and without the
+          # The fork's boot-ramdisk patch must be embedded: the
+          # per-run /init lives in __uml_boot_init, and without the
           # format-only-when-unformatted change the data disk would
           # still be wiped on every boot.
           strings "$FW/KRuntime_6_18_4K" | grep -q UML_BOOT_UPPER_KEEP \
