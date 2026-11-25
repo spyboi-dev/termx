@@ -207,6 +207,23 @@ static void TXCrashLogCheckPreviousRun(NSString *logPath) {
     TXCrashLogWriteMarker("Previous run ended without shutdown (likely killed by iOS, e.g. jetsam; no signal handler runs for SIGKILL)");
 }
 
+// Reopen the engine-log fd after the log file was replaced
+// (TXLogCapFileToTail renames a new file over it): the rename
+// swaps the inode, and the old fd would keep writing to the
+// unlinked inode, so crash lines after a cap would never appear
+// in the visible file. Opens the new fd first, then swaps, so a
+// signal handler running concurrently sees a valid fd either way;
+// if the open fails the old fd stays in place. Normal context
+// only (open/close are not async-signal-safe).
+void TXCrashLogReopen(void) {
+    if (TXCrashLogEnginePath[0] == '\0') return;
+    int fd = open(TXCrashLogEnginePath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    int old = TXCrashLogFd;
+    TXCrashLogFd = fd;
+    if (old >= 0) close(old);
+}
+
 void TXCrashLogInstall(NSString *logPath) {
     static BOOL installed = NO;
     if (installed) return;

@@ -60,7 +60,7 @@
 
     UILabel *taglineLabel = [[UILabel alloc] init];
     taglineLabel.font = [UIFont systemFontOfSize:15];
-    taglineLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+    taglineLabel.textColor = TXThemeSecondaryTextColor();
     taglineLabel.numberOfLines = 0;
     taglineLabel.text = @"A real Linux terminal for iPhone — Debian on the Kernarium Linux kernel.";
     taglineLabel.translatesAutoresizingMaskIntoConstraints = NO;
@@ -85,20 +85,11 @@
     // no restart (see TXLogDebug).
     UIView *diagnosticsCard = [self diagnosticsCard];
 
-    // Two honest notes, in plain words. The device-info one is the
-    // answer to "why does fastfetch say Unknown": the app never
-    // types commands into the terminal at boot, and the runtime's
-    // boot struct has no kernel command line field, so there is no
-    // channel to pass the phone model to the guest. A phone that ran
-    // an older build may still show the old values from its data
-    // disk — that is its own saved state, and it stays.
-    UILabel *deviceNote = [self noteLabelWithText:
-        @"Device info: fastfetch shows Host, CPU and GPU as Unknown on a fresh install. TermX doesn't type commands into the terminal at boot, and the Linux runtime has no way to pass the phone model to the guest, so the guest can't know what it's running on."];
     UILabel *licenseNote = [self noteLabelWithText:
         @"TermX is free software under the GPL-2.0-or-later, built on the Kernarium Linux runtime."];
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        titleLabel, taglineLabel, appCard, imageCard, runtimeCard, diagnosticsCard, deviceNote, licenseNote]];
+        titleLabel, taglineLabel, appCard, imageCard, runtimeCard, diagnosticsCard, licenseNote]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 20;
     [stack setCustomSpacing:8 afterView:titleLabel];
@@ -128,8 +119,8 @@
 // right and may wrap to two lines (a release tag is long).
 - (UIView *)cardWithTitle:(NSString *)title rows:(NSArray<NSArray<NSString *> *> *)rows {
     UIView *card = [[UIView alloc] init];
-    card.backgroundColor = [UIColor colorWithWhite:0.11 alpha:1.0];
-    card.layer.cornerRadius = 24;
+    card.backgroundColor = TXThemeCardBackground();
+    card.layer.cornerRadius = TXThemeCornerRadiusCard;
     card.layer.masksToBounds = YES;
     card.translatesAutoresizingMaskIntoConstraints = NO;
 
@@ -150,7 +141,7 @@
         [rowsStack addArrangedSubview:rowView];
         if (previousRow) {
             UIView *sep = [[UIView alloc] init];
-            sep.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
+            sep.backgroundColor = TXThemeSeparatorColor();
             sep.translatesAutoresizingMaskIntoConstraints = NO;
             [rowsStack addArrangedSubview:sep];
             [sep.heightAnchor constraintEqualToConstant:1].active = YES;
@@ -175,7 +166,7 @@
 - (UIView *)rowWithKey:(NSString *)key value:(NSString *)value {
     UILabel *keyLabel = [[UILabel alloc] init];
     keyLabel.font = [UIFont systemFontOfSize:15];
-    keyLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+    keyLabel.textColor = TXThemeSecondaryTextColor();
     keyLabel.text = key;
     keyLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [keyLabel setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
@@ -204,8 +195,8 @@
 // when diagnosis started.
 - (UIView *)diagnosticsCard {
     UIView *card = [[UIView alloc] init];
-    card.backgroundColor = [UIColor colorWithWhite:0.11 alpha:1.0];
-    card.layer.cornerRadius = 24;
+    card.backgroundColor = TXThemeCardBackground();
+    card.layer.cornerRadius = TXThemeCornerRadiusCard;
     card.layer.masksToBounds = YES;
     card.translatesAutoresizingMaskIntoConstraints = NO;
 
@@ -217,13 +208,13 @@
 
     UILabel *keyLabel = [[UILabel alloc] init];
     keyLabel.font = [UIFont systemFontOfSize:15];
-    keyLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+    keyLabel.textColor = TXThemeSecondaryTextColor();
     keyLabel.text = @"Debug logging";
     keyLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
     UILabel *detailLabel = [[UILabel alloc] init];
     detailLabel.font = [UIFont systemFontOfSize:13];
-    detailLabel.textColor = [UIColor colorWithWhite:0.45 alpha:1.0];
+    detailLabel.textColor = TXThemeSecondaryTextColor();
     detailLabel.text = @"Verbose sampler and session lines in the log. Off by default; takes effect at once.";
     detailLabel.numberOfLines = 0;
     detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
@@ -269,7 +260,7 @@
 - (UILabel *)noteLabelWithText:(NSString *)text {
     UILabel *label = [[UILabel alloc] init];
     label.font = [UIFont systemFontOfSize:13];
-    label.textColor = [UIColor colorWithWhite:0.45 alpha:1.0];
+    label.textColor = TXThemeSecondaryTextColor();
     label.numberOfLines = 0;
     label.text = text;
     label.translatesAutoresizingMaskIntoConstraints = NO;

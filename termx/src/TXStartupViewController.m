@@ -96,20 +96,21 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     // Top row: teal dot + "Starting" left, elapsed timer right.
     self.statusDot = [[UIView alloc] init];
     self.statusDot.backgroundColor = TXStartupTeal();
+    // Half of the 10 pt dot: a derived value, not a theme token.
     self.statusDot.layer.cornerRadius = 5;
     self.statusDot.translatesAutoresizingMaskIntoConstraints = NO;
     [self.statusDot.widthAnchor constraintEqualToConstant:10].active = YES;
     [self.statusDot.heightAnchor constraintEqualToConstant:10].active = YES;
 
     self.statusLabel = [[UILabel alloc] init];
-    self.statusLabel.font = [UIFont boldSystemFontOfSize:17];
+    self.statusLabel.font = [UIFont boldSystemFontOfSize:16];
     self.statusLabel.textColor = TXStartupTeal();
     self.statusLabel.text = @"Starting";
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
     self.timerLabel = [[UILabel alloc] init];
-    self.timerLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
-    self.timerLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+    self.timerLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    self.timerLabel.textColor = TXThemeSecondaryTextColor();
     self.timerLabel.text = @"0:00";
     self.timerLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
@@ -135,14 +136,14 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     // guest is booting (see KernEngine.bootProgress).
     self.progressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
     self.progressView.translatesAutoresizingMaskIntoConstraints = NO;
-    self.progressView.trackTintColor = [UIColor colorWithWhite:0.2 alpha:1.0];
+    self.progressView.trackTintColor = TXThemeButtonBackground();
     self.progressView.progressTintColor = TXStartupTeal();
     self.progressView.progress = 0;
 
     // The checklist card: one rounded dark card holding the rows.
     UIView *card = [[UIView alloc] init];
-    card.backgroundColor = [UIColor colorWithWhite:0.11 alpha:1.0];
-    card.layer.cornerRadius = 24;
+    card.backgroundColor = TXThemeCardBackground();
+    card.layer.cornerRadius = TXThemeCornerRadiusCard;
     card.layer.masksToBounds = YES;
     card.translatesAutoresizingMaskIntoConstraints = NO;
 
@@ -154,12 +155,12 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         [NSLayoutConstraint activateConstraints:@[
             [row.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
             [row.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
-            [row.heightAnchor constraintEqualToConstant:68],
+            [row.heightAnchor constraintEqualToConstant:TXThemeChecklistRowHeightPt],
             previousRow ? [row.topAnchor constraintEqualToAnchor:previousRow.bottomAnchor] : [row.topAnchor constraintEqualToAnchor:card.topAnchor],
         ]];
         if (previousRow) {
             UIView *sep = [[UIView alloc] init];
-            sep.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
+            sep.backgroundColor = TXThemeSeparatorColor();
             sep.translatesAutoresizingMaskIntoConstraints = NO;
             [card addSubview:sep];
             [NSLayoutConstraint activateConstraints:@[
@@ -176,7 +177,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     // Plain-words reason, shown only when a step failed.
     self.reasonLabel = [[UILabel alloc] init];
     self.reasonLabel.font = [UIFont systemFontOfSize:14];
-    self.reasonLabel.textColor = [UIColor colorWithWhite:0.65 alpha:1.0];
+    self.reasonLabel.textColor = TXThemeReasonTextColor();
     self.reasonLabel.numberOfLines = 0;
     self.reasonLabel.hidden = YES;
     self.reasonLabel.translatesAutoresizingMaskIntoConstraints = NO;
@@ -196,7 +197,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     // It does not run in the background — say so plainly.
     self.infoLabel = [[UILabel alloc] init];
     self.infoLabel.font = [UIFont systemFontOfSize:13];
-    self.infoLabel.textColor = [UIColor colorWithWhite:0.45 alpha:1.0];
+    self.infoLabel.textColor = TXThemeSecondaryTextColor();
     self.infoLabel.textAlignment = NSTextAlignmentCenter;
     self.infoLabel.numberOfLines = 0;
     self.infoLabel.text = @"When you leave the app, the guest pauses and its disk is saved first. It doesn't run in the background.";
@@ -211,7 +212,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     // the user can boot the installed image as-is instead of
     // updating. A hidden arranged subview collapses in the stack,
     // so it takes no space when it is not needed.
-    self.actionButton = [self buttonWithTitle:@"Install" action:@selector(actionTapped)];
+    self.actionButton = [self primaryButtonWithTitle:@"Install" action:@selector(actionTapped)];
     self.startButton = [self buttonWithTitle:@"Start" action:@selector(startTapped)];
     self.startButton.hidden = YES;
     UIButton *logButton = [self buttonWithTitle:@"Log" action:@selector(logTapped)];
@@ -228,14 +229,19 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     [self.eraseButton setTitle:@"Erase data disk…" forState:UIControlStateNormal];
     self.eraseButton.titleLabel.font = [UIFont systemFontOfSize:14];
     [self.eraseButton setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
+    [self.eraseButton setTitleColor:[[UIColor systemRedColor] colorWithAlphaComponent:0.4] forState:UIControlStateDisabled];
     self.eraseButton.translatesAutoresizingMaskIntoConstraints = NO;
+    // 44 pt hit area: a bare text button is ~20 pt tall and easy
+    // to miss. The height only pads the tap target; with no
+    // background fill it still reads as a text button.
+    [self.eraseButton.heightAnchor constraintEqualToConstant:44].active = YES;
     [self.eraseButton addTarget:self action:@selector(eraseTapped) forControlEvents:UIControlEventTouchUpInside];
 
     // A spacer holds the title and card low on the screen, the way
     // the Andarium screen does, instead of crowding the top row.
     UIView *spacer = [[UIView alloc] init];
     spacer.translatesAutoresizingMaskIntoConstraints = NO;
-    [spacer.heightAnchor constraintEqualToConstant:120].active = YES;
+    [spacer.heightAnchor constraintEqualToConstant:48].active = YES;
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[topRow, spacer, titleLabel, self.progressView, card, self.reasonLabel, self.crashLabel, buttons, self.eraseButton, self.infoLabel]];
     stack.axis = UILayoutConstraintAxisVertical;
@@ -320,9 +326,10 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     row.translatesAutoresizingMaskIntoConstraints = NO;
 
     UIView *icon = [[UIView alloc] init];
+    // Half of the 28 pt icon: a derived value, not a theme token.
     icon.layer.cornerRadius = 14;
     icon.layer.borderWidth = 2;
-    icon.layer.borderColor = [[UIColor colorWithWhite:0.5 alpha:1.0] CGColor];
+    icon.layer.borderColor = [TXThemeDimmedColor() CGColor];
     icon.translatesAutoresizingMaskIntoConstraints = NO;
     [icon.widthAnchor constraintEqualToConstant:28].active = YES;
     [icon.heightAnchor constraintEqualToConstant:28].active = YES;
@@ -351,20 +358,24 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     ]];
 
     UILabel *titleLabel = [[UILabel alloc] init];
-    titleLabel.font = [UIFont boldSystemFontOfSize:17];
+    titleLabel.font = [UIFont boldSystemFontOfSize:16];
     titleLabel.textColor = [UIColor whiteColor];
     titleLabel.text = title;
     titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
     UILabel *detailLabel = [[UILabel alloc] init];
     detailLabel.font = [UIFont systemFontOfSize:14];
-    detailLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
-    // Wraps to two lines: a download detail such as "Downloading…
+    detailLabel.textColor = TXThemeSecondaryTextColor();
+    // Two lines, truncated: a download detail such as "Downloading…
     // 42% · 56 MiB of 116 MiB · 2.1 MiB/s" is ~49 chars (~360 pt)
     // in a ~298 pt area, so one line truncates it on iPhone 15
-    // Plus. The 68 pt row still fits: title (17 pt) + spacing +
-    // two detail lines (14 pt each) is ~56 pt.
-    detailLabel.numberOfLines = 0;
+    // Plus — and an uncapped detail (the corrupt-disk message,
+    // ~152 chars) wraps to four lines and crowds into the
+    // neighbouring rows. setRow: caps the text as well; the full
+    // text stays in the log. The 68 pt row still fits: title
+    // (16 pt) + spacing + two detail lines (14 pt each) is ~55 pt.
+    detailLabel.numberOfLines = 2;
+    detailLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
     UIStackView *labels = [[UIStackView alloc] initWithArrangedSubviews:@[titleLabel, detailLabel]];
@@ -400,11 +411,21 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     [button setTitle:title forState:UIControlStateNormal];
     button.titleLabel.font = [UIFont boldSystemFontOfSize:16];
     [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    button.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1.0];
-    button.layer.cornerRadius = 12;
+    [button setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.5] forState:UIControlStateDisabled];
+    button.backgroundColor = TXThemeButtonBackground();
+    button.layer.cornerRadius = TXThemeCornerRadiusButton;
     button.translatesAutoresizingMaskIntoConstraints = NO;
-    [button.heightAnchor constraintEqualToConstant:48].active = YES;
+    [button.heightAnchor constraintEqualToConstant:TXThemePrimaryButtonHeightPt].active = YES;
     [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return button;
+}
+
+// The primary action (Install / Start / Update / Terminal): teal
+// fill, so it reads as primary at a glance. Log, About and the
+// second Start button stay quiet (see buttonWithTitle).
+- (UIButton *)primaryButtonWithTitle:(NSString *)title action:(SEL)action {
+    UIButton *button = [self buttonWithTitle:title action:action];
+    button.backgroundColor = TXStartupTeal();
     return button;
 }
 
@@ -429,6 +450,16 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     if ((currentState == TermXStateDownloading || currentState == TermXStateBooting) &&
         self.previousState != TermXStateDownloading && self.previousState != TermXStateBooting) {
         self.startTime = [NSDate date];
+        if (currentState == TermXStateDownloading) {
+            // Fresh rate baseline for this download: the rate is
+            // measured from lastReceived, which otherwise still
+            // holds the previous install's ~121 MB, so the strict
+            // > in downloadDetail never fires again and the rate
+            // stays 0 for the whole download.
+            self.lastReceived = 0;
+            self.lastRateTime = nil;
+            self.lastRate = 0;
+        }
     }
     self.previousState = currentState;
     NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:self.startTime];
@@ -455,6 +486,8 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 // reinstalling the image would fail on the same disk again),
 // Update when a newer image is available and the guest is stopped
 // (or running — tapping it stops the guest first, then installs),
+// except when the crash choice is showing, where the button is
+// Start anyway instead and Update waits until after the start.
 // Start when the guest is installed but powered off, Terminal when
 // the guest is running and no update is available (the way back
 // after swiping down from the terminal), disabled with the live
@@ -494,12 +527,15 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             self.actionButton.enabled = YES;
             break;
         case TermXStateStopped:
-            if (engine.updateAvailable) {
-                [self.actionButton setTitle:@"Update" forState:UIControlStateNormal];
-            } else if (crashChoice) {
-                // "Start" here is Start anyway: the crash label
-                // names both options, and this button boots as-is.
+            if (crashChoice) {
+                // The crash choice outranks the update prompt:
+                // the crash label promises "Start anyway, or Start
+                // fresh", and there is no way to boot the old image
+                // as-is if this button says Update. Update stays
+                // available after starting.
                 [self.actionButton setTitle:@"Start anyway" forState:UIControlStateNormal];
+            } else if (engine.updateAvailable) {
+                [self.actionButton setTitle:@"Update" forState:UIControlStateNormal];
             } else {
                 [self.actionButton setTitle:@"Start" forState:UIControlStateNormal];
             }
@@ -555,13 +591,22 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
                                 engine.state != TermXStateStopping &&
                                 engine.state != TermXStateSuspended &&
                                 engine.dataDiskExists);
+    // The primary button stays teal when disabled, only dimmer —
+    // never grey — so it still reads as the same button while
+    // "Starting…" or "Downloading…". (The erase button dims via
+    // its Disabled title color instead; it has no fill.)
+    if (self.actionButton.enabled) {
+        self.actionButton.backgroundColor = TXStartupTeal();
+    } else {
+        self.actionButton.backgroundColor = [TXStartupTeal() colorWithAlphaComponent:0.35];
+    }
 }
 
 - (void)refreshHeader {
     KernEngine *engine = [KernEngine shared];
     NSString *text = @"Ready";
-    UIColor *dot = [UIColor colorWithWhite:0.5 alpha:1.0];
-    UIColor *labelColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+    UIColor *dot = TXThemeDimmedColor();
+    UIColor *labelColor = TXThemeSecondaryTextColor();
     switch (engine.state) {
         case TermXStateDownloading:
             text = @"Downloading"; dot = TXStartupTeal(); labelColor = TXStartupTeal();
@@ -583,13 +628,13 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             break;
         case TermXStateReady:
         case TermXStateStopped:
-            text = @"Ready"; dot = [UIColor colorWithWhite:0.5 alpha:1.0]; labelColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+            text = @"Ready"; dot = TXThemeDimmedColor(); labelColor = TXThemeSecondaryTextColor();
             break;
         case TermXStateIdle:
             // Nothing installed yet: "Ready" would claim a guest
             // that does not exist. The engine's own initial status
             // text says "Not installed yet — tap Install".
-            text = @"Not installed"; dot = [UIColor colorWithWhite:0.5 alpha:1.0]; labelColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+            text = @"Not installed"; dot = TXThemeDimmedColor(); labelColor = TXThemeSecondaryTextColor();
             break;
     }
     self.statusLabel.text = text;
@@ -727,12 +772,12 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     }
 }
 
-// "Downloading… 42% · 56 MB of 116 MB · 2.1 MB/s", from the real
+// "Downloading… 42% · 56 MiB of 116 MiB · 2.1 MiB/s", from the real
 // byte counts the download watcher reports. The rate is measured
 // between poll ticks; it is omitted until two ticks exist. The rate
 // timestamp only moves when bytes actually arrive, so a stalled
 // download (no new bytes for over a second — two poll ticks) drops
-// the rate to 0 instead of showing a stale MB/s forever.
+// the rate to 0 instead of showing a stale MiB/s forever.
 - (NSString *)downloadDetail {
     KernEngine *engine = [KernEngine shared];
     int64_t received = engine.downloadReceived;
@@ -765,6 +810,13 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     UIActivityIndicatorView *spinner = self.rowSpinners[(NSUInteger)row];
     UILabel *title = self.rowTitles[(NSUInteger)row];
     UILabel *detailLabel = self.rowDetails[(NSUInteger)row];
+    // Cap the detail: the fixed 68 pt row fits two detail lines,
+    // and a long status (the corrupt-disk message, ~152 chars)
+    // would wrap to four and crowd into the neighbouring rows.
+    // The full text stays in the log.
+    if (detail.length > 100) {
+        detail = [[detail substringToIndex:100] stringByAppendingString:@"…"];
+    }
     detailLabel.text = detail;
     // The state is otherwise colour, icon and spinner only, which
     // VoiceOver cannot see: name it on the row container (see
@@ -787,7 +839,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             [spinner stopAnimating];
             spinner.hidden = YES;
             title.textColor = [UIColor whiteColor];
-            detailLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+            detailLabel.textColor = TXThemeSecondaryTextColor();
             break;
         case TXStartupRowUpdate:
             // The image is fine (teal check, like Done) — but a
@@ -823,12 +875,12 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         case TXStartupRowPending:
             icon.backgroundColor = [UIColor clearColor];
             icon.layer.borderWidth = 2;
-            icon.layer.borderColor = [[UIColor colorWithWhite:0.5 alpha:1.0] CGColor];
+            icon.layer.borderColor = [TXThemeDimmedColor() CGColor];
             check.hidden = YES;
             [spinner stopAnimating];
             spinner.hidden = YES;
-            title.textColor = [UIColor colorWithWhite:0.5 alpha:1.0];
-            detailLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+            title.textColor = TXThemeDimmedColor();
+            detailLabel.textColor = TXThemeSecondaryTextColor();
             break;
     }
 }
@@ -942,8 +994,10 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 // Present the terminal once the shell is really ready. A short
 // beat at full green first, so the user sees every check done. If
 // the log screen is open on top, wait until it closes instead of
-// yanking it away. Coming back from the terminal (swipe down from
-// the top edge) does not re-trigger this: the user chose to return.
+// yanking it away. If About (or another non-Log screen) is open,
+// re-arm instead: closing it presents the terminal. Coming back
+// from the terminal (swipe down from the top edge) does not
+// re-trigger this: the user chose to return.
 - (void)maybePresentTerminal {
     if ([KernEngine shared].state != TermXStateRunning) return;
     if ([KernEngine shared].flow.terminalPresented) return;
@@ -962,15 +1016,18 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             return;
         }
         if (strongSelf.presentedViewController) {
+            UIViewController *presented = strongSelf.presentedViewController;
+            // The user tapped Terminal manually inside the 0.7 s
+            // window: the terminal is already up, so this
+            // presentation is consumed. Re-arming here would
+            // re-present (cleared) when the user swipes back down,
+            // wiping scrollback.
+            if ([presented isKindOfClass:[TerminalViewController class]]) {
+                return;
+            }
             // Only the Log screen defers the presentation: the
             // shell came up while the user was reading the log, so
-            // wait for it to close. Any other presented screen
-            // (About, the size sheet) must NOT set the flag — the
-            // user tapped Terminal within this window, or is reading
-            // About, and the flag would otherwise fire later on an
-            // unrelated Log close and present a cleared terminal,
-            // wiping scrollback.
-            UIViewController *presented = strongSelf.presentedViewController;
+            // wait for it to close.
             BOOL isLog = NO;
             if ([presented isKindOfClass:[UINavigationController class]]) {
                 isLog = [[(UINavigationController *)presented topViewController] isKindOfClass:[TXLogViewController class]];
@@ -979,7 +1036,17 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             }
             if (isLog) {
                 engine.flow.presentAfterLogCloses = YES;
+                return;
             }
+            // Any other screen (About, the size sheet): the shell
+            // came up while the user was reading it. Re-arm, so
+            // closing it presents the terminal — viewDidAppear
+            // re-enters here once the flag is clear. The check
+            // above guards the manual-Terminal race: if the user
+            // taps Terminal before the re-armed run fires, that
+            // run sees the terminal already presented and stands
+            // down instead of double-presenting.
+            engine.flow.terminalPresented = NO;
             return;
         }
         [strongSelf presentTerminalWithClearScreen:YES];
@@ -1038,10 +1105,13 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 
 - (void)actionTapped {
     KernEngine *engine = [KernEngine shared];
-    if (engine.lastSessionCrashed && !engine.flow.crashAcknowledged && engine.state == TermXStateReady) {
+    if (engine.lastSessionCrashed && !engine.flow.crashAcknowledged &&
+        (engine.state == TermXStateReady || engine.state == TermXStateStopped)) {
         // Start anyway: the user chose to boot into whatever crashed
         // last time. A manual start earns a fresh automatic retry
-        // if this boot fails.
+        // if this boot fails. The crash choice outranks the update
+        // prompt, so this branch runs before the Update branch
+        // below even when an update is available.
         [engine.flow acknowledgeCrash];
         [engine.flow resetRetry];
         [engine bootOnView:self.guestView];
@@ -1155,6 +1225,15 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 }
 
 - (void)eraseTapped {
+    // The user has chosen a different remedy: cancel the pending
+    // automatic boot retry, so it cannot fire while the erase
+    // confirmation is open and turn the confirmed erase into a
+    // "stop the guest before erasing" refusal. Marking the retry
+    // used stops the pending block (see maybeScheduleBootRetry)
+    // and blocks a new schedule; a manual Start or Install
+    // re-arms it (see resetRetry).
+    [KernEngine shared].flow.bootRetryUsed = YES;
+    [KernEngine shared].flow.bootRetryScheduled = NO;
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Erase data disk?"
                                                                    message:@"This deletes everything saved in the guest — installed packages, files, all of it. The Debian system image is untouched, and the next boot starts with a fresh, empty data disk."
                                                             preferredStyle:UIAlertControllerStyleAlert];

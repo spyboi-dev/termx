@@ -58,10 +58,18 @@ typedef struct {
      * the lines that fell off the front once the cap was reached.
      * The view remembers both at its last render and only appends
      * the lines with a higher seq, deleting the dropped ones from
-     * the front of its text. Neither is reset by a scrollback clear
-     * (a clear is detected by the count shrinking, not by the seq). */
+     * the front of its text. Neither is reset by a scrollback clear;
+     * a clear is detected by the count shrinking and by
+     * clear_generation changing (see below). */
     uint64_t scrollback_seq;
     uint64_t scrollback_dropped;
+    /* Monotonic clear generation, incremented by every scrollback
+     * clear. The view remembers it at its last render and forces a
+     * full rebuild when it changes: a clear followed by enough new
+     * output within one flush interval can leave scrollback_count
+     * above the rendered count, so the count alone cannot detect
+     * the clear (see vt_clear_scrollback). */
+    uint64_t clear_generation;
     int dirty; /* grid or scrollback changed since last render. */
     int bell; /* BEL (0x07) received since the view last checked. Set
                  by vt_put_char; the view clears it when it rings the

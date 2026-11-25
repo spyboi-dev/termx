@@ -52,6 +52,14 @@ void TXCrashLogInstallEarly(void);
 // terminate). A no-op when the handlers were never installed.
 void TXCrashLogMarkCleanShutdown(void);
 
+// Reopen the engine-log fd onto the current engine.log file, after
+// the log was replaced (capped) under it: the cap renames a new
+// file over the old one, and the old fd would keep writing to the
+// unlinked inode. Call from normal context only, never from a
+// signal handler. A no-op when the handlers were never installed,
+// and keeps the old fd when the reopen fails.
+void TXCrashLogReopen(void);
+
 // Mark a return to the foreground, so a clean-shutdown marker from
 // an earlier backgrounding cannot mask later foreground work.
 void TXCrashLogMarkForeground(void);

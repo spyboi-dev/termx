@@ -119,9 +119,13 @@ static void vt_clear_grid(vt_t *vt) {
 /* Forget the scrollback rows, keeping the allocated array so the
  * next scroll does not reallocate from scratch. The seq counters are
  * NOT reset: they are monotonic, and the view detects a clear by the
- * count shrinking. */
+ * count shrinking and by clear_generation changing. The generation
+ * is what catches a clear followed by enough new output in one
+ * flush interval to push the count back above the rendered count,
+ * where the count alone would miss the clear entirely. */
 static void vt_clear_scrollback(vt_t *vt) {
     vt->scrollback_count = 0;
+    vt->clear_generation++;
 }
 
 int vt_is_empty(vt_t *vt) {

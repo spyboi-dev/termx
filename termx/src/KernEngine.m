@@ -42,8 +42,8 @@ static NSString* const kTermXRuntimeUpstreamCommit = @"fbe12ee";
 // The Linux guest: 2 vCPUs, and as much RAM as iOS gives the app
 // minus a 1 GiB reserve for iOS and the app itself (see
 // TXComputeGuestMemoryMiB). The iPhone 15 Plus has 6 GiB, so the
-// guest gets 5 GiB there. 2048 is the default until the first boot
-// computes it, and the floor: a smaller device never gets less.
+// guest gets 5 GiB there. 2048 is the default until init computes
+// it, and the floor: a smaller device never gets less.
 // The value must satisfy the pre-flight (min 512, step 64), so the
 // computation rounds down to a 64 MiB step. 512 MiB was the old
 // fixed value, set when 1024 MiB was suspected of being killed by
@@ -66,6 +66,10 @@ static NSString* const kTermXRuntimeUpstreamCommit = @"fbe12ee";
 // --entitlements — ld64.lld -adhoc_codesign cannot embed them.
 static uint32_t kGuestMemoryMiB = 2048;
 static const uint32_t kGuestCPUs = 2;
+// Forward: defined below with bootOnView:. init computes the guest
+// RAM once so kernelDetail shows the real value before the first
+// boot instead of the 2 GiB fallback.
+static uint32_t TXComputeGuestMemoryMiB(void);
 // The guest's persistent data disk, in GiB: one sparse file at a fixed
 // path (see dataDiskPath), created once and reused on every boot, so
 // the size is capacity, not allocated size — the file only grows as
@@ -365,6 +369,13 @@ static void ConsoleOutput(void* context, const void* buffer, size_t length) {
         // Build marker, every launch: the commit this IPA was built
         // from plus the guest RAM, so a device log always identifies
         // its build. Runs right after the "--- App launch ---" marker.
+        // Guest RAM from the device, once at launch: kernelDetail
+        // (the startup screen's Pending detail) reads
+        // kGuestMemoryMiB, so computing it here — not only at the
+        // first boot — shows the real value (~5 GiB on a 15 Plus)
+        // before the first boot instead of the 2 GiB fallback.
+        // bootOnView: recomputes it anyway.
+        kGuestMemoryMiB = TXComputeGuestMemoryMiB();
         TXLogEngine(@"TermX build %s · guest %u MiB RAM · %u vCPUs",
                     TERMX_BUILD_COMMIT, kGuestMemoryMiB, kGuestCPUs);
 #if TERMX_RING_BUFFER_AB
@@ -1557,10 +1568,11 @@ static NSString* TXGuestSuspensionWord(uint32_t suspension) {
 
 // Guest RAM from the device: all of physical memory except a 1 GiB
 // reserve for iOS and the app itself, with a 2 GiB floor. Read once
-// per boot (bootOnView: sets kGuestMemoryMiB from this before the
-// pre-flight). Rounded down to a 64 MiB step, which the runtime
-// requires (see the pre-flight). Falls back to 2 GiB if the sysctl
-// fails, which is the old fixed value.
+// at init (so the startup screen shows the real value before the
+// first boot) and once per boot (bootOnView: sets kGuestMemoryMiB
+// from this before the pre-flight). Rounded down to a 64 MiB step,
+// which the runtime requires (see the pre-flight). Falls back to
+// 2 GiB if the sysctl fails, which is the old fixed value.
 static uint32_t TXComputeGuestMemoryMiB(void) {
     uint64_t memsize = 0;
     size_t len = sizeof(memsize);

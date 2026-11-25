@@ -32,6 +32,62 @@ static inline UIColor *TXThemeAccentColor(void) {
     return [UIColor colorWithRed:0x2A / 255.0 green:0xB3 / 255.0 blue:0xA3 / 255.0 alpha:1.0];
 }
 
+// Shared grey scale: every screen reads its greys from here, so the
+// same role is the same value everywhere. The card and the log view
+// share one background (0.11); the progress track shares the button
+// background (0.22).
+static inline UIColor *TXThemeCardBackground(void) {
+    return [UIColor colorWithWhite:0.11 alpha:1.0];
+}
+
+static inline UIColor *TXThemeButtonBackground(void) {
+    return [UIColor colorWithWhite:0.22 alpha:1.0];
+}
+
+// Separator hairline: white at 8% alpha, not opaque 0.08 grey —
+// over the 0.11 card it composites lighter than the card, while an
+// opaque 0.08 would render darker than the card.
+static inline UIColor *TXThemeSeparatorColor(void) {
+    return [UIColor colorWithWhite:1.0 alpha:0.08];
+}
+
+static inline UIColor *TXThemeSecondaryTextColor(void) {
+    return [UIColor colorWithWhite:0.6 alpha:1.0];
+}
+
+// Guest-dead notice pill background.
+static inline UIColor *TXThemePillBackground(void) {
+    return [UIColor colorWithWhite:0.15 alpha:1.0];
+}
+
+// Idle keyboard key background.
+static inline UIColor *TXThemeKeyBackground(void) {
+    return [UIColor colorWithWhite:0.30 alpha:1.0];
+}
+
+// Dimmed elements: pending row icon border and title, header dot.
+static inline UIColor *TXThemeDimmedColor(void) {
+    return [UIColor colorWithWhite:0.5 alpha:1.0];
+}
+
+// Failure-reason label on the startup screen.
+static inline UIColor *TXThemeReasonTextColor(void) {
+    return [UIColor colorWithWhite:0.65 alpha:1.0];
+}
+
+// Corner radii: one token per radius. The 5 pt status dot is not
+// tokenized: it is half of the 10 pt dot, a derived value.
+static const CGFloat TXThemeCornerRadiusKey = 6.0;
+static const CGFloat TXThemeCornerRadiusPill = 8.0;
+static const CGFloat TXThemeCornerRadiusButton = 12.0;
+static const CGFloat TXThemeCornerRadiusLog = 18.0;
+static const CGFloat TXThemeCornerRadiusCard = 24.0;
+
+// Shared heights: the primary button height, and the startup
+// checklist row height.
+static const CGFloat TXThemePrimaryButtonHeightPt = 48.0;
+static const CGFloat TXThemeChecklistRowHeightPt = 68.0;
+
 // The terminal font size, persisted across launches. Default 14 pt.
 // Pinch to zoom changes it (see TerminalViewController); the font is
 // built from this size everywhere, so one change re-renders the whole

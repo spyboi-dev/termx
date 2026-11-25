@@ -45,7 +45,6 @@ The guest boots from a read-only system image, with a persistent data disk on to
 
 ## Limitations
 
-- Device info is incomplete: on a fresh install fastfetch shows Host, CPU, and GPU as Unknown. The guest kernel genuinely does not know what phone it runs on, and the app never types a command into the terminal at boot, so it cannot pass the model in. The runtime has no channel for it either (the boot struct carries no kernel command line). Older installs may still show values written by earlier builds.
 - The terminal is 48 columns wide. The width does not follow the phone orientation or pinch zoom: there is no winsize channel from the app to the guest, so the shell sets `stty cols 48` at login and stays there. Pinch zoom changes only the display size.
 - When you leave the app, the guest pauses (its disk is saved first) and resumes when you return. It does not run in the background. Background audio, location, or fetch modes would violate Apple's rules if used to keep a Linux guest alive, so none are used.
 - Memory: the IPA is adhoc-signed, so the increased-memory-limit entitlement is not granted; the guest runs under iOS's standard per-process memory limit, with a 1 GiB reserve. That entitlement needs a provisioning profile that carries it, which a free developer account cannot get.

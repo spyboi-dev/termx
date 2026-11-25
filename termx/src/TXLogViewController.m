@@ -8,6 +8,11 @@
 @property (nonatomic, strong) UITextView *logTextView;
 @property (nonatomic, strong) UIButton *shareLogButton;
 @property (nonatomic, strong, nullable) NSTimer *refreshTimer;
+// Generation counter for the "Copied" feedback: each Copy tap
+// bumps it, and the delayed reset only runs if its generation is
+// still current, so a second tap's feedback runs its full duration
+// instead of being cut short by the first tap's reset.
+@property (nonatomic) NSUInteger copyFeedbackGeneration;
 // Serial queue for the log-file reads: TXLogFullText() reads up to
 // 1 MB (two 512 KB capped files), so it runs here instead of on the
 // main thread, where it stalled scrolling every tick. Serial, so
@@ -30,17 +35,11 @@
     self.title = @"Logs";
     self.view.backgroundColor = TXThemeBackgroundColor();
 
-    UILabel *header = [[UILabel alloc] init];
-    header.font = [UIFont boldSystemFontOfSize:17];
-    header.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
-    header.text = @"Engine log + guest console";
-    header.translatesAutoresizingMaskIntoConstraints = NO;
-
     self.logTextView = [[UITextView alloc] init];
     self.logTextView.font = TXTermFont();
     self.logTextView.textColor = TXThemeForegroundColor();
-    self.logTextView.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1.0];
-    self.logTextView.layer.cornerRadius = 18;
+    self.logTextView.backgroundColor = TXThemeCardBackground();
+    self.logTextView.layer.cornerRadius = TXThemeCornerRadiusLog;
     self.logTextView.layer.masksToBounds = YES;
     self.logTextView.textContainerInset = UIEdgeInsetsMake(16, 16, 16, 16);
     self.logTextView.editable = NO;
@@ -51,13 +50,13 @@
     [self.shareLogButton setTitle:@"Copy log" forState:UIControlStateNormal];
     self.shareLogButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
     [self.shareLogButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.shareLogButton.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1.0];
-    self.shareLogButton.layer.cornerRadius = 12;
+    self.shareLogButton.backgroundColor = TXThemeButtonBackground();
+    self.shareLogButton.layer.cornerRadius = TXThemeCornerRadiusButton;
     self.shareLogButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.shareLogButton.heightAnchor constraintEqualToConstant:48].active = YES;
+    [self.shareLogButton.heightAnchor constraintEqualToConstant:TXThemePrimaryButtonHeightPt].active = YES;
     [self.shareLogButton addTarget:self action:@selector(copyTapped) forControlEvents:UIControlEventTouchUpInside];
 
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[header, self.logTextView, self.shareLogButton]];
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[self.logTextView, self.shareLogButton]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 16;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -77,7 +76,9 @@
         [stack.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor constant:-20],
         [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-16],
         [stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-40],
-        [self.logTextView.heightAnchor constraintEqualToConstant:420],
+        // The log fills the available height: scroll top/bottom
+        // insets (16 + 16) + stack spacing (16) + Copy button (48).
+        [self.logTextView.heightAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.heightAnchor constant:-96],
     ]];
 }
 
@@ -141,8 +142,14 @@
 - (void)copyTapped {
     [UIPasteboard generalPasteboard].string = self.logTextView.text ?: @"";
     [self.shareLogButton setTitle:@"Copied" forState:UIControlStateNormal];
+    UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"Log copied");
+    self.copyFeedbackGeneration++;
+    NSUInteger generation = self.copyFeedbackGeneration;
+    __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self.shareLogButton setTitle:@"Copy log" forState:UIControlStateNormal];
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.copyFeedbackGeneration != generation) return;
+        [strongSelf.shareLogButton setTitle:@"Copy log" forState:UIControlStateNormal];
     });
 }
 

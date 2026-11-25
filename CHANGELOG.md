@@ -7,6 +7,95 @@ grouped under 0.1.0 by date and commit.
 
 ## 0.3.0 — 2026-11-24 — Phase 5: architecture and code quality
 
+### UI bug-fix round 2: renderer, startup, and design tokens
+
+Three fresh audits of the 083c97a build found real bugs in the
+incremental renderer, the startup flow, and the Log screen, plus
+a design pass over the startup screen, key rows, and theme.
+All fixed here; nothing in this section changes the guest image,
+the state machine, or the clear-on-boot gating.
+
+Slop removal (at the user's direction, 2026-11-25): the
+device-info note is gone from the About screen, the README, and
+BUILD.md, and the About header no longer claims the screen says
+anything about backgrounding. It never comes back.
+
+- A clear plus heavy output in one 60 ms burst defeated the
+  incremental renderer's clear detection: the dispatcher only
+  noticed a clear when the scrollback count shrank, and a burst
+  could push the count back above the rendered count, leaving
+  pre-clear lines on screen and dropping the first post-clear
+  lines. A monotonic clear-generation counter in `vt_t`,
+  bumped on every clear, now forces a full rebuild.
+- Pinch and double-tap zoom stalled when the terminal was idle
+  with the keyboard dismissed: the flush early-return never
+  checked `_fullRebuildNeeded`. It does now, so a zoom
+  re-renders even with no new output.
+- Two pinches with no flush between them lost the first zoom
+  ratio (`_rebuildOffsetScale` was overwritten, not composed).
+  Ratios now multiply.
+- The guest-dead notice said "swipe down to return", but the
+  exit gesture required being at the top of the scrollback —
+  exactly where the user is not when the guest dies. The exit
+  gesture now works from any scroll position while the notice
+  is visible. The pill also has real padding now and is opaque,
+  and its detail allows three lines instead of truncating.
+- "Copied" feedback is no longer cut short by a second tap
+  (generation counter on both the terminal and Log Copy
+  buttons) and is announced to VoiceOver.
+- `resetCursorBlink` now restarts the blink timer phase, so
+  the cursor stays visible for a full cycle after input
+  instead of hiding again almost immediately.
+- The secondary and Fn key rows now use the same FillEqually
+  layout and 3 pt spacing as the primary row, so all three
+  rows align.
+- The download rate never showed on any download after the
+  first: the rate baseline was never reset, so after one
+  install it sat at ~121 MB and the strict `>` never fired
+  again. The baseline now resets on the transition into
+  Downloading.
+- The terminal never auto-presented if About was open when the
+  shell came up: `terminalPresented` was set before the 0.7 s
+  block bailed, and nothing re-armed it. A non-Log modal now
+  re-arms the flag, with a guard so a manual Terminal tap in
+  the meantime cannot double-present.
+- An invisible 5 s auto-retry raced the user's Erase tap: if
+  the retry fired while the Erase confirmation was open, the
+  confirmed erase was refused. Tapping Erase now cancels the
+  pending retry.
+- One non-UTF-8 byte in the guest console made the whole guest
+  section vanish from the Log screen (strict UTF-8 read
+  returned nil). The log now decodes lossily, replacing bad
+  bytes instead of dropping the section.
+- "Start anyway" was missing when the crash choice showed
+  alongside an update: the buttons were Update and Start fresh
+  with no way to boot the old image as-is. The crash choice
+  now takes priority — the action button is "Start anyway",
+  Start fresh stays second, and Update remains available
+  afterwards.
+- Row detail strings are capped at 100 chars with the detail
+  label limited to two lines, so the corrupt-disk message no
+  longer overflows the fixed 68 pt row.
+- The kernel row showed the fallback "2 GiB RAM" before the
+  first boot; guest RAM is now computed at engine init, so the
+  pending detail shows the real value (~5 GiB on a 15 Plus).
+- The Log cap rewrite is atomic now (temp file + rename), so a
+  refresh can never catch an empty file — and the crash
+  logger reopens its fd after a cap, so crash lines written
+  after a cap still land in the visible engine.log.
+- Design: the primary action button is teal with white text
+  while Log and About stay quiet; the Erase button has a 44 pt
+  hit area; disabled buttons dim (teal at 0.35 alpha, never
+  grey); the startup info line and About secondary text are
+  white 0.6 instead of 0.45; the 120 pt spacer is 48 pt so the
+  startup screen fits without scrolling on a 15 Plus; the Log
+  screen lost its duplicate in-page header and fills the height
+  on iPad; row titles, status, and timer are all 16 pt.
+- Theme tokens: the grey scale, corner radii, and the 48 pt /
+  68 pt heights are named in TXTheme and used everywhere, with
+  the near-duplicates consolidated (log background 0.12 → card
+  0.11, progress track 0.20 → button 0.22).
+
 ### UI bug-fix round: leaks, stale flags, and polish
 
 Three fresh audits of the 81d40f4 build found one real leak, one

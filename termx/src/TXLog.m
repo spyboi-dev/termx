@@ -1,11 +1,13 @@
 // TXLog - see the header.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "TXLog.h"
+#import "TXCrashLog.h"
 #import <mach/mach.h>
 #import <errno.h>
 #import <fcntl.h>
 #import <pthread.h>
 #import <signal.h>
+#import <stdio.h>
 #import <string.h>
 #import <unistd.h>
 
@@ -117,12 +119,14 @@ NSString *TXLogGuestLogPath(void) {
 // Keep a log file from growing forever: once it passes 512 KB,
 // keep only the last 256 KB, starting at a line boundary.
 // Byte-based, so a chunk of non-UTF-8 console output cannot defeat
-// it. Runs on TXLogQueue only. The rewrite is in place, never by
-// rename: TXCrashLog holds an open fd to this path, and an atomic
-// write (temp file + rename) swaps the inode out from under it, so
-// the crash handler's next write goes to the old unlinked inode and
-// is lost. Truncating and writing through the same path keeps the
-// inode, so the crash fd stays valid.
+// it. Runs on TXLogQueue only. The rewrite is atomic: the tail is
+// written to a temp file in the same directory and renamed over
+// the original, so a reader on another queue sees either the old
+// file or the new one, never an empty or half-written one.
+// Note: the rename swaps the inode, so after capping engine.log
+// the crash logger's fd is reopened onto the new file below
+// (TXCrashLogReopen), or its lines would keep going to the old,
+// unlinked inode.
 static void TXLogCapFileToTail(NSString *path) {
     NSData *data = [NSData dataWithContentsOfFile:path];
     if (!data || data.length <= 512 * 1024) return;
@@ -131,11 +135,15 @@ static void TXLogCapFileToTail(NSString *path) {
     while (keepFrom < data.length && bytes[keepFrom] != '\n') keepFrom++;
     if (keepFrom < data.length) keepFrom++; // skip the newline itself
     NSData *tail = [data subdataWithRange:NSMakeRange(keepFrom, data.length - keepFrom)];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!fh) return;
-    [fh truncateFileAtOffset:0];
-    [fh writeData:tail];
-    [fh closeFile];
+    NSString *tmpPath = [path stringByAppendingString:@".cap-tmp"];
+    if (![tail writeToFile:tmpPath atomically:NO]) return;
+    if (rename(tmpPath.fileSystemRepresentation, path.fileSystemRepresentation) != 0) {
+        [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
+    } else if ([path isEqualToString:TXLogEngineLogPath()]) {
+        // Only engine.log has a held-open fd (the crash logger's);
+        // guest.log is opened per append, so it needs no reopen.
+        TXCrashLogReopen();
+    }
 }
 
 // The file write itself: queue-confined. Creates the directory,
@@ -202,11 +210,56 @@ void TXLogConsoleData(NSData *data) {
     });
 }
 
+// Decode log bytes as UTF-8, replacing invalid bytes with U+FFFD
+// instead of dropping the whole file: stringWithContentsOfFile
+// with NSUTF8StringEncoding returns nil on a single bad byte, so
+// one non-UTF-8 byte in the guest console used to make the entire
+// guest section vanish from the Log screen. Valid UTF-8 takes the
+// fast path unchanged; only invalid input goes through the
+// byte-by-byte fallback below.
+static NSString *TXLogLossyUTF8String(NSData *data) {
+    if (!data.length) return nil;
+    NSString *strict = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (strict) return strict;
+    NSMutableString *out = [NSMutableString stringWithCapacity:data.length];
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
+    NSUInteger i = 0, n = data.length;
+    while (i < n) {
+        uint8_t b = bytes[i];
+        NSUInteger len = 0;
+        if (b < 0x80) len = 1;
+        else if (b >= 0xC2 && b <= 0xDF) len = 2;
+        else if (b >= 0xE0 && b <= 0xEF) len = 3;
+        else if (b >= 0xF0 && b <= 0xF4) len = 4;
+        else { [out appendString:@"\uFFFD"]; i++; continue; }
+        BOOL valid = (i + len <= n);
+        if (valid) {
+            for (NSUInteger j = 1; j < len; j++) {
+                if ((bytes[i + j] & 0xC0) != 0x80) valid = NO;
+            }
+            if (valid && len == 3) {
+                uint8_t b1 = bytes[i + 1];
+                if (b == 0xE0 && b1 < 0xA0) valid = NO; // overlong
+                if (b == 0xED && b1 > 0x9F) valid = NO; // surrogate
+            }
+            if (valid && len == 4) {
+                uint8_t b1 = bytes[i + 1];
+                if (b == 0xF0 && b1 < 0x90) valid = NO; // overlong
+                if (b == 0xF4 && b1 > 0x8F) valid = NO; // > U+10FFFF
+            }
+        }
+        if (!valid) { [out appendString:@"\uFFFD"]; i++; continue; }
+        NSString *chunk = [[NSString alloc] initWithBytes:bytes + i length:len encoding:NSUTF8StringEncoding];
+        if (chunk) [out appendString:chunk];
+        else [out appendString:@"\uFFFD"];
+        i += len;
+    }
+    return out;
+}
+
 NSString *TXLogFullText(void) {
-    NSString *engine = [NSString stringWithContentsOfFile:TXLogEngineLogPath()
-                                                   encoding:NSUTF8StringEncoding error:nil];
-    NSString *guest = [NSString stringWithContentsOfFile:TXLogGuestLogPath()
-                                                  encoding:NSUTF8StringEncoding error:nil];
+    NSString *engine = TXLogLossyUTF8String([NSData dataWithContentsOfFile:TXLogEngineLogPath()]);
+    NSString *guest = TXLogLossyUTF8String([NSData dataWithContentsOfFile:TXLogGuestLogPath()]);
     if (!engine.length && !guest.length) return @"(no log yet — start the guest and lines will appear here)";
     NSMutableString *out = [NSMutableString string];
     if (engine.length) [out appendString:engine];

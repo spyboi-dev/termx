@@ -167,6 +167,22 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 }
 @end
 
+// Label with text insets, for the guest-dead notice pill: the text
+// sits 12 pt from the sides and 8 pt from the top and bottom instead
+// of flush against the pill's edges.
+@interface TXPaddedLabel : UILabel
+@end
+
+@implementation TXPaddedLabel
+- (void)drawTextInRect:(CGRect)rect {
+    [super drawTextInRect:UIEdgeInsetsInsetRect(rect, UIEdgeInsetsMake(8, 12, 8, 12))];
+}
+- (CGSize)intrinsicContentSize {
+    CGSize size = [super intrinsicContentSize];
+    return CGSizeMake(size.width + 24, size.height + 16);
+}
+@end
+
 @implementation TerminalViewController {
     KernEngine *_engine;
     vt_t _vt;
@@ -206,6 +222,8 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     NSUInteger _renderedScrollbackCount; // scrollback lines in the text view
     uint64_t _renderedScrollbackSeq;     // seq of the last rendered scrollback line
     uint64_t _renderedScrollbackDropped; // dropped count at the last render
+    uint64_t _renderedClearGeneration;   // clear generation at the last render
+    NSUInteger _copyFeedbackGeneration;  // Copy taps, so a later tap's "Copied" is not cut short by an earlier tap's timer
     NSUInteger _scrollbackTextLength;    // chars of the text view that are scrollback
     BOOL _fullRebuildNeeded; // font size changed, or the render state is stale
     // Cursor blink: a timer toggles _cursorBlinkOn, and the next flush
@@ -378,7 +396,8 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIStackView *fnStack = [[UIStackView alloc] init];
     fnStack.translatesAutoresizingMaskIntoConstraints = NO;
     fnStack.axis = UILayoutConstraintAxisHorizontal;
-    fnStack.spacing = 5;
+    fnStack.spacing = 3;
+    fnStack.distribution = UIStackViewDistributionFillEqually;
     [_fnRow addSubview:fnStack];
     for (int i = 0; i < 12; i++) {
         NSString *title = [NSString stringWithFormat:@"f%d", i + 1];
@@ -413,18 +432,19 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [rows addArrangedSubview:_fnRow];
 
     // Secondary row (hidden until More is toggled): Home End PgUp PgDn Del Copy Fn.
+    // Same layout as the primary row: equal widths at 3 pt spacing,
+    // so its keys line up with the primary row's. The spacer views
+    // are gone: under FillEqually they would take an equal share
+    // each and shrink the keys.
     _secondaryRow = [[UIStackView alloc] init];
     _secondaryRow.translatesAutoresizingMaskIntoConstraints = NO;
     _secondaryRow.axis = UILayoutConstraintAxisHorizontal;
-    _secondaryRow.spacing = 5;
+    _secondaryRow.spacing = 3;
+    _secondaryRow.distribution = UIStackViewDistributionFillEqually;
     [self addKey:_secondaryRow title:@"home" bytes:"\x1B[H" length:3];
     [self addKey:_secondaryRow title:@"end" bytes:"\x1B[F" length:3];
-    UIView *sp1 = [[UIView alloc] init];
-    [_secondaryRow addArrangedSubview:sp1];
     [self addKey:_secondaryRow title:@"pgup" bytes:"\x1B[5~" length:4];
     [self addKey:_secondaryRow title:@"pgdn" bytes:"\x1B[6~" length:4];
-    UIView *sp2 = [[UIView alloc] init];
-    [_secondaryRow addArrangedSubview:sp2];
     [self addKey:_secondaryRow title:@"del" bytes:"\x1B[3~" length:4];
     // Copy: the whole transcript (scrollback plus grid) to the
     // clipboard, so copying does not depend only on the long-press
@@ -436,8 +456,6 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _copyButton.accessibilityHint = @"Copies the whole transcript.";
     [_copyButton addTarget:self action:@selector(onCopyAll) forControlEvents:UIControlEventTouchUpInside];
     [_secondaryRow addArrangedSubview:_copyButton];
-    UIView *sp3 = [[UIView alloc] init];
-    [_secondaryRow addArrangedSubview:sp3];
     _fnButton = [self keyButton:@"fn"];
     [_fnButton addTarget:self action:@selector(onFn) forControlEvents:UIControlEventTouchUpInside];
     _fnButton.accessibilityHint = @"Shows or hides the function key row.";
@@ -592,14 +610,14 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // it never dismisses the terminal and sends nothing to the
     // guest. Taps pass through it to the terminal below. Hidden
     // while the guest runs.
-    _guestStatusLabel = [[UILabel alloc] init];
+    _guestStatusLabel = [[TXPaddedLabel alloc] init];
     _guestStatusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    _guestStatusLabel.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.92];
+    _guestStatusLabel.backgroundColor = TXThemePillBackground();
     _guestStatusLabel.textColor = TXThemeForegroundColor();
     _guestStatusLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
     _guestStatusLabel.textAlignment = NSTextAlignmentCenter;
-    _guestStatusLabel.numberOfLines = 2;
-    _guestStatusLabel.layer.cornerRadius = 8;
+    _guestStatusLabel.numberOfLines = 3;
+    _guestStatusLabel.layer.cornerRadius = TXThemeCornerRadiusPill;
     _guestStatusLabel.clipsToBounds = YES;
     _guestStatusLabel.userInteractionEnabled = NO;
     _guestStatusLabel.hidden = YES;
@@ -813,6 +831,10 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         _cursorBlinkOn = YES;
         _cursorBlinkChanged = YES;
     }
+    // Restart the blink phase: without this the timer keeps its old
+    // fire date and the cursor can hide again almost immediately
+    // after input. A full 0.53 s cycle from now keeps it visible.
+    [_blinkTimer setFireDate:[NSDate dateWithTimeIntervalSinceNow:0.53]];
 }
 
 // BEL: a short vibration, no sound. The guest rings the bell for
@@ -841,7 +863,7 @@ static UIColor *TXKeyBackground(BOOL on, BOOL pressed) {
     // blue: a blue toggle on a teal-accent app reads as a different
     // app's colour.
     return on ? TXThemeAccentColor()
-              : [UIColor colorWithWhite:0.30 alpha:1.0];
+              : TXThemeKeyBackground();
 }
 
 // VoiceOver label for a key title: the glyphs and abbreviations
@@ -884,7 +906,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     b.backgroundColor = TXKeyBackground(NO, NO);
     [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     [b setTitleColor:[UIColor whiteColor] forState:UIControlStateSelected];
-    b.layer.cornerRadius = 6;
+    b.layer.cornerRadius = TXThemeCornerRadiusKey;
     b.layer.shadowColor = [UIColor blackColor].CGColor;
     b.layer.shadowOffset = CGSizeMake(0, 1);
     b.layer.shadowRadius = 1;
@@ -1166,10 +1188,16 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     // back to "copy". The button itself is the feedback — a toast
     // would need a new view for one word.
     [_copyButton setTitle:@"Copied" forState:UIControlStateNormal];
+    UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, @"Copied");
+    // Generation token: a second tap must not have its "Copied"
+    // cut short by the first tap's timer. Only the latest tap's
+    // timer restores the title, so it runs its full 1.5 s.
+    NSUInteger generation = ++_copyFeedbackGeneration;
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return;
+        if (generation != strongSelf->_copyFeedbackGeneration) return;
         [strongSelf->_copyButton setTitle:@"copy" forState:UIControlStateNormal];
     });
 }
@@ -1257,8 +1285,10 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     if (TXTermFontSize() == TXConfigTermFontSizeDefault) return;
     // The rebuild below re-renders at the new size: remember the
     // size ratio so the scroll position survives it (see
-    // restoreTerminalPosition).
-    _rebuildOffsetScale = TXConfigTermFontSizeDefault / TXTermFontSize();
+    // restoreTerminalPosition). Composed, not assigned: a pinch
+    // with no flush between it and this reset must not lose the
+    // pinch's ratio.
+    _rebuildOffsetScale *= TXConfigTermFontSizeDefault / TXTermFontSize();
     TXSetTermFontSize(TXConfigTermFontSizeDefault);
     _output.font = TXTermFont();
     _fullRebuildNeeded = YES; // the whole text re-renders at the new size
@@ -1269,7 +1299,11 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 // terminal returns to the startup screen, where Stop, Logs, Install
 // and Boot live. It only fires when the scrollback is already at its
 // very top: anywhere else, a downward drag is the user scrolling
-// through the output, not asking to leave.
+// through the output, not asking to leave. While the guest-dead
+// notice is visible the top requirement is relaxed: the user is
+// almost always pinned at the bottom when the guest dies, and the
+// notice tells them to swipe down to return, so the drag must work
+// from any scroll position then.
 - (void)onExitPan:(UIPanGestureRecognizer *)pan {
     switch (pan.state) {
         case UIGestureRecognizerStateBegan:
@@ -1283,7 +1317,8 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
             break;
         case UIGestureRecognizerStateEnded: {
             CGPoint translation = [pan translationInView:_output];
-            if (_exitPanAtTop && _exitPanStart.y < TXConfigExitPanTopStripPt && translation.y > TXConfigExitPanTranslationThresholdPt &&
+            BOOL guestDead = _guestStatusLabel && !_guestStatusLabel.hidden;
+            if ((_exitPanAtTop || guestDead) && _exitPanStart.y < TXConfigExitPanTopStripPt && translation.y > TXConfigExitPanTranslationThresholdPt &&
                 fabs(translation.y) > fabs(translation.x)) {
                 [self dismissViewControllerAnimated:YES completion:nil];
             }
@@ -1323,8 +1358,10 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
             if (fabs(size - TXTermFontSize()) < TXConfigPinchDeadZonePt) return;
             // The rebuild below re-renders at the new size: remember
             // the size ratio so the scroll position survives it (see
-            // restoreTerminalPosition).
-            _rebuildOffsetScale = size / TXTermFontSize();
+            // restoreTerminalPosition). Composed, not assigned: two
+            // pinches with no flush between them must not lose the
+            // first ratio.
+            _rebuildOffsetScale *= size / TXTermFontSize();
             TXSetTermFontSize(size);
             _output.font = TXTermFont();
             _fullRebuildNeeded = YES; // the whole text re-renders at the new size
@@ -1414,7 +1451,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     // cleared only by a flush that actually ran (below, after the
     // drag check): a blink tick during a drag must not be lost, or
     // the cursor would stick in one phase until the next output.
-    if (!_vt.dirty && !_cursorBlinkChanged) return;
+    if (!_vt.dirty && !_cursorBlinkChanged && !_fullRebuildNeeded) return;
     // Do not rebuild while the user is dragging or the view is still
     // decelerating: setting attributedText resets the scroll position,
     // and rebuilding mid-drag would yank the view. The dirty flag
@@ -1440,6 +1477,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     // render. A full rebuild is also the fallback inside the
     // incremental path if it finds an inconsistency mid-way.
     if (_fullRebuildNeeded ||
+        _vt.clear_generation != _renderedClearGeneration ||
         (NSUInteger)_vt.scrollback_count < _renderedScrollbackCount ||
         _vt.scrollback_seq < _renderedScrollbackSeq ||
         _vt.scrollback_dropped < _renderedScrollbackDropped) {
@@ -1497,6 +1535,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     _renderedScrollbackCount = (NSUInteger)_vt.scrollback_count;
     _renderedScrollbackSeq = _vt.scrollback_seq;
     _renderedScrollbackDropped = _vt.scrollback_dropped;
+    _renderedClearGeneration = _vt.clear_generation;
     _scrollbackTextLength = scrollbackLength;
     _fullRebuildNeeded = NO;
     [self restoreTerminalPosition:pinned savedOffset:savedOffset

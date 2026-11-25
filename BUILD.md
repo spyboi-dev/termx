@@ -156,9 +156,6 @@ fragile behind the VM egress proxy, retried in-script).
   channel from the app to the guest, and the app never types a
   command into the terminal at boot, so nothing can re-run `stty`
   when the size changes. Fixing it needs a runtime winsize channel.
-- **Device info is Unknown** on a fresh install for the same reason:
-  the app writes no device files at boot, and the runtime boot
-  struct has no kernel command line field to pass the model through.
 - The app runs **no command at boot**: boot is a local clear plus a
   bare newline, nothing typed into the terminal.
 
