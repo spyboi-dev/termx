@@ -374,11 +374,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _input.returnKeyType = UIReturnKeyDefault;
     [self.view addSubview:_input];
 
-    // The keyboard toolbar, NewTerm's model: a blurred bar with the key
-    // rows, riding above the software keyboard. It is a container, not
-    // an element: VoiceOver reads the key buttons inside it, not the bar.
-    UIVisualEffectView *toolbar = [[UIVisualEffectView alloc]
-        initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterial]];
+    // The keyboard toolbar, NewTerm's model: a solid black bar with
+    // the key rows, riding above the software keyboard. Pure black,
+    // not a blur: the bar is continuous with the terminal above it,
+    // so the whole screen reads as one black surface, and a blur
+    // would smear the terminal text scrolling behind it. It is a
+    // container, not an element: VoiceOver reads the key buttons
+    // inside it, not the bar.
+    UIView *toolbar = [[UIView alloc] init];
+    toolbar.backgroundColor = TXThemeBackgroundColor();
     toolbar.translatesAutoresizingMaskIntoConstraints = NO;
     toolbar.isAccessibilityElement = NO;
     [self.view addSubview:toolbar];
@@ -386,8 +390,8 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIStackView *rows = [[UIStackView alloc] init];
     rows.translatesAutoresizingMaskIntoConstraints = NO;
     rows.axis = UILayoutConstraintAxisVertical;
-    rows.spacing = 4;
-    [toolbar.contentView addSubview:rows];
+    rows.spacing = 6;
+    [toolbar addSubview:rows];
 
     // Fn row (hidden until Fn is toggled): F1-F12, horizontally scrolling.
     _fnRow = [[UIScrollView alloc] init];
@@ -396,7 +400,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIStackView *fnStack = [[UIStackView alloc] init];
     fnStack.translatesAutoresizingMaskIntoConstraints = NO;
     fnStack.axis = UILayoutConstraintAxisHorizontal;
-    fnStack.spacing = 3;
+    fnStack.spacing = 6;
     fnStack.distribution = UIStackViewDistributionFillEqually;
     [_fnRow addSubview:fnStack];
     for (int i = 0; i < 12; i++) {
@@ -439,7 +443,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _secondaryRow = [[UIStackView alloc] init];
     _secondaryRow.translatesAutoresizingMaskIntoConstraints = NO;
     _secondaryRow.axis = UILayoutConstraintAxisHorizontal;
-    _secondaryRow.spacing = 3;
+    _secondaryRow.spacing = 6;
     _secondaryRow.distribution = UIStackViewDistributionFillEqually;
     [self addKey:_secondaryRow title:@"home" bytes:"\x1B[H" length:3];
     [self addKey:_secondaryRow title:@"end" bytes:"\x1B[F" length:3];
@@ -468,14 +472,14 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // distributes equally, so the arrows are as wide as the text
     // keys instead of squeezed into the leftover space, and the icon
     // keys (paste, hide-keyboard) are as wide as the rest instead of
-    // narrow. On a 430 pt screen each key is ~35 pt — the
-    // four-letter labels shrink slightly to fit (see keyButton).
+    // narrow. On a 430 pt screen each key is ~33 pt at 6 pt spacing —
+    // the four-letter labels shrink slightly to fit (see keyButton).
     // Paste is a clipboard icon, not the word: the word took the
     // most width in the row, and the icon reads just as clearly.
     UIStackView *primary = [[UIStackView alloc] init];
     primary.translatesAutoresizingMaskIntoConstraints = NO;
     primary.axis = UILayoutConstraintAxisHorizontal;
-    primary.spacing = 3;
+    primary.spacing = 6;
     primary.distribution = UIStackViewDistributionFillEqually;
     _ctrlButton = [self keyButton:@"ctrl"];
     [_ctrlButton addTarget:self action:@selector(onCtrl) forControlEvents:UIControlEventTouchUpInside];
@@ -498,7 +502,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIButton *pasteButton = [self keyButton:@"paste"];
     [pasteButton setTitle:nil forState:UIControlStateNormal];
     [pasteButton setImage:[UIImage systemImageNamed:@"doc.on.clipboard"
-                                   withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:16 weight:UIImageSymbolWeightMedium]]
+                                   withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightMedium]]
                  forState:UIControlStateNormal];
     pasteButton.tintColor = [UIColor whiteColor];
     pasteButton.accessibilityHint = @"Pastes the clipboard into the terminal.";
@@ -516,7 +520,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [self addArrowKey:primary title:@"↑" tag:1];
     [self addArrowKey:primary title:@"↓" tag:2];
     UIButton *kbd = [self keyButton:@"⌨"];
-    kbd.titleLabel.font = [UIFont monospacedSystemFontOfSize:16 weight:UIFontWeightMedium];
+    kbd.titleLabel.font = [UIFont monospacedSystemFontOfSize:18 weight:UIFontWeightMedium];
     kbd.accessibilityHint = @"Hides the keyboard. Tap the terminal to show it again.";
     [kbd addTarget:self action:@selector(onKeyboard) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:kbd];
@@ -532,7 +536,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         [toolbar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [rows.leadingAnchor constraintEqualToAnchor:toolbar.leadingAnchor constant:4],
         [rows.trailingAnchor constraintEqualToAnchor:toolbar.trailingAnchor constant:-4],
-        [rows.topAnchor constraintEqualToAnchor:toolbar.topAnchor constant:5],
+        [rows.topAnchor constraintEqualToAnchor:toolbar.topAnchor constant:8],
         [rows.bottomAnchor constraintEqualToAnchor:toolbar.bottomAnchor constant:-4],
         [_fnRow.heightAnchor constraintEqualToConstant:TXConfigKeyRowHeightPt],
         [_secondaryRow.heightAnchor constraintEqualToConstant:TXConfigKeyRowHeightPt],
@@ -912,15 +916,15 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     b.layer.shadowRadius = 1;
     b.layer.shadowOpacity = 0.35;
     // Slim horizontal insets: the primary row holds eleven equal
-    // keys, and 10 pt insets overflowed a 430 pt screen once Paste
-    // joined it. The titles shrink to fit instead of clipping: with
+    // keys at 6 pt spacing, and wider insets would overflow a 430 pt
+    // screen. The titles shrink to fit instead of clipping: with
     // equal widths a four-letter label ("ctrl", "more", ~33.2 pt at
     // 14 pt) is wider than its key, so the title scales down rather
-    // than truncating. 2 pt insets and a 0.6 floor keep it fitting
-    // even on a 320 pt screen: each key is ~25.6 pt, leaving ~21.6 pt
+    // than truncating. 1 pt insets and a 0.6 floor keep it fitting
+    // even on a 320 pt screen: each key is ~22.9 pt, leaving ~20.9 pt
     // for the label, and 33.2 pt at 0.6 scale is ~19.9 pt. The
     // three-letter keys stay at full size.
-    b.contentEdgeInsets = UIEdgeInsetsMake(6, 2, 6, 2);
+    b.contentEdgeInsets = UIEdgeInsetsMake(6, 1, 6, 1);
     b.titleLabel.adjustsFontSizeToFitWidth = YES;
     b.titleLabel.minimumScaleFactor = 0.6;
     // Pressed state: the key lightens while the finger is down, on
@@ -1034,12 +1038,15 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 
 // An arrow key: a full-height keyButton like every other key, with
 // its own touch target and hold-to-repeat. A single glyph needs less
-// side padding than a word, so the arrows take 5 pt insets. They sit
-// directly in the primary row now, one equal share each — the nested
-// stack that used to squeeze them into the leftover width is gone.
+// side padding than a word, so the arrows take 5 pt insets, and the
+// glyph is 18 pt so it fills the taller 42 pt key the way the
+// keyboard's own symbols do. They sit directly in the primary row
+// now, one equal share each — the nested stack that used to squeeze
+// them into the leftover width is gone.
 - (void)addArrowKey:(UIStackView *)row title:(NSString *)title tag:(NSInteger)tag {
     UIButton *b = [self keyButton:title];
     b.tag = tag;
+    b.titleLabel.font = [UIFont monospacedSystemFontOfSize:18 weight:UIFontWeightMedium];
     b.contentEdgeInsets = UIEdgeInsetsMake(6, 5, 6, 5);
     [b addTarget:self action:@selector(arrowTouchDown:) forControlEvents:UIControlEventTouchDown];
     [b addTarget:self action:@selector(arrowTouchUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];

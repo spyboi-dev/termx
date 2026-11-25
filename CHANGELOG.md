@@ -96,6 +96,14 @@ anything about backgrounding. It never comes back.
   the near-duplicates consolidated (log background 0.12 → card
   0.11, progress track 0.20 → button 0.22).
 
+### Immersive keyboard-style key row
+
+The key rows now match the iOS keyboard they sit above: 42 pt
+tall keys at 6 pt spacing, on a solid black toolbar instead of
+the SystemChromeMaterial blur, so the whole screen reads as one
+black surface. Arrow glyphs, the paste icon, and the
+hide-keyboard glyph are 18 pt to fill the taller keys.
+
 ### UI bug-fix round: leaks, stale flags, and polish
 
 Three fresh audits of the 81d40f4 build found one real leak, one

@@ -56,7 +56,9 @@
 #define TXConfigPinchDeadZonePt 0.1
 
 // Key rows: every row (Fn, secondary, primary) is this tall.
-#define TXConfigKeyRowHeightPt 34.0
+// 42 pt matches the iOS keyboard's own key height, so the
+// terminal keys read as keyboard keys, not a thin strip.
+#define TXConfigKeyRowHeightPt 42.0
 
 // Clear-on-boot fresh prompt (TerminalViewController): the newline
 // that asks bash for a prompt on the clean screen is only sent once
