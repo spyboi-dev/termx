@@ -2,9 +2,12 @@
 // from Settings.
 //
 // Font size (the same size pinch zoom changes, settable here with
-// a stepper) and the terminal appearance (the background, which is
-// pure black). The stepper sets the live surface's size at once
-// through the Ghostty view, so the terminal behind reflects it.
+// a stepper) and the terminal colors: a list of preset color themes
+// (Black is the default), shown with a checkmark on the selected
+// one. Picking a theme writes its colors to the Ghostty config
+// file and reloads the live surface at once, so the terminal
+// behind reflects it. The stepper sets the live surface's size
+// the same way.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import <UIKit/UIKit.h>
 

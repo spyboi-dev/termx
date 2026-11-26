@@ -12,6 +12,7 @@
 #import <string.h>
 
 #import "TXLog.h"
+#import "TXTerminalTheme.h"
 #import "TXTheme.h"
 
 @interface TXGhosttyView ()
@@ -202,52 +203,21 @@ static void TXGhosttyWriteClipboard(
         TXLogEngine(@"Ghostty: config creation failed");
         return;
     }
-    // Pure black background: Ghostty's default theme is One Dark
-    // (#282C34), and the view's own black is hidden behind the
-    // Metal layer Ghostty renders into, so the view colour alone
-    // never shows. The C API has no config setter; the reference
-    // wrapper writes a config file and loads it, so this does the
-    // same: one line, loaded before finalize. The config lives in
-    // Documents (not Caches) so it is visible in the Files app
-    // alongside the guest data and logs; the stale Caches copy from
-    // before is removed so there is one source of truth. One live
-    // copy only: this file IS the config Ghostty reads, and the app
-    // never keeps a second copy. If the user edits it in Files,
-    // their other lines survive: only the background line is owned
-    // here (forced to black, the required background), and every
-    // other line is kept as-is.
-    NSString *configDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *configPath = [configDir stringByAppendingPathComponent:@"ghostty-config.conf"];
-    NSString *oldCachesPath = [[NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject]
-        stringByAppendingPathComponent:@"ghostty-config.conf"];
-    [[NSFileManager defaultManager] removeItemAtPath:oldCachesPath error:nil];
-    NSString *existing = [NSString stringWithContentsOfFile:configPath
-                                                    encoding:NSUTF8StringEncoding error:nil];
-    NSMutableArray<NSString *> *keptLines = [NSMutableArray array];
-    for (NSString *line in [existing componentsSeparatedByString:@"\n"]) {
-        NSString *trimmed = [line stringByTrimmingCharactersInSet:
-            [NSCharacterSet whitespaceCharacterSet]];
-        // Drop only an existing "background = ..." line (the app
-        // owns the background); keep every other line the user may
-        // have added in Files. "background-opacity" and friends are
-        // not the background line: after "background" the next
-        // non-space character must be "=".
-        BOOL isBackgroundLine = NO;
-        if ([trimmed hasPrefix:@"background"]) {
-            NSString *rest = [[trimmed substringFromIndex:@"background".length]
-                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-            isBackgroundLine = [rest hasPrefix:@"="];
-        }
-        if (!isBackgroundLine && trimmed.length) [keptLines addObject:line];
-    }
-    [keptLines insertObject:@"background = #000000" atIndex:0];
-    NSString *configContent = [[keptLines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
-    NSError *writeError = nil;
-    if (![configContent writeToFile:configPath atomically:YES encoding:NSUTF8StringEncoding error:&writeError]) {
-        TXLogEngine(@"Ghostty: background config write failed: %@", writeError);
-    } else {
-        ghostty_config_load_file(_config, [configPath UTF8String]);
-    }
+    // The color theme: the config file holds the selected theme's
+    // color lines (background, foreground, cursor, selection),
+    // written by TXTerminalThemeWriteConfig, which also keeps any
+    // other lines the user added in Files and removes the stale
+    // Caches copy so there is one live copy. The config lives in
+    // Documents so it is visible in the Files app alongside the
+    // guest data and logs. The C API has no config setter; the
+    // reference wrapper writes a config file and loads it, so this
+    // does the same, loaded before finalize. The default theme is
+    // Black, pure black, not Ghostty's default One Dark (#282C34):
+    // the view's own black is hidden behind the Metal layer
+    // Ghostty renders into, so the view colour alone never shows.
+    TXTerminalThemeWriteConfig();
+    NSString *configPath = TXTerminalThemeConfigPath();
+    ghostty_config_load_file(_config, [configPath UTF8String]);
     ghostty_config_finalize(_config);
     ghostty_runtime_config_s rt;
     memset(&rt, 0, sizeof(rt));
@@ -788,6 +758,24 @@ static uint32_t TXUnshiftedCodepointForGhosttyKey(ghostty_input_key_e key) {
     snprintf(action, sizeof(action), "set_font_size:%.0f", (double)size);
     if (ghostty_surface_binding_action(_surface, action, strlen(action))) {
         TXSetTermFontSize(size);
+    }
+}
+
+// Reload the Ghostty config on the live surface, so a color theme
+// picked in Settings applies without relaunching: one
+// reload_config binding action, the same action the keyboard
+// shortcut triggers. If it fails (or there is no surface yet),
+// the config file is already rewritten, so the next surface
+// creation picks the theme up anyway.
+- (void)reloadConfig {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self reloadConfig]; });
+        return;
+    }
+    if (!_surface) return;
+    const char *action = "reload_config";
+    if (!ghostty_surface_binding_action(_surface, action, strlen(action))) {
+        TXLogEngine(@"Ghostty: reload_config failed; theme applies on next launch");
     }
 }
 

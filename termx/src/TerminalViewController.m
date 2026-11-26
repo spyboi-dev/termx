@@ -34,9 +34,7 @@
 #import "TXTheme.h"
 
 @interface TerminalViewController () <KernEngineDelegate, UITextFieldDelegate, UIGestureRecognizerDelegate, TXTerminalSessionManagerDelegate, UIDocumentPickerDelegate>
-// Chrome helpers (Sessions section): glass press scale and haptics.
-- (void)circleButtonPressed:(UIButton *)button;
-- (void)circleButtonReleased:(UIButton *)button;
+// Chrome helpers (Sessions section): haptics.
 - (void)chromeLightHaptic;
 - (void)chromeMediumHaptic;
 - (void)chromeSelectionHaptic;
@@ -90,14 +88,18 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 }
 @end
 
-// The glass material for the multi-window chrome, matching
-// Swipterm's frosted glass: a dark system material blur, so the
-// terminal behind shows through blurred and dimmed. One helper so
-// the sidebar, the top bar, the circular buttons and the selected
-// session card all use the same material.
-static UIVisualEffectView *TXGlassEffectView(void) {
-    UIVisualEffectView *effectView = [[UIVisualEffectView alloc]
-        initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
+// Liquid Glass for the one custom view that really needs it: the
+// sidebar panel. Apple's doc says standard bars and buttons pick
+// up Liquid Glass automatically, and custom backgrounds only
+// interfere — so the top bar is a UIToolbar and the buttons use
+// the system glass button style, and no hand-made blur remains
+// anywhere. The sidebar is a custom floating panel, so it uses
+// UIGlassEffect (the doc's fallback for custom views), regular
+// style, not interactive. The glass is the panel's background;
+// the session cards on top of it are plain rows, no glass.
+static UIVisualEffectView *TXLiquidGlassEffectView(void) {
+    UIGlassEffect *effect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
+    UIVisualEffectView *effectView = [[UIVisualEffectView alloc] initWithEffect:effect];
     effectView.translatesAutoresizingMaskIntoConstraints = NO;
     return effectView;
 }
@@ -129,7 +131,7 @@ static UIVisualEffectView *TXGlassEffectView(void) {
     NSUInteger _copyFeedbackGeneration; // Copy taps, so a later tap's "Copied" is not cut short by an earlier tap's timer
     // Multiple windows (Swipterm's UI): the top bar and the sidebar.
     TXTerminalSessionManager *_sessionManager;
-    UIView *_topBar; // panel toggle left, session title centred, + right
+    UIToolbar *_topBar; // system toolbar: Liquid Glass bar, panel left, title centred, + right
     UILabel *_topBarTitleLabel;
     UIView *_sidebarView; // slides in from the left, terminal dimmed behind
     UIView *_sidebarDimView;
@@ -182,22 +184,21 @@ static UIVisualEffectView *TXGlassEffectView(void) {
     };
     [self.view addSubview:_output];
 
-    // Top bar (Swipterm's terminal header): a circular panel toggle
-    // on the left, the session title centred in bold, and the +
-    // on the RIGHT (the user's one change from Swipterm, where the
-    // + sits next to the panel icon on the left). Glass, not flat
-    // black: a dark material blur, so the bar reads as frosted glass
-    // like Swipterm's header. The Ghostty view starts under this bar.
-    _topBar = [[UIView alloc] init];
-    _topBar.backgroundColor = [UIColor clearColor];
+    // Top bar: a system UIToolbar, so the bar itself is Liquid
+    // Glass automatically — no custom background, no hand-made
+    // blur. Panel toggle on the left, the session title centred in
+    // bold, and the + on the RIGHT (the user's one change from
+    // Swipterm, where the + sits next to the panel icon on the
+    // left). The buttons are system glass buttons (see
+    // circleButtonWithSymbol), so the system draws each icon over
+    // its own glass. The title is a plain label subview, centred
+    // on the bar. The Ghostty view starts under this bar.
+    _topBar = [[UIToolbar alloc] init];
     _topBar.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_topBar];
-    UIVisualEffectView *topBarGlass = TXGlassEffectView();
-    [_topBar insertSubview:topBarGlass atIndex:0];
     UIButton *panelButton = [self circleButtonWithSymbol:@"sidebar.left" action:@selector(onToggleSidebar)];
     panelButton.accessibilityLabel = @"Sessions";
     panelButton.accessibilityHint = @"Shows the session list.";
-    [_topBar addSubview:panelButton];
     _topBarTitleLabel = [[UILabel alloc] init];
     _topBarTitleLabel.font = [UIFont boldSystemFontOfSize:17];
     _topBarTitleLabel.textColor = [UIColor whiteColor];
@@ -208,27 +209,18 @@ static UIVisualEffectView *TXGlassEffectView(void) {
     UIButton *addButton = [self circleButtonWithSymbol:@"plus" action:@selector(onNewSession)];
     addButton.accessibilityLabel = @"New session";
     addButton.accessibilityHint = @"Opens a new terminal window.";
-    [_topBar addSubview:addButton];
+    UIBarButtonItem *panelItem = [[UIBarButtonItem alloc] initWithCustomView:panelButton];
+    UIBarButtonItem *addItem = [[UIBarButtonItem alloc] initWithCustomView:addButton];
+    UIBarButtonItem *flex = [[UIBarButtonItem alloc]
+        initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
+    _topBar.items = @[panelItem, flex, addItem];
     UILayoutGuide *topSafe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
         [_topBar.topAnchor constraintEqualToAnchor:topSafe.topAnchor],
         [_topBar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [_topBar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [_topBar.heightAnchor constraintEqualToConstant:52],
-        [topBarGlass.topAnchor constraintEqualToAnchor:_topBar.topAnchor],
-        [topBarGlass.leadingAnchor constraintEqualToAnchor:_topBar.leadingAnchor],
-        [topBarGlass.trailingAnchor constraintEqualToAnchor:_topBar.trailingAnchor],
-        [topBarGlass.bottomAnchor constraintEqualToAnchor:_topBar.bottomAnchor],
-        [panelButton.leadingAnchor constraintEqualToAnchor:_topBar.leadingAnchor constant:12],
-        [panelButton.centerYAnchor constraintEqualToAnchor:_topBar.centerYAnchor],
-        [panelButton.widthAnchor constraintEqualToConstant:44],
-        [panelButton.heightAnchor constraintEqualToConstant:44],
-        [addButton.trailingAnchor constraintEqualToAnchor:_topBar.trailingAnchor constant:-12],
-        [addButton.centerYAnchor constraintEqualToAnchor:_topBar.centerYAnchor],
-        [addButton.widthAnchor constraintEqualToConstant:44],
-        [addButton.heightAnchor constraintEqualToConstant:44],
-        [_topBarTitleLabel.leadingAnchor constraintEqualToAnchor:panelButton.trailingAnchor constant:8],
-        [_topBarTitleLabel.trailingAnchor constraintEqualToAnchor:addButton.leadingAnchor constant:-8],
+        [_topBarTitleLabel.centerXAnchor constraintEqualToAnchor:_topBar.centerXAnchor],
         [_topBarTitleLabel.centerYAnchor constraintEqualToAnchor:_topBar.centerYAnchor],
     ]];
 
@@ -385,8 +377,7 @@ static UIVisualEffectView *TXGlassEffectView(void) {
     [_moreButton addTarget:self action:@selector(onMore) forControlEvents:UIControlEventTouchUpInside];
     _moreButton.accessibilityHint = @"Shows or hides the second key row.";
     [primary addArrangedSubview:_moreButton];
-    // Paste as a clipboard icon: keyButton:@"paste" gives it the
-    // "Paste" VoiceOver label, then the title is swapped for the
+    // Paste as a clipboard icon: the title is swapped for the
     // SF Symbol so it takes one key's width like everything else.
     // Same action, same chunked paste, same haptics as before.
     // Paste is the Font Awesome solid clipboard icon, at the
@@ -399,11 +390,11 @@ static UIVisualEffectView *TXGlassEffectView(void) {
     // transparent, so the key's grey shows through them, the way
     // the Font Awesome icon is drawn.
     UIButton *pasteButton = [self keyButton:@"paste"];
-    [pasteButton setTitle:nil forState:UIControlStateNormal];
-    UIImage *pasteImage = [[UIImage imageNamed:@"FAClipboard"]
+    UIButtonConfiguration *pasteConfig = [pasteButton.configuration copy];
+    pasteConfig.title = nil;
+    pasteConfig.image = [[UIImage imageNamed:@"FAClipboard"]
         imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
-    [pasteButton setImage:pasteImage forState:UIControlStateNormal];
-    pasteButton.tintColor = [UIColor whiteColor];
+    pasteButton.configuration = pasteConfig;
     pasteButton.accessibilityHint = @"Pastes the clipboard into the terminal.";
     [pasteButton addTarget:self action:@selector(onPaste) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:pasteButton];
@@ -419,7 +410,6 @@ static UIVisualEffectView *TXGlassEffectView(void) {
     [self addArrowKey:primary title:@"↑" tag:1];
     [self addArrowKey:primary title:@"↓" tag:2];
     UIButton *kbd = [self keyButton:@"⌨"];
-    kbd.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightMedium];
     kbd.accessibilityHint = @"Hides the keyboard. Tap the terminal to show it again.";
     [kbd addTarget:self action:@selector(onKeyboard) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:kbd];
@@ -519,14 +509,15 @@ static UIVisualEffectView *TXGlassEffectView(void) {
     [_sidebarDimView addGestureRecognizer:dimTap];
 
     // The sidebar itself: 300 pt wide (Swipterm's width), full
-    // height, hidden off-screen left until opened. Glass, not flat
-    // black: a dark material blur, so the terminal behind shows
-    // through blurred and dimmed, the way Swipterm's sidebar does.
+    // height, hidden off-screen left until opened. Liquid Glass,
+    // not a hand-made blur: the system glass material, so the
+    // terminal behind shows through the panel the way Swipterm's
+    // sidebar does. The session cards on top of it are plain rows.
     _sidebarView = [[UIView alloc] init];
     _sidebarView.backgroundColor = [UIColor clearColor];
     _sidebarView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_sidebarView];
-    UIVisualEffectView *sidebarGlass = TXGlassEffectView();
+    UIVisualEffectView *sidebarGlass = TXLiquidGlassEffectView();
     [_sidebarView insertSubview:sidebarGlass atIndex:0];
     _sidebarLeadingConstraint = [_sidebarView.leadingAnchor
         constraintEqualToAnchor:self.view.leadingAnchor constant:-300];
@@ -590,12 +581,8 @@ static UIVisualEffectView *TXGlassEffectView(void) {
         [sidebarTitle.centerYAnchor constraintEqualToAnchor:sidebarAddButton.centerYAnchor],
         [sidebarPanelButton.trailingAnchor constraintEqualToAnchor:_sidebarView.trailingAnchor constant:-16],
         [sidebarPanelButton.topAnchor constraintEqualToAnchor:_sidebarView.topAnchor constant:8],
-        [sidebarPanelButton.widthAnchor constraintEqualToConstant:44],
-        [sidebarPanelButton.heightAnchor constraintEqualToConstant:44],
         [sidebarAddButton.trailingAnchor constraintEqualToAnchor:sidebarPanelButton.leadingAnchor constant:-8],
         [sidebarAddButton.centerYAnchor constraintEqualToAnchor:sidebarPanelButton.centerYAnchor],
-        [sidebarAddButton.widthAnchor constraintEqualToConstant:44],
-        [sidebarAddButton.heightAnchor constraintEqualToConstant:44],
         [sidebarScroll.topAnchor constraintEqualToAnchor:sidebarPanelButton.bottomAnchor constant:8],
         [sidebarScroll.leadingAnchor constraintEqualToAnchor:_sidebarView.leadingAnchor],
         [sidebarScroll.trailingAnchor constraintEqualToAnchor:_sidebarView.trailingAnchor],
@@ -607,12 +594,8 @@ static UIVisualEffectView *TXGlassEffectView(void) {
         [_sidebarSessionStack.widthAnchor constraintEqualToAnchor:sidebarScroll.frameLayoutGuide.widthAnchor constant:-24],
         [gearButton.leadingAnchor constraintEqualToAnchor:_sidebarView.leadingAnchor constant:16],
         [gearButton.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12],
-        [gearButton.widthAnchor constraintEqualToConstant:44],
-        [gearButton.heightAnchor constraintEqualToConstant:44],
         [filesButton.leadingAnchor constraintEqualToAnchor:gearButton.trailingAnchor constant:12],
         [filesButton.centerYAnchor constraintEqualToAnchor:gearButton.centerYAnchor],
-        [filesButton.widthAnchor constraintEqualToConstant:44],
-        [filesButton.heightAnchor constraintEqualToConstant:44],
     ]];
 
     // Swipe in from the left edge to open the sidebar, the way the
@@ -709,26 +692,6 @@ static UIVisualEffectView *TXGlassEffectView(void) {
     [_output setFocused:NO];
 }
 
-// The one key background colour, for every state a key can be in.
-// A toggle's ON colour lives on the button's `selected` property, so
-// the pressed-state handlers and setToggle below can both ask this
-// one function instead of each remembering the colours — the old
-// code had setToggle restore white 0.16 while keyButton used 0.30,
-// so a toggled-off key came back visibly darker than its siblings.
-static UIColor *TXKeyBackground(BOOL on, BOOL pressed) {
-    if (pressed) {
-        // Pressed ON is a lighter teal, so the press still reads on
-        // a latched toggle; pressed OFF is the same light grey as before.
-        return on ? [UIColor colorWithRed:0.35 green:0.80 blue:0.72 alpha:1.0]
-                  : [UIColor colorWithWhite:0.35 alpha:1.0];
-    }
-    // ON is the app accent teal (#2AB3A3, TXThemeAccentColor), not
-    // blue: a blue toggle on a teal-accent app reads as a different
-    // app's colour.
-    return on ? TXThemeAccentColor()
-              : TXThemeKeyBackground();
-}
-
 // VoiceOver label for a key title: the glyphs and abbreviations
 // ("←", "⌨", "ctrl", "pgup") read as nothing useful on their own.
 static NSString *TXKeyAccessibilityLabel(NSString *title) {
@@ -757,62 +720,40 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 - (UIButton *)keyButton:(NSString *)title {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     b.translatesAutoresizingMaskIntoConstraints = NO;
-    [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
-    // The key design from the user's mockup: a dark grey key with
-    // white sans-serif text and a thin light border, not the old
-    // flat mid-grey key with monospaced text. The border is what
-    // makes the key read as a key against the black toolbar — a
-    // flat fill with no edge blends into the black. The fill is
-    // white 0.22, darker than the old 0.30, and the corner radius
-    // is 9 pt, rounder than the old 6 pt, so the keys match the
-    // mockup's pill-like roundness. The small shadow below the key
-    // gives the same depth the mockup's keys have.
-    b.backgroundColor = TXKeyBackground(NO, NO);
-    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateSelected];
-    b.layer.cornerRadius = TXThemeCornerRadiusKey;
-    b.layer.borderWidth = 1;
-    b.layer.borderColor = TXThemeKeyBorderColor().CGColor;
-    b.layer.shadowColor = [UIColor blackColor].CGColor;
-    b.layer.shadowOffset = CGSizeMake(0, 1);
-    b.layer.shadowRadius = 1;
-    b.layer.shadowOpacity = 0.35;
-    // Slim horizontal insets: the primary row holds eleven equal
-    // keys at 6 pt spacing, and wider insets would overflow a 430 pt
-    // screen. The titles shrink to fit instead of clipping: with
-    // equal widths the widest four-letter label ("more", ~36 pt at
+    // System glass button (iOS 26): the configuration is the glass,
+    // so there is no solid fill, no manual border, and no shadow —
+    // the terminal blurs through the key itself. The system draws
+    // the title over its own glass and gives the press response, so
+    // a key never renders as an empty pill. The key row keeps its
+    // sizes, spacing, and 9 pt-ish roundness (Medium corner style).
+    // Single glyphs (arrows, hide-keyboard) at 18 pt like the
+    // keyboard's own symbols; words at 16 pt.
+    UIButtonConfiguration *config = [UIButtonConfiguration glassButtonConfiguration];
+    config.title = title;
+    config.baseForegroundColor = [UIColor whiteColor];
+    config.cornerStyle = UIButtonConfigurationCornerStyleMedium;
+    config.contentInsets = NSDirectionalEdgeInsetsMake(6, 1, 6, 1);
+    UIFont *font = (title.length == 1)
+        ? [UIFont systemFontOfSize:18 weight:UIFontWeightMedium]
+        : [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    config.titleTextAttributesTransformer = ^NSDictionary<NSAttributedStringKey, id> *(NSDictionary<NSAttributedStringKey, id> *incoming) {
+        NSMutableDictionary<NSAttributedStringKey, id> *attrs = [incoming mutableCopy];
+        attrs[NSFontAttributeName] = font;
+        return attrs;
+    };
+    b.configuration = config;
+    // The titles shrink to fit instead of clipping: with equal
+    // widths the widest four-letter label ("more", ~36 pt at
     // 16 pt sans-serif) is wider than its key, so the title scales
-    // down rather than truncating. 1 pt insets and a 0.5 floor keep
-    // it fitting even on a 320 pt screen: each key is ~22.9 pt,
-    // leaving ~20.9 pt for the label, and 36 pt at 0.5 scale is
-    // 18 pt. The three-letter keys stay at full size.
-    b.contentEdgeInsets = UIEdgeInsetsMake(6, 1, 6, 1);
+    // down rather than truncating. A 0.5 floor keeps it fitting
+    // even on a 320 pt screen.
     b.titleLabel.adjustsFontSizeToFitWidth = YES;
     b.titleLabel.minimumScaleFactor = 0.5;
-    // Pressed state: the key lightens while the finger is down, on
-    // top of the default title dim. TouchDown fires before the
-    // key's own action, TouchUp restores the colour before the
-    // action's toggle (if any) sets the new one — the order is the
-    // order the targets were added, and keyButton's targets are
-    // added first, at creation.
-    [b addTarget:self action:@selector(keyButtonPressed:) forControlEvents:UIControlEventTouchDown];
-    [b addTarget:self action:@selector(keyButtonReleased:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
     // VoiceOver: a glyph or abbreviation alone reads as nothing.
     b.accessibilityLabel = TXKeyAccessibilityLabel(title);
     b.accessibilityHint = @"Sends this key to the terminal.";
     b.accessibilityTraits = UIAccessibilityTraitButton;
     return b;
-}
-
-// A press lightens the key; releasing restores the colour for its
-// toggle state (selected = a latched Ctrl/Alt or an open More/Fn row).
-- (void)keyButtonPressed:(UIButton *)button {
-    button.backgroundColor = TXKeyBackground(button.selected, YES);
-}
-
-- (void)keyButtonReleased:(UIButton *)button {
-    button.backgroundColor = TXKeyBackground(button.selected, NO);
 }
 
 // A light tap for a key press. The generator is prepared again
@@ -938,17 +879,14 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 }
 
 // An arrow key: a full-height keyButton like every other key, with
-// its own touch target and hold-to-repeat. A single glyph needs less
-// side padding than a word, so the arrows take 5 pt insets, and the
-// glyph is 18 pt so it fills the taller 42 pt key the way the
-// keyboard's own symbols do. They sit directly in the primary row
-// now, one equal share each — the nested stack that used to squeeze
-// them into the leftover width is gone.
+// its own touch target and hold-to-repeat. The single glyph is
+// 18 pt (set in keyButton), so it fills the taller 42 pt key the
+// way the keyboard's own symbols do. They sit directly in the
+// primary row now, one equal share each — the nested stack that
+// used to squeeze them into the leftover width is gone.
 - (void)addArrowKey:(UIStackView *)row title:(NSString *)title tag:(NSInteger)tag {
     UIButton *b = [self keyButton:title];
     b.tag = tag;
-    b.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightMedium];
-    b.contentEdgeInsets = UIEdgeInsetsMake(6, 5, 6, 5);
     [b addTarget:self action:@selector(arrowTouchDown:) forControlEvents:UIControlEventTouchDown];
     [b addTarget:self action:@selector(arrowTouchUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
     [row addArrangedSubview:b];
@@ -992,11 +930,15 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 }
 
 - (void)setToggle:(UIButton *)button on:(BOOL)on {
-    // The toggle state lives on `selected`, so the pressed-state
-    // handlers can restore the right colour without knowing which
-    // toggle this is. VoiceOver reads the value as On/Off.
+    // The toggle state lives on `selected`. The visual is a tint
+    // on the glass configuration: teal when latched, no tint when
+    // not, so the key stays glass in both states. The press
+    // response is the glass button's own. VoiceOver reads the
+    // value as On/Off.
     button.selected = on;
-    button.backgroundColor = TXKeyBackground(on, NO);
+    UIButtonConfiguration *config = [button.configuration copy];
+    config.baseBackgroundColor = on ? TXThemeAccentColor() : nil;
+    button.configuration = config;
     button.accessibilityValue = on ? @"On" : @"Off";
 }
 
@@ -1005,47 +947,24 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 - (UIButton *)circleButtonWithSymbol:(NSString *)symbol action:(SEL)action {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     b.translatesAutoresizingMaskIntoConstraints = NO;
-    UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration
-        configurationWithPointSize:20 weight:UIImageSymbolWeightMedium];
-    UIImage *image = [UIImage systemImageNamed:symbol withConfiguration:config];
-    [b setImage:image forState:UIControlStateNormal];
-    b.tintColor = [UIColor whiteColor];
-    // A glass circle, like Swipterm's: a dark material blur clipped
-    // to the circle, so the terminal behind blurs through it. The
-    // flat 0.12 grey is gone. 44 pt, so the corner radius (22)
-    // makes it a circle.
-    b.backgroundColor = [UIColor clearColor];
-    UIVisualEffectView *glass = TXGlassEffectView();
-    [b insertSubview:glass atIndex:0];
-    [NSLayoutConstraint activateConstraints:@[
-        [glass.topAnchor constraintEqualToAnchor:b.topAnchor],
-        [glass.leadingAnchor constraintEqualToAnchor:b.leadingAnchor],
-        [glass.trailingAnchor constraintEqualToAnchor:b.trailingAnchor],
-        [glass.bottomAnchor constraintEqualToAnchor:b.bottomAnchor],
-    ]];
-    b.layer.cornerRadius = 22;
-    b.clipsToBounds = YES;
-    // Press scale: shrink slightly on touch, spring back on release.
-    [b addTarget:self action:@selector(circleButtonPressed:) forControlEvents:UIControlEventTouchDown];
-    [b addTarget:self action:@selector(circleButtonReleased:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+    // System glass button (iOS 26): the configuration is the glass.
+    // The system draws the SF Symbol over its own glass, so the
+    // icon is never covered the way a hand-added blur view covered
+    // it (the empty dark circles). No manual background, border,
+    // shadow, or press scale: the glass button has its own press
+    // response. 44 pt, capsule corner style, so it is a circle.
+    UIButtonConfiguration *config = [UIButtonConfiguration glassButtonConfiguration];
+    config.image = [UIImage systemImageNamed:symbol withConfiguration:
+        [UIImageSymbolConfiguration configurationWithPointSize:20 weight:UIImageSymbolWeightMedium]];
+    config.baseForegroundColor = [UIColor whiteColor];
+    config.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+    b.configuration = config;
     [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [NSLayoutConstraint activateConstraints:@[
+        [b.widthAnchor constraintEqualToConstant:44],
+        [b.heightAnchor constraintEqualToConstant:44],
+    ]];
     return b;
-}
-
-// Press scale for the circular chrome buttons: shrink slightly on
-// touch, spring back on release, the way Swipterm's glass buttons
-// respond. Visual only; the haptic for the action fires in the
-// action itself.
-- (void)circleButtonPressed:(UIButton *)button {
-    [UIView animateWithDuration:0.12 animations:^{
-        button.transform = CGAffineTransformMakeScale(0.90, 0.90);
-    }];
-}
-
-- (void)circleButtonReleased:(UIButton *)button {
-    [UIView animateWithDuration:0.35 delay:0 usingSpringWithDamping:0.6 initialSpringVelocity:0 options:0 animations:^{
-        button.transform = CGAffineTransformIdentity;
-    } completion:nil];
 }
 
 // Haptics for the chrome only (top bar, sidebar, Settings): one
@@ -1159,20 +1078,12 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
         BOOL selected = (i == _sessionManager.currentIndex);
         UIButton *card = [UIButton buttonWithType:UIButtonTypeSystem];
         card.translatesAutoresizingMaskIntoConstraints = NO;
-        // The selected card is glass: a dark material blur in the
-        // rounded rect, slightly lighter than the sidebar panel.
-        // Unselected cards stay clear, like Swipterm's.
-        card.backgroundColor = [UIColor clearColor];
-        if (selected) {
-            UIVisualEffectView *glass = TXGlassEffectView();
-            [card insertSubview:glass atIndex:0];
-            [NSLayoutConstraint activateConstraints:@[
-                [glass.topAnchor constraintEqualToAnchor:card.topAnchor],
-                [glass.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
-                [glass.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
-                [glass.bottomAnchor constraintEqualToAnchor:card.bottomAnchor],
-            ]];
-        }
+        // Plain rows over the sidebar's glass: no glass on the
+        // cards themselves. The selected card gets a plain lighter
+        // fill; unselected cards stay clear, like Swipterm's.
+        card.backgroundColor = selected
+            ? [UIColor colorWithWhite:1.0 alpha:0.10]
+            : [UIColor clearColor];
         card.layer.cornerRadius = 12;
         card.clipsToBounds = YES;
         card.tag = (NSInteger)i;

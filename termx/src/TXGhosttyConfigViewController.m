@@ -4,11 +4,13 @@
 
 #import "TXConfig.h"
 #import "TXGhosttyView.h"
+#import "TXTerminalTheme.h"
 #import "TXTheme.h"
 
 typedef NS_ENUM(NSInteger, TXGhosttyConfigSection) {
     TXGhosttyConfigSectionFont = 0,
     TXGhosttyConfigSectionAppearance,
+    TXGhosttyConfigSectionTheme,
     TXGhosttyConfigSectionCount,
 };
 
@@ -39,6 +41,7 @@ typedef NS_ENUM(NSInteger, TXGhosttyConfigSection) {
     switch (section) {
         case TXGhosttyConfigSectionFont: return 2;
         case TXGhosttyConfigSectionAppearance: return 1;
+        case TXGhosttyConfigSectionTheme: return TXTerminalThemeCount;
         default: return 0;
     }
 }
@@ -48,6 +51,7 @@ typedef NS_ENUM(NSInteger, TXGhosttyConfigSection) {
     switch (section) {
         case TXGhosttyConfigSectionFont: return @"Font";
         case TXGhosttyConfigSectionAppearance: return @"Appearance";
+        case TXGhosttyConfigSectionTheme: return @"Color Theme";
         default: return nil;
     }
 }
@@ -95,8 +99,22 @@ typedef NS_ENUM(NSInteger, TXGhosttyConfigSection) {
             cell.selectionStyle = UITableViewCellSelectionStyleDefault;
         }
     } else if (indexPath.section == TXGhosttyConfigSectionAppearance) {
+        // The background of the selected theme, so this row stays
+        // true when another theme is picked.
+        TXTerminalTheme theme = TXTerminalThemes[TXTerminalThemeSelectedIndex()];
         cell.textLabel.text = @"Background";
-        cell.detailTextLabel.text = @"Black";
+        cell.detailTextLabel.text = [NSString stringWithUTF8String:theme.background];
+    } else if (indexPath.section == TXGhosttyConfigSectionTheme) {
+        // Preset themes only, no color picker and no hex field:
+        // a tap picks the theme, the checkmark shows the selected
+        // one, and the config is rewritten and reloaded on the
+        // live surface at once.
+        TXTerminalTheme theme = TXTerminalThemes[indexPath.row];
+        cell.textLabel.text = [NSString stringWithUTF8String:theme.name];
+        cell.accessoryType = (indexPath.row == TXTerminalThemeSelectedIndex())
+            ? UITableViewCellAccessoryCheckmark
+            : UITableViewCellAccessoryNone;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     }
     return cell;
 }
@@ -105,6 +123,11 @@ typedef NS_ENUM(NSInteger, TXGhosttyConfigSection) {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (indexPath.section == TXGhosttyConfigSectionFont && indexPath.row == 1) {
         [self.terminalOutput setFontSize:TXConfigTermFontSizeDefault];
+        [self.tableView reloadData];
+    } else if (indexPath.section == TXGhosttyConfigSectionTheme) {
+        TXTerminalThemeSetSelectedIndex(indexPath.row);
+        TXTerminalThemeWriteConfig();
+        [self.terminalOutput reloadConfig];
         [self.tableView reloadData];
     }
 }

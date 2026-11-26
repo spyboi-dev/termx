@@ -115,13 +115,10 @@ typedef NS_ENUM(NSInteger, TXSettingsContainerRow) {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:kCellID];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:kCellID];
-        // Glassy card, not flat: the grouped cell's background is a
-        // dark material blur, so the card reads as frosted glass
-        // over the black table, matching Swipterm's grouped cards.
-        UIVisualEffectView *glass = [[UIVisualEffectView alloc]
-            initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
-        cell.backgroundView = glass;
-        cell.backgroundColor = [UIColor clearColor];
+        // Plain rows, no glass: the doc says to apply Liquid Glass
+        // sparingly, only to the most important functional
+        // elements. A settings row is not one; it uses the
+        // standard grouped cell background.
         cell.textLabel.textColor = [UIColor whiteColor];
         cell.textLabel.font = [UIFont systemFontOfSize:17];
         cell.detailTextLabel.textColor = TXThemeSecondaryTextColor();

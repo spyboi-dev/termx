@@ -79,7 +79,7 @@ FWSHA=$(sha256sum Frameworks/KRuntime_6_18_4K.framework/KRuntime_6_18_4K | cut -
 CFLAGS="-target arm64-apple-ios$MIN -isysroot $SDK -miphoneos-version-min=$MIN -fobjc-arc -O2 -Wno-deprecated-declarations -DTERMX_BUILD_COMMIT=\"$COMMIT\" -DTERMX_FRAMEWORK_SHA256=\"$FWSHA\" -I$SRC -IFrameworks/Ghostty/include -F$SDK/System/Library/SubFrameworks -F$SDK/System/Library/PrivateFrameworks"
 
 echo "== compile"
-for f in main AppDelegate TerminalViewController KernEngine GuestInstall TXCrashLog TXLog TXLogViewController TXStartupViewController TXAboutViewController TXGuestFlow TXLocalhostProxy TXGhosttyView TXBackgroundKeepAlive TXStikJITCoordinator TXStikJITTransport TXPairingStore TXLoopbackProbe TXOnDevicePairing TXTerminalSessionManager TXSettingsViewController TXJITDetailViewController TXGhosttyConfigViewController TXLocalhostDetailViewController; do
+for f in main AppDelegate TerminalViewController KernEngine GuestInstall TXCrashLog TXLog TXLogViewController TXStartupViewController TXAboutViewController TXGuestFlow TXLocalhostProxy TXGhosttyView TXBackgroundKeepAlive TXStikJITCoordinator TXStikJITTransport TXPairingStore TXLoopbackProbe TXOnDevicePairing TXTerminalSessionManager TXSettingsViewController TXJITDetailViewController TXGhosttyConfigViewController TXTerminalTheme TXLocalhostDetailViewController; do
   echo "   $f.m"
   $CLANG $CFLAGS -c "$SRC/$f.m" -o "$OUT/$f.o"
 done
@@ -118,7 +118,7 @@ ld64.lld-18 -arch arm64 -platform_version ios $MIN 26.5 \
   "$OUT"/TXPairingStore.o "$OUT"/TXLoopbackProbe.o "$OUT"/TXOnDevicePairing.o \
   "$OUT"/TXTerminalSessionManager.o "$OUT"/TXSettingsViewController.o \
   "$OUT"/TXJITDetailViewController.o "$OUT"/TXGhosttyConfigViewController.o \
-  "$OUT"/TXLocalhostDetailViewController.o \
+  "$OUT"/TXTerminalTheme.o "$OUT"/TXLocalhostDetailViewController.o \
   "$OUT"/vt.o \
   Frameworks/Ghostty/libghostty.a \
   $RPPAIRING_LIB \

@@ -83,6 +83,13 @@
 // persisted, like the pinch zoom.
 - (void)setFontSize:(CGFloat)size;
 
+// Reload the Ghostty config on the live surface, via the
+// reload_config binding action, so a color theme picked in
+// Settings applies without relaunching. If the reload fails, the
+// config file is already rewritten and the next launch picks the
+// theme up.
+- (void)reloadConfig;
+
 // Whether the surface is focused (cursor shown). Set NO when the
 // terminal screen goes away; YES while it is on screen.
 - (void)setFocused:(BOOL)focused;
