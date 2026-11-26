@@ -29,3 +29,4 @@ termx/CRASH-*.txt
 # rootfs-build/tx-vsock-bridge.c; rebuild with
 # aarch64-linux-gnu-gcc -static -O2 -o tx-vsock-bridge tx-vsock-bridge.c).
 rootfs-build/tx-vsock-bridge
+termx/helper-artifact/
