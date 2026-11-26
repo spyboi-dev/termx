@@ -456,13 +456,18 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
-            // Home + erase: ESC[2J alone erases but leaves the
-            // cursor where the replay left it — on the bottom row
-            // after a full boot log — so the fresh prompt lands on
-            // the bottom row, with the whole screen empty above it.
-            // ESC[H first puts the cursor at the top-left, so the
-            // prompt opens at the top, the way Termux opens.
-            static const uint8_t clearSeq[] = { 0x1B, '[', 'H', 0x1B, '[', '2', 'J' };
+            // Home + erase + erase scrollback: ESC[2J alone erases
+            // only the visible screen, and ESC[H first puts the
+            // cursor at the top-left, so the prompt opens at the
+            // top, the way Termux opens. But the boot log stays in
+            // scrollback, and a pinch zoom (a font-size change)
+            // reflows the grid and pulls those scrollback lines
+            // back into the visible area, so the boot log reappears
+            // on zoom. ESC[3J erases the scrollback too, so the
+            // boot log is truly gone and zooming reflows only what
+            // is on screen. The log itself is not lost: it stays
+            // in guest.log and engine.log.
+            static const uint8_t clearSeq[] = { 0x1B, '[', 'H', 0x1B, '[', '2', 'J', 0x1B, '[', '3', 'J' };
             [strongSelf->_output feedGuestOutput:[NSData dataWithBytes:clearSeq length:sizeof(clearSeq)]];
             // The shell prompt is only ever printed by the shell
             // itself, never by the boot log, so "@iphone:" in the
