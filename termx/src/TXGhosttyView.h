@@ -78,6 +78,11 @@
 // bracketed paste when the terminal has that mode on.
 - (void)pasteText:(NSString *)text;
 
+// Set the font size absolutely (Settings stepper), via Ghostty's
+// set_font_size binding action. Clamped to Termux's 4-256 pt and
+// persisted, like the pinch zoom.
+- (void)setFontSize:(CGFloat)size;
+
 // Whether the surface is focused (cursor shown). Set NO when the
 // terminal screen goes away; YES while it is on screen.
 - (void)setFocused:(BOOL)focused;

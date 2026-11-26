@@ -77,7 +77,7 @@ apt_install_retry() {
       bash coreutils util-linux mount procps psmisc \
       apt dpkg ca-certificates debian-archive-keyring gnupg \
       sudo passwd adduser \
-      iproute2 iputils-ping curl wget nano less \
+      iproute2 iputils-ping curl wget nano less tmux \
       openssh-client tar gzip xz-utils file \
       locales tzdata kmod bash-completion ncurses-base \
       systemd-timesyncd fastfetch \

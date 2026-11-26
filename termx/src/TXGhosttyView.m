@@ -207,11 +207,43 @@ static void TXGhosttyWriteClipboard(
     // Metal layer Ghostty renders into, so the view colour alone
     // never shows. The C API has no config setter; the reference
     // wrapper writes a config file and loads it, so this does the
-    // same: one line, loaded before finalize.
-    NSString *configDir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    // same: one line, loaded before finalize. The config lives in
+    // Documents (not Caches) so it is visible in the Files app
+    // alongside the guest data and logs; the stale Caches copy from
+    // before is removed so there is one source of truth. One live
+    // copy only: this file IS the config Ghostty reads, and the app
+    // never keeps a second copy. If the user edits it in Files,
+    // their other lines survive: only the background line is owned
+    // here (forced to black, the required background), and every
+    // other line is kept as-is.
+    NSString *configDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *configPath = [configDir stringByAppendingPathComponent:@"ghostty-config.conf"];
+    NSString *oldCachesPath = [[NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject]
+        stringByAppendingPathComponent:@"ghostty-config.conf"];
+    [[NSFileManager defaultManager] removeItemAtPath:oldCachesPath error:nil];
+    NSString *existing = [NSString stringWithContentsOfFile:configPath
+                                                    encoding:NSUTF8StringEncoding error:nil];
+    NSMutableArray<NSString *> *keptLines = [NSMutableArray array];
+    for (NSString *line in [existing componentsSeparatedByString:@"\n"]) {
+        NSString *trimmed = [line stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceCharacterSet]];
+        // Drop only an existing "background = ..." line (the app
+        // owns the background); keep every other line the user may
+        // have added in Files. "background-opacity" and friends are
+        // not the background line: after "background" the next
+        // non-space character must be "=".
+        BOOL isBackgroundLine = NO;
+        if ([trimmed hasPrefix:@"background"]) {
+            NSString *rest = [[trimmed substringFromIndex:@"background".length]
+                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            isBackgroundLine = [rest hasPrefix:@"="];
+        }
+        if (!isBackgroundLine && trimmed.length) [keptLines addObject:line];
+    }
+    [keptLines insertObject:@"background = #000000" atIndex:0];
+    NSString *configContent = [[keptLines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
     NSError *writeError = nil;
-    if (![@"background = #000000\n" writeToFile:configPath atomically:YES encoding:NSUTF8StringEncoding error:&writeError]) {
+    if (![configContent writeToFile:configPath atomically:YES encoding:NSUTF8StringEncoding error:&writeError]) {
         TXLogEngine(@"Ghostty: background config write failed: %@", writeError);
     } else {
         ghostty_config_load_file(_config, [configPath UTF8String]);
@@ -737,6 +769,25 @@ static uint32_t TXUnshiftedCodepointForGhosttyKey(ghostty_input_key_e key) {
             break;
         default:
             break;
+    }
+}
+
+// Set the font size absolutely (Settings stepper): one
+// set_font_size binding action with the target size, clamped to
+// Termux's range and persisted, like the pinch zoom. Ghostty
+// re-lays out the grid and reflows the content to the new width.
+- (void)setFontSize:(CGFloat)size {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self setFontSize:size]; });
+        return;
+    }
+    if (!_surface) return;
+    if (size < TXConfigTermFontSizeMin) size = TXConfigTermFontSizeMin;
+    if (size > TXConfigTermFontSizeMax) size = TXConfigTermFontSizeMax;
+    char action[64];
+    snprintf(action, sizeof(action), "set_font_size:%.0f", (double)size);
+    if (ghostty_surface_binding_action(_surface, action, strlen(action))) {
+        TXSetTermFontSize(size);
     }
 }
 

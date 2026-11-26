@@ -29,9 +29,11 @@
 #import "TXConfig.h"
 #import "TXGhosttyView.h"
 #import "TXLog.h"
+#import "TXSettingsViewController.h"
+#import "TXTerminalSessionManager.h"
 #import "TXTheme.h"
 
-@interface TerminalViewController () <KernEngineDelegate, UITextFieldDelegate, UIGestureRecognizerDelegate>
+@interface TerminalViewController () <KernEngineDelegate, UITextFieldDelegate, UIGestureRecognizerDelegate, TXTerminalSessionManagerDelegate, UIDocumentPickerDelegate>
 @end
 
 static const uint8_t kFnBytes[12][6] = {
@@ -104,6 +106,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIButton *_copyButton; // secondary-row Copy, kept so onCopyAll can show "Copied"
     UILabel *_guestStatusLabel; // "Guest stopped/failed" notice over the terminal
     NSUInteger _copyFeedbackGeneration; // Copy taps, so a later tap's "Copied" is not cut short by an earlier tap's timer
+    // Multiple windows (Swipterm's UI): the top bar and the sidebar.
+    TXTerminalSessionManager *_sessionManager;
+    UIView *_topBar; // panel toggle left, session title centred, + right
+    UILabel *_topBarTitleLabel;
+    UIView *_sidebarView; // slides in from the left, terminal dimmed behind
+    UIView *_sidebarDimView;
+    UIStackView *_sidebarSessionStack; // session cards, rebuilt on change
+    NSLayoutConstraint *_sidebarLeadingConstraint; // -width when closed, 0 open
+    BOOL _sidebarVisible;
 }
 
 - (void)viewDidLoad {
@@ -141,6 +152,49 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         [strongSelf->_bellHaptic prepare];
     };
     [self.view addSubview:_output];
+
+    // Top bar (Swipterm's terminal header): a circular panel toggle
+    // on the left, the session title centred in bold, and the +
+    // on the RIGHT (the user's one change from Swipterm, where the
+    // + sits next to the panel icon on the left). Pure black, like
+    // the terminal below it. The Ghostty view starts under this bar.
+    _topBar = [[UIView alloc] init];
+    _topBar.backgroundColor = TXThemeBackgroundColor();
+    _topBar.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:_topBar];
+    UIButton *panelButton = [self circleButtonWithSymbol:@"sidebar.left" action:@selector(onToggleSidebar)];
+    panelButton.accessibilityLabel = @"Sessions";
+    panelButton.accessibilityHint = @"Shows the session list.";
+    [_topBar addSubview:panelButton];
+    _topBarTitleLabel = [[UILabel alloc] init];
+    _topBarTitleLabel.font = [UIFont boldSystemFontOfSize:17];
+    _topBarTitleLabel.textColor = [UIColor whiteColor];
+    _topBarTitleLabel.textAlignment = NSTextAlignmentCenter;
+    _topBarTitleLabel.text = @"iphone";
+    _topBarTitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [_topBar addSubview:_topBarTitleLabel];
+    UIButton *addButton = [self circleButtonWithSymbol:@"plus" action:@selector(onNewSession)];
+    addButton.accessibilityLabel = @"New session";
+    addButton.accessibilityHint = @"Opens a new terminal window.";
+    [_topBar addSubview:addButton];
+    UILayoutGuide *topSafe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [_topBar.topAnchor constraintEqualToAnchor:topSafe.topAnchor],
+        [_topBar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_topBar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_topBar.heightAnchor constraintEqualToConstant:52],
+        [panelButton.leadingAnchor constraintEqualToAnchor:_topBar.leadingAnchor constant:12],
+        [panelButton.centerYAnchor constraintEqualToAnchor:_topBar.centerYAnchor],
+        [panelButton.widthAnchor constraintEqualToConstant:44],
+        [panelButton.heightAnchor constraintEqualToConstant:44],
+        [addButton.trailingAnchor constraintEqualToAnchor:_topBar.trailingAnchor constant:-12],
+        [addButton.centerYAnchor constraintEqualToAnchor:_topBar.centerYAnchor],
+        [addButton.widthAnchor constraintEqualToConstant:44],
+        [addButton.heightAnchor constraintEqualToConstant:44],
+        [_topBarTitleLabel.leadingAnchor constraintEqualToAnchor:panelButton.trailingAnchor constant:8],
+        [_topBarTitleLabel.trailingAnchor constraintEqualToAnchor:addButton.leadingAnchor constant:-8],
+        [_topBarTitleLabel.centerYAnchor constraintEqualToAnchor:_topBar.centerYAnchor],
+    ]];
 
     // Replay the console output from before this screen existed, and
     // take over live delivery, in one atomic step: the engine sets
@@ -337,7 +391,7 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [_output.topAnchor constraintEqualToAnchor:safe.topAnchor],
+        [_output.topAnchor constraintEqualToAnchor:_topBar.bottomAnchor],
         [_output.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
         [_output.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
         [_output.bottomAnchor constraintEqualToAnchor:toolbar.topAnchor],
@@ -402,10 +456,131 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     _guestStatusLabel.hidden = YES;
     [self.view addSubview:_guestStatusLabel];
     [NSLayoutConstraint activateConstraints:@[
-        [_guestStatusLabel.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
+        [_guestStatusLabel.topAnchor constraintEqualToAnchor:_topBar.bottomAnchor constant:8],
         [_guestStatusLabel.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
         [_guestStatusLabel.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
     ]];
+
+    // Multiple windows: the session manager (tmux in the guest)
+    // and the sidebar (Swipterm's session list, sliding over the
+    // terminal, which dims behind it). The manager owns the session
+    // list; this controller owns the UI and feeds it the Ghostty
+    // surface for the tmux keystrokes.
+    _sessionManager = [[TXTerminalSessionManager alloc] init];
+    _sessionManager.output = _output;
+    _sessionManager.delegate = self;
+
+    // Dim view over the terminal while the sidebar is open; a tap
+    // on it closes the sidebar.
+    _sidebarDimView = [[UIView alloc] init];
+    _sidebarDimView.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
+    _sidebarDimView.translatesAutoresizingMaskIntoConstraints = NO;
+    _sidebarDimView.hidden = YES;
+    _sidebarDimView.alpha = 0;
+    [self.view addSubview:_sidebarDimView];
+    UITapGestureRecognizer *dimTap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onSidebarDimTap)];
+    [_sidebarDimView addGestureRecognizer:dimTap];
+
+    // The sidebar itself: 300 pt wide (Swipterm's width), full
+    // height, hidden off-screen left until opened. Pure black,
+    // like the terminal.
+    _sidebarView = [[UIView alloc] init];
+    _sidebarView.backgroundColor = TXThemeBackgroundColor();
+    _sidebarView.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:_sidebarView];
+    _sidebarLeadingConstraint = [_sidebarView.leadingAnchor
+        constraintEqualToAnchor:self.view.leadingAnchor constant:-300];
+    _sidebarLeadingConstraint.active = YES;
+    [NSLayoutConstraint activateConstraints:@[
+        [_sidebarDimView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_sidebarDimView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_sidebarDimView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_sidebarDimView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [_sidebarView.topAnchor constraintEqualToAnchor:safe.topAnchor],
+        [_sidebarView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [_sidebarView.widthAnchor constraintEqualToConstant:300],
+    ]];
+
+    // Sidebar header: "TermX" bold on the left, the + and the panel
+    // icon on the right, all circular like Swipterm's.
+    UILabel *sidebarTitle = [[UILabel alloc] init];
+    sidebarTitle.font = [UIFont boldSystemFontOfSize:20];
+    sidebarTitle.textColor = [UIColor whiteColor];
+    sidebarTitle.text = @"TermX";
+    sidebarTitle.translatesAutoresizingMaskIntoConstraints = NO;
+    [_sidebarView addSubview:sidebarTitle];
+    UIButton *sidebarAddButton = [self circleButtonWithSymbol:@"plus" action:@selector(onNewSession)];
+    sidebarAddButton.accessibilityLabel = @"New session";
+    sidebarAddButton.accessibilityHint = @"Opens a new terminal window.";
+    [_sidebarView addSubview:sidebarAddButton];
+    UIButton *sidebarPanelButton = [self circleButtonWithSymbol:@"sidebar.left" action:@selector(onToggleSidebar)];
+    sidebarPanelButton.accessibilityLabel = @"Hide sessions";
+    sidebarPanelButton.accessibilityHint = @"Hides the session list.";
+    [_sidebarView addSubview:sidebarPanelButton];
+
+    // Session cards: a scrollable vertical stack, rebuilt whenever
+    // the session list changes.
+    UIScrollView *sidebarScroll = [[UIScrollView alloc] init];
+    sidebarScroll.translatesAutoresizingMaskIntoConstraints = NO;
+    [_sidebarView addSubview:sidebarScroll];
+    _sidebarSessionStack = [[UIStackView alloc] init];
+    _sidebarSessionStack.axis = UILayoutConstraintAxisVertical;
+    _sidebarSessionStack.spacing = 4;
+    _sidebarSessionStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [sidebarScroll addSubview:_sidebarSessionStack];
+
+    // Sidebar bottom row: the gear (Settings) and, next to it, the
+    // folder (Files), both circular like Swipterm's gear.
+    UIButton *gearButton = [self circleButtonWithSymbol:@"gearshape" action:@selector(onOpenSettings)];
+    gearButton.accessibilityLabel = @"Settings";
+    gearButton.accessibilityHint = @"Opens Settings.";
+    [_sidebarView addSubview:gearButton];
+    UIButton *filesButton = [self circleButtonWithSymbol:@"folder" action:@selector(onOpenFiles)];
+    filesButton.accessibilityLabel = @"Files";
+    filesButton.accessibilityHint = @"Opens the TermX folder in the Files app.";
+    [_sidebarView addSubview:filesButton];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [sidebarTitle.leadingAnchor constraintEqualToAnchor:_sidebarView.leadingAnchor constant:16],
+        [sidebarTitle.topAnchor constraintEqualToAnchor:_sidebarView.topAnchor constant:12],
+        [sidebarTitle.centerYAnchor constraintEqualToAnchor:sidebarAddButton.centerYAnchor],
+        [sidebarPanelButton.trailingAnchor constraintEqualToAnchor:_sidebarView.trailingAnchor constant:-16],
+        [sidebarPanelButton.topAnchor constraintEqualToAnchor:_sidebarView.topAnchor constant:8],
+        [sidebarPanelButton.widthAnchor constraintEqualToConstant:44],
+        [sidebarPanelButton.heightAnchor constraintEqualToConstant:44],
+        [sidebarAddButton.trailingAnchor constraintEqualToAnchor:sidebarPanelButton.leadingAnchor constant:-8],
+        [sidebarAddButton.centerYAnchor constraintEqualToAnchor:sidebarPanelButton.centerYAnchor],
+        [sidebarAddButton.widthAnchor constraintEqualToConstant:44],
+        [sidebarAddButton.heightAnchor constraintEqualToConstant:44],
+        [sidebarScroll.topAnchor constraintEqualToAnchor:sidebarPanelButton.bottomAnchor constant:8],
+        [sidebarScroll.leadingAnchor constraintEqualToAnchor:_sidebarView.leadingAnchor],
+        [sidebarScroll.trailingAnchor constraintEqualToAnchor:_sidebarView.trailingAnchor],
+        [sidebarScroll.bottomAnchor constraintEqualToAnchor:gearButton.topAnchor constant:-8],
+        [_sidebarSessionStack.leadingAnchor constraintEqualToAnchor:sidebarScroll.contentLayoutGuide.leadingAnchor constant:12],
+        [_sidebarSessionStack.trailingAnchor constraintEqualToAnchor:sidebarScroll.contentLayoutGuide.trailingAnchor constant:-12],
+        [_sidebarSessionStack.topAnchor constraintEqualToAnchor:sidebarScroll.contentLayoutGuide.topAnchor constant:8],
+        [_sidebarSessionStack.bottomAnchor constraintEqualToAnchor:sidebarScroll.contentLayoutGuide.bottomAnchor constant:-8],
+        [_sidebarSessionStack.widthAnchor constraintEqualToAnchor:sidebarScroll.frameLayoutGuide.widthAnchor constant:-24],
+        [gearButton.leadingAnchor constraintEqualToAnchor:_sidebarView.leadingAnchor constant:16],
+        [gearButton.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12],
+        [gearButton.widthAnchor constraintEqualToConstant:44],
+        [gearButton.heightAnchor constraintEqualToConstant:44],
+        [filesButton.leadingAnchor constraintEqualToAnchor:gearButton.trailingAnchor constant:12],
+        [filesButton.centerYAnchor constraintEqualToAnchor:gearButton.centerYAnchor],
+        [filesButton.widthAnchor constraintEqualToConstant:44],
+        [filesButton.heightAnchor constraintEqualToConstant:44],
+    ]];
+
+    // Swipe in from the left edge to open the sidebar, the way the
+    // split-view sidebar opens. The exit pan (swipe down from the
+    // top) is untouched.
+    UIScreenEdgePanGestureRecognizer *edgePan = [[UIScreenEdgePanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onSidebarEdgePan:)];
+    edgePan.edges = UIRectEdgeLeft;
+    [self.view addGestureRecognizer:edgePan];
+
+    [self rebuildSidebarSessions];
 
     [self termXEngineDidChangeState:_engine.state status:_engine.statusText];
 }
@@ -782,6 +957,222 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     button.accessibilityValue = on ? @"On" : @"Off";
 }
 
+#pragma mark - Sessions (top bar / sidebar)
+
+- (UIButton *)circleButtonWithSymbol:(NSString *)symbol action:(SEL)action {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration
+        configurationWithPointSize:20 weight:UIImageSymbolWeightMedium];
+    UIImage *image = [UIImage systemImageNamed:symbol withConfiguration:config];
+    [b setImage:image forState:UIControlStateNormal];
+    b.tintColor = [UIColor whiteColor];
+    // Circular dark button, like Swipterm's: a touch lighter than
+    // the black behind it, so the circle reads. 44 pt, so the
+    // corner radius (22) makes it a circle.
+    b.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1.0];
+    b.layer.cornerRadius = 22;
+    b.clipsToBounds = YES;
+    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)onToggleSidebar {
+    [self setSidebarVisible:!_sidebarVisible animated:YES];
+}
+
+- (void)setSidebarVisible:(BOOL)visible animated:(BOOL)animated {
+    if (visible == _sidebarVisible) return;
+    _sidebarVisible = visible;
+    if (visible) {
+        // The keyboard would cover the sidebar's bottom row (gear
+        // and Files); dismiss it while the sidebar is open, the way
+        // Swipterm shows the sidebar without a keyboard.
+        [self.view endEditing:YES];
+        _sidebarDimView.hidden = NO;
+    }
+    _sidebarLeadingConstraint.constant = visible ? 0 : -300;
+    void (^animations)(void) = ^{
+        [self.view layoutIfNeeded];
+        self->_sidebarDimView.alpha = visible ? 1 : 0;
+    };
+    void (^completion)(BOOL) = ^(BOOL finished) {
+        (void)finished;
+        if (!visible) {
+            self->_sidebarDimView.hidden = YES;
+            // Back to typing: refocus the keyboard once the
+            // sidebar is gone.
+            [self->_input becomeFirstResponder];
+        }
+    };
+    if (animated) {
+        [UIView animateWithDuration:0.3 animations:animations completion:completion];
+    } else {
+        animations();
+        completion(YES);
+    }
+}
+
+- (void)onSidebarDimTap {
+    [self setSidebarVisible:NO animated:YES];
+}
+
+- (void)onSidebarEdgePan:(UIScreenEdgePanGestureRecognizer *)pan {
+    if (pan.state == UIGestureRecognizerStateRecognized) {
+        [self setSidebarVisible:YES animated:YES];
+    }
+}
+
+// Rebuild the sidebar's session cards from the manager's list.
+// Each card: a terminal icon, the session name, and an X to close
+// it (hidden when it is the only session). The selected card gets
+// the lighter rounded fill, like Swipterm's. Tapping a card
+// switches to that session; tapping its X closes it.
+- (void)rebuildSidebarSessions {
+    for (UIView *view in _sidebarSessionStack.arrangedSubviews) {
+        [_sidebarSessionStack removeArrangedSubview:view];
+        [view removeFromSuperview];
+    }
+    NSArray<TXTerminalSession *> *sessions = _sessionManager.sessions;
+    for (NSUInteger i = 0; i < sessions.count; i++) {
+        TXTerminalSession *session = sessions[i];
+        BOOL selected = (i == _sessionManager.currentIndex);
+        UIButton *card = [UIButton buttonWithType:UIButtonTypeSystem];
+        card.translatesAutoresizingMaskIntoConstraints = NO;
+        card.backgroundColor = selected ? TXThemeCardBackground() : [UIColor clearColor];
+        card.layer.cornerRadius = 12;
+        card.clipsToBounds = YES;
+        card.tag = (NSInteger)i;
+        [card addTarget:self action:@selector(onSelectSession:) forControlEvents:UIControlEventTouchUpInside];
+        card.accessibilityLabel = session.displayName;
+        card.accessibilityHint = @"Switches to this terminal window.";
+        UIImageView *icon = [[UIImageView alloc] initWithImage:
+            [UIImage systemImageNamed:@"terminal" withConfiguration:
+                [UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightMedium]]];
+        icon.tintColor = [UIColor whiteColor];
+        icon.translatesAutoresizingMaskIntoConstraints = NO;
+        icon.contentMode = UIViewContentModeScaleAspectFit;
+        [card addSubview:icon];
+        UILabel *name = [[UILabel alloc] init];
+        name.font = [UIFont systemFontOfSize:17 weight:selected ? UIFontWeightMedium : UIFontWeightRegular];
+        name.textColor = [UIColor whiteColor];
+        name.text = session.displayName;
+        name.translatesAutoresizingMaskIntoConstraints = NO;
+        [card addSubview:name];
+        UIButton *closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        closeButton.translatesAutoresizingMaskIntoConstraints = NO;
+        [closeButton setImage:[UIImage systemImageNamed:@"xmark" withConfiguration:
+            [UIImageSymbolConfiguration configurationWithPointSize:13 weight:UIFontWeightSemibold]]
+                     forState:UIControlStateNormal];
+        closeButton.tintColor = TXThemeSecondaryTextColor();
+        closeButton.tag = (NSInteger)i;
+        [closeButton addTarget:self action:@selector(onCloseSession:) forControlEvents:UIControlEventTouchUpInside];
+        closeButton.accessibilityLabel = @"Close session";
+        closeButton.accessibilityHint = @"Closes this terminal window.";
+        // The last session never closes.
+        closeButton.hidden = (sessions.count <= 1);
+        [card addSubview:closeButton];
+        [NSLayoutConstraint activateConstraints:@[
+            [card.heightAnchor constraintEqualToConstant:48],
+            [icon.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+            [icon.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+            [icon.widthAnchor constraintEqualToConstant:22],
+            [icon.heightAnchor constraintEqualToConstant:22],
+            [name.leadingAnchor constraintEqualToAnchor:icon.trailingAnchor constant:10],
+            [name.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+            [name.trailingAnchor constraintEqualToAnchor:closeButton.leadingAnchor constant:-4],
+            [closeButton.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-4],
+            [closeButton.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+            [closeButton.widthAnchor constraintEqualToConstant:32],
+            [closeButton.heightAnchor constraintEqualToConstant:32],
+        ]];
+        [_sidebarSessionStack addArrangedSubview:card];
+    }
+}
+
+- (void)onSelectSession:(UIButton *)sender {
+    [_sessionManager switchToSessionAtIndex:(NSUInteger)sender.tag];
+    [self setSidebarVisible:NO animated:YES];
+}
+
+- (void)onCloseSession:(UIButton *)sender {
+    [_sessionManager closeSessionAtIndex:(NSUInteger)sender.tag];
+}
+
+- (void)onNewSession {
+    [_sessionManager createSession];
+    // A new session is the current one: close the sidebar so the
+    // user lands in it. (If the sidebar was closed, this is a
+    // no-op.)
+    if (_sidebarVisible) [self setSidebarVisible:NO animated:YES];
+}
+
+// Settings, Swipterm's style: a grouped table in a navigation
+// controller, presented modally. The terminal's Ghostty view goes
+// with it so the font-size stepper can set the live size.
+- (void)onOpenSettings {
+    TXSettingsViewController *settings = [[TXSettingsViewController alloc] init];
+    settings.terminalOutput = _output;
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:settings];
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self setSidebarVisible:NO animated:NO];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+// Files: open the Files app at this app's Documents folder, which
+// is the TermX folder (file sharing is on). That folder IS the
+// live data: the data disk, the image, the logs and the Ghostty
+// config all live there, so what Files shows is what the app
+// reads and writes — one copy, not a display copy. If the Files
+// app cannot be opened, fall back to an in-app document picker
+// at the same folder.
+- (void)onOpenFiles {
+    NSURL *filesURL = [NSURL URLWithString:@"shareddocuments://"];
+    __weak typeof(self) weakSelf = self;
+    [[UIApplication sharedApplication] openURL:filesURL options:@{} completionHandler:^(BOOL success) {
+        if (success) return;
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        // The string-based picker API (already used for the JIT
+        // pairing-file import): no extra framework, and the
+        // deprecated warning is silenced by the build flags.
+        UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
+            initWithDocumentTypes:@[@"public.folder"] inMode:UIDocumentPickerModeOpen];
+        picker.delegate = strongSelf;
+        [strongSelf setSidebarVisible:NO animated:NO];
+        [strongSelf presentViewController:picker animated:YES completion:nil];
+    }];
+    [self setSidebarVisible:NO animated:NO];
+}
+
+// The Files fallback picker is for browsing the TermX folder only;
+// picking a folder is a no-op (the live data is already there).
+- (void)documentPicker:(UIDocumentPickerViewController *)controller
+    didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    (void)controller; (void)urls;
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+    (void)controller;
+}
+
+// Session manager delegate: the list or the current session
+// changed — update the top bar title and rebuild the sidebar.
+- (void)sessionManagerDidUpdateSessions:(id)manager {
+    (void)manager;
+    _topBarTitleLabel.text = _sessionManager.currentSession.displayName;
+    [self rebuildSidebarSessions];
+}
+
+- (void)sessionManager:(id)manager showAlertWithTitle:(NSString *)title message:(NSString *)message {
+    (void)manager;
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
 #pragma mark - Actions
 
 // The toggles: tap to latch, tap again (or use it) to release. The
@@ -993,6 +1384,18 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     // fed on the main thread, so keep the whole block there.
     dispatch_async(dispatch_get_main_queue(), ^{
         [self->_output feedGuestOutput:data];
+        // Sessions: while a tmux start is pending, "command not
+        // found" means tmux is not installed (see the manager).
+        // And a fresh "Debian GNU/Linux" login banner while tmux
+        // was running means the guest rebooted, so tmux is gone
+        // and the session list goes back to one plain shell.
+        [self->_sessionManager checkConsoleOutputForTmuxFailure:data];
+        if (self->_sessionManager.tmuxStarted) {
+            NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (text && [text rangeOfString:@"Debian GNU/Linux"].location != NSNotFound) {
+                [self->_sessionManager resetToSingleSession];
+            }
+        }
     });
 }
 
