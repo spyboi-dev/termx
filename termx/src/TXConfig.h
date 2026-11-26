@@ -72,6 +72,15 @@
 #define TXConfigExitPanTopStripPt 44.0
 #define TXConfigExitPanTranslationThresholdPt 80.0
 
+// Edge fade (the scroll edge effect, Apple's scroll edge
+// treatment): the height of the blur-and-fade strip at the top
+// and bottom of the terminal, where scrolling text disappears
+// into the blur instead of being cut sharply. The top strip
+// runs from the screen top to this far below the safe area (it
+// covers the floating top buttons); the bottom strip is this
+// tall above the key row.
+#define TXConfigEdgeFadeHeightPt 56.0
+
 // Pinned-to-bottom: the terminal auto-follows new output while the
 // scroll offset is within this distance of the bottom.
 #define TXConfigPinnedToBottomThresholdPt 16.0

@@ -15,7 +15,7 @@
 #import "TXTerminalTheme.h"
 #import "TXTheme.h"
 
-@interface TXGhosttyView ()
+@interface TXGhosttyView () <UIGestureRecognizerDelegate>
 - (void)tx_tick;
 - (void)tx_requestFrame;
 - (void)tx_updateSublayerFrames;
@@ -23,6 +23,11 @@
 - (void)tx_completeClipboardRead:(void *)request;
 - (void)tx_ringBell;
 - (void)tx_handlePinch:(UIPinchGestureRecognizer *)gesture;
+- (void)tx_handleScrollPan:(UIPanGestureRecognizer *)pan;
+- (void)tx_startScrollMomentum:(CGFloat)velocityY;
+- (void)tx_stopScrollMomentum;
+- (void)tx_scrollMomentumTick:(CADisplayLink *)link;
+- (void)tx_settleScrollToRow;
 @end
 
 // Weak proxy for the display link: a CADisplayLink retains its
@@ -38,6 +43,19 @@
 - (void)tick:(CADisplayLink *)link {
     (void)link;
     [self.view tx_tick];
+}
+@end
+
+// Weak proxy for the scroll-momentum display link, same pattern
+// as the tick proxy: the link must not keep the view alive.
+@interface TXGhosttyMomentumProxy : NSObject
+@property (nonatomic, weak) TXGhosttyView *view;
+- (void)tick:(CADisplayLink *)link;
+@end
+
+@implementation TXGhosttyMomentumProxy
+- (void)tick:(CADisplayLink *)link {
+    [self.view tx_scrollMomentumTick:link];
 }
 @end
 
@@ -165,10 +183,18 @@ static void TXGhosttyWriteClipboard(
     CGSize _lastSizePx;
     CGFloat _pinchLastScale; // pinch-zoom: scale at the last step taken
     CGFloat _pinchFontSize;  // pinch-zoom: font size tracked on this side
+    // Scrollback scrolling: the pan's last translation (the delta
+    // since is what moves the viewport), and the momentum link
+    // with the flick velocity it decays, in pt/s.
+    CGPoint _scrollLastTranslation;
+    CADisplayLink *_scrollMomentumLink;
+    TXGhosttyMomentumProxy *_scrollMomentumProxy;
+    CGFloat _scrollMomentumVelocityY;
 }
 
 @synthesize viewportColumns = _viewportColumns;
 @synthesize viewportRows = _viewportRows;
+@synthesize surfaceBottomInset = _surfaceBottomInset;
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
@@ -189,6 +215,20 @@ static void TXGhosttyWriteClipboard(
     UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc]
         initWithTarget:self action:@selector(tx_handlePinch:)];
     [self addGestureRecognizer:pinch];
+    // Swipe to scroll the scrollback: a one-finger pan, the
+    // reference's touch scrolling (libghostty-spm
+    // UITerminalView+Scroll: a pan drives the engine viewport by
+    // the pixel through the smooth-scroll API). One finger only,
+    // so a two-finger pinch never also scrolls, and the tap to
+    // focus the keyboard is untouched (a tap has no movement, so
+    // the pan never begins for it). The exit drag is coordinated
+    // in gestureRecognizerShouldBegin: below.
+    UIPanGestureRecognizer *scrollPan = [[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(tx_handleScrollPan:)];
+    scrollPan.delegate = self;
+    scrollPan.minimumNumberOfTouches = 1;
+    scrollPan.maximumNumberOfTouches = 1;
+    [self addGestureRecognizer:scrollPan];
     return self;
 }
 
@@ -260,6 +300,13 @@ static void TXGhosttyWriteClipboard(
     _surface = ghostty_surface_new(_app, &cfg);
     if (_surface) {
         ghostty_surface_set_focus(_surface, _focused);
+        // Pixel-smooth scrolling (Patches/ghostty/0022): without
+        // this opt-in a precision scroll moves the viewport a
+        // whole row at a time, so content under the finger jumps.
+        // With it the viewport moves by whole rows and the
+        // remainder is a sub-row fraction the renderer draws, so
+        // the pan below can move the viewport by the pixel.
+        ghostty_surface_set_smooth_scroll(_surface, true);
         // A surface is born occluded and skips every draw until it
         // hears otherwise: stamp visibility now, so the first frame
         // draws. (didMoveToWindow re-stamps it on window changes.)
@@ -271,13 +318,20 @@ static void TXGhosttyWriteClipboard(
 }
 
 // Push the view size (in physical pixels) into the surface. The
-// resize callback reports the grid Ghostty computed from it.
+// resize callback reports the grid Ghostty computed from it. The
+// grid is shorter than the view by surfaceBottomInset: the view
+// is full-screen, but the grid ends above the key row, so the
+// prompt (the grid's last row) stays readable. The Metal layer
+// is still sized to the full view bounds (tx_updateSublayerFrames),
+// so the strip below the grid is the theme background, not text.
 - (void)tx_updateSize {
     if (!_surface) return;
     CGFloat scale = [UIScreen mainScreen].scale;
     CGSize size = self.bounds.size;
     uint32_t wPx = (uint32_t)lround(size.width * scale);
-    uint32_t hPx = (uint32_t)lround(size.height * scale);
+    CGFloat hPt = size.height - _surfaceBottomInset;
+    if (hPt < 20) hPt = 20; // never a zero or negative grid
+    uint32_t hPx = (uint32_t)lround(hPt * scale);
     if (wPx == 0 || hPx == 0) return;
     if (_surfaceReady && _lastSizePx.width == wPx && _lastSizePx.height == hPx) return;
     _lastSizePx = CGSizeMake(wPx, hPx);
@@ -288,6 +342,15 @@ static void TXGhosttyWriteClipboard(
         _surfaceReady = YES;
         [self tx_flushPendingOutput];
     }
+}
+
+// The controller sets the bottom inset whenever the key row
+// moves; a size update follows at once (layoutSubviews also
+// calls tx_updateSize, which no-ops when the size is unchanged).
+- (void)setSurfaceBottomInset:(CGFloat)surfaceBottomInset {
+    if (surfaceBottomInset == _surfaceBottomInset) return;
+    _surfaceBottomInset = MAX(0, surfaceBottomInset);
+    [self tx_updateSize];
 }
 
 - (void)layoutSubviews {
@@ -742,6 +805,163 @@ static uint32_t TXUnshiftedCodepointForGhosttyKey(ghostty_input_key_e key) {
     }
 }
 
+// Swipe to scroll the scrollback, the reference's touch
+// scrolling (libghostty-spm UITerminalView+Scroll, adapted to
+// this view's own display link): the pan's translation drives
+// the engine viewport by the pixel through
+// ghostty_surface_smooth_scroll_by_tracked, so the content
+// follows the finger 1:1 instead of jumping a row at a time.
+// Drag down pulls the content down (older output comes in from
+// the top): toward the scrollback, which is positive for the
+// smooth-scroll API. Drag up is the reverse, back toward the
+// prompt. A flick keeps going on momentum after the finger
+// lifts; a slow drag settles to the nearest row when it ends.
+// Typing is untouched: this is a pan on the terminal view, the
+// keyboard is owned by the hidden input field, and the pinch
+// (two fingers) never also scrolls.
+- (void)tx_handleScrollPan:(UIPanGestureRecognizer *)pan {
+    if (!_surface) return;
+    switch (pan.state) {
+        case UIGestureRecognizerStateBegan:
+            [self tx_stopScrollMomentum];
+            _scrollLastTranslation = CGPointZero;
+            break;
+        case UIGestureRecognizerStateChanged: {
+            CGPoint translation = [pan translationInView:self];
+            CGFloat dy = translation.y - _scrollLastTranslation.y;
+            _scrollLastTranslation = translation;
+            if (dy != 0) {
+                CGFloat scale = [UIScreen mainScreen].scale;
+                ghostty_surface_smooth_scroll_by_tracked(_surface, (double)(dy * scale));
+                _needsFrame = YES;
+            }
+            break;
+        }
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled: {
+            CGPoint velocity = [pan velocityInView:self];
+            // A flick keeps scrolling with momentum (the
+            // reference's TerminalMomentumScroll: 0.92 decay per
+            // 1/60 s, stop below 50 pt/s). A slow drag just
+            // settles to the nearest row.
+            if (fabs(velocity.y) >= 100) {
+                [self tx_startScrollMomentum:velocity.y];
+            } else {
+                [self tx_settleScrollToRow];
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+- (void)tx_startScrollMomentum:(CGFloat)velocityY {
+    [self tx_stopScrollMomentum];
+    _scrollMomentumVelocityY = velocityY;
+    _scrollMomentumProxy = [[TXGhosttyMomentumProxy alloc] init];
+    _scrollMomentumProxy.view = self;
+    _scrollMomentumLink = [CADisplayLink displayLinkWithTarget:_scrollMomentumProxy
+                                                        selector:@selector(tick:)];
+    [_scrollMomentumLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+
+- (void)tx_stopScrollMomentum {
+    [_scrollMomentumLink invalidate];
+    _scrollMomentumLink = nil;
+    _scrollMomentumProxy = nil;
+}
+
+// One momentum frame: decay the velocity, move the viewport by
+// what is left. The decay is per 1/60 s of wall time (0.92),
+// scaled by the frame duration so a 120 Hz display does not
+// decay twice as fast as a 60 Hz one.
+- (void)tx_scrollMomentumTick:(CADisplayLink *)link {
+    if (!_surface) {
+        [self tx_stopScrollMomentum];
+        return;
+    }
+    CGFloat dt = (CGFloat)link.duration;
+    if (dt <= 0) dt = 1.0 / 60.0;
+    _scrollMomentumVelocityY *= pow(0.92, dt * 60.0);
+    if (fabs(_scrollMomentumVelocityY) < 50) {
+        [self tx_stopScrollMomentum];
+        [self tx_settleScrollToRow];
+        return;
+    }
+    CGFloat scale = [UIScreen mainScreen].scale;
+    CGFloat dyPt = _scrollMomentumVelocityY * dt;
+    ghostty_surface_smooth_scroll_by_tracked(_surface, (double)(dyPt * scale));
+    _needsFrame = YES;
+}
+
+// Bring the viewport back to a whole row once a scroll stops:
+// the smooth-scroll fraction is a sub-row offset, and leaving
+// it means the text rests half a row off. The reference's
+// TerminalSmoothScrollPosition.pixelsToNearestRow: within half
+// a row, snap back to the current row; past half, snap forward
+// to the next. Positive is toward the scrollback.
+- (void)tx_settleScrollToRow {
+    if (!_surface) return;
+    ghostty_surface_smooth_scroll_s state;
+    memset(&state, 0, sizeof(state));
+    ghostty_surface_smooth_scroll(_surface, &state);
+    if (!state.available || state.cell_height == 0 || state.fraction == 0) return;
+    double settlePx = (state.fraction * 2 <= (double)state.cell_height)
+        ? state.fraction
+        : (state.fraction - (double)state.cell_height);
+    if (settlePx != 0) {
+        ghostty_surface_smooth_scroll_by(_surface, settlePx);
+        _needsFrame = YES;
+    }
+}
+
+- (BOOL)isScrolledToBottom {
+    if (!_surface) return YES; // no surface yet: the exit drag works
+    ghostty_surface_smooth_scroll_s state;
+    memset(&state, 0, sizeof(state));
+    ghostty_surface_smooth_scroll(_surface, &state);
+    // No scrollback (or a full-screen app with mouse reporting,
+    // where the scroll belongs to the app): at the bottom.
+    if (!state.available) return YES;
+    // At the bottom the engine forces the fraction to zero, so
+    // the row alone is the check.
+    return state.row >= state.max_row;
+}
+
+#pragma mark - UIGestureRecognizerDelegate
+
+// The scroll pan must not steal the exit drag: a downward drag
+// that starts in the top strip while the terminal is at the
+// bottom belongs to the controller's exit pan (it returns to the
+// startup screen). A drag up from there is a scroll into the
+// history, and a drag from anywhere else is a scroll, so those
+// begin. The exit pan's own gate (it only fires when the drag
+// began at the bottom) keeps a scroll that lands at the bottom
+// from dismissing.
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    if (![gestureRecognizer isKindOfClass:[UIPanGestureRecognizer class]]) return YES;
+    UIPanGestureRecognizer *pan = (UIPanGestureRecognizer *)gestureRecognizer;
+    CGPoint location = [pan locationInView:self];
+    if (location.y >= TXConfigExitPanTopStripPt) return YES;
+    // In the top strip: only yield a downward drag at the bottom.
+    // An upward drag is a scroll; a downward drag while scrolled
+    // up is a scroll back toward the prompt.
+    if (![self isScrolledToBottom]) return YES;
+    CGPoint translation = [pan translationInView:self];
+    if (translation.y <= 0) return YES;
+    return NO;
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
+    // The pinch (two fingers) and the tap never conflict with a
+    // one-finger pan; the exit pan is coordinated in
+    // shouldBegin above, so simultaneous recognition is safe.
+    (void)gestureRecognizer; (void)otherGestureRecognizer;
+    return YES;
+}
+
 // Set the font size absolutely (Settings stepper): one
 // set_font_size binding action with the target size, clamped to
 // Termux's range and persisted, like the pinch zoom. Ghostty
@@ -853,6 +1073,7 @@ static uint32_t TXUnshiftedCodepointForGhosttyKey(ghostty_input_key_e key) {
     TXLogEngine(@"TXGhosttyView dealloc");
     [_tickLink invalidate];
     _tickLink = nil;
+    [self tx_stopScrollMomentum];
     if (_surface) { ghostty_surface_free(_surface); _surface = NULL; }
     if (_app) { ghostty_app_free(_app); _app = NULL; }
     if (_config) { ghostty_config_free(_config); _config = NULL; }

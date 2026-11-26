@@ -83,6 +83,27 @@
 // persisted, like the pinch zoom.
 - (void)setFontSize:(CGFloat)size;
 
+// The strip at the bottom of the view the grid must not occupy,
+// in points. The view is full-screen (its Metal layer covers the
+// whole screen, so text can scroll behind the floating top
+// buttons and the key row), but the grid ends above the key row:
+// the prompt is the grid's last row, and it has to stay readable
+// above the key row. Ghostty's viewport cannot show empty space
+// below the last row — the smooth-scroll position is clamped to
+// the grid and the fraction is forced to zero at the bottom
+// (Patches/ghostty/0022) — so no scroll offset can lift the
+// prompt above the key row; the grid itself must end there. The
+// strip below the grid is the theme background (the root view
+// behind the layer). Set by the controller whenever the key row
+// moves (keyboard show/hide); 0 means the grid fills the view.
+@property (nonatomic) CGFloat surfaceBottomInset;
+
+// Whether the viewport is at the bottom of the scrollback (the
+// prompt is on screen). YES when there is no scrollback to
+// scroll (the surface is not ready or nothing is above the
+// viewport). The controller's exit drag only fires here.
+- (BOOL)isScrolledToBottom;
+
 // Reload the Ghostty config on the live surface, so a color theme
 // picked in Settings applies at once, without relaunching: a fresh
 // config is built from the live config file and pushed with

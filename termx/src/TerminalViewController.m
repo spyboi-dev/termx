@@ -40,6 +40,12 @@
 - (void)chromeLightHaptic;
 - (void)chromeMediumHaptic;
 - (void)chromeSelectionHaptic;
+// Edge fades (the scroll edge effect): build the top/bottom
+// blur-and-fade strips, recolor them when the theme changes,
+// and size their gradient layers after layout.
+- (void)tx_buildEdgeFades;
+- (void)tx_updateEdgeFadeColors;
+- (void)tx_layoutEdgeFades;
 @end
 
 static const uint8_t kFnBytes[12][6] = {
@@ -121,8 +127,26 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     UIStackView *_secondaryRow;
     UIScrollView *_fnRow;
     NSLayoutConstraint *_toolbarBottom;
+    UIView *_toolbar; // the key-row bar; the grid ends at its top
     BOOL _didClearScreenOnBoot; // clear-on-boot already done for this terminal instance
     CGPoint _exitPanStart; // where the top-edge exit drag began
+    BOOL _exitPanBeganAtBottom; // the terminal was at the bottom when the exit drag began
+    // Edge fades (the scroll edge effect): the blur-and-fade
+    // strips at the top and bottom of the terminal, where
+    // scrolling text disappears into the blur instead of being
+    // cut sharply. Each is a blur view (masked by a gradient so
+    // the blur itself fades out) under a theme-color gradient
+    // that fades the text into the background.
+    UIView *_topEdgeFade; // the top strip's container
+    UIView *_bottomEdgeFade; // the bottom strip's container
+    UIView *_topEdgeFadeView; // the fade gradient's host view
+    UIView *_bottomEdgeFadeView;
+    CAGradientLayer *_topEdgeFadeLayer; // theme background, opaque at the edge
+    CAGradientLayer *_bottomEdgeFadeLayer;
+    UIVisualEffectView *_topEdgeBlur; // the blur, masked to fade out
+    UIVisualEffectView *_bottomEdgeBlur;
+    CAGradientLayer *_topEdgeBlurMask; // white to clear, the blur's fade
+    CAGradientLayer *_bottomEdgeBlurMask;
     NSTimer *_repeatTimer; // arrow key repeat (NewTerm 2.4: hold to repeat)
     ghostty_input_key_e _repeatKey; // the arrow key being repeated
     UIImpactFeedbackGenerator *_keyHaptic;  // light tap on key presses
@@ -193,6 +217,14 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
         [strongSelf->_bellHaptic prepare];
     };
     [self.view addSubview:_output];
+
+    // The edge fades (the scroll edge effect) go over the
+    // terminal and under the floating buttons and the key row,
+    // so they are added here, right after the terminal and
+    // before any other chrome. Their outer constraints are set
+    // with the rest of the layout below (the bottom one anchors
+    // to the toolbar, which does not exist yet).
+    [self tx_buildEdgeFades];
 
     // Top buttons: two standalone circular glass buttons floating
     // over the terminal, the ChatGPT app's top UI — no pill, no
@@ -265,12 +297,17 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     // glass circles, and the theme's background color shows
     // through — the root view behind the bar is the theme color,
     // so the key area follows the terminal color when the theme
-    // changes. The Ghostty view still ends at the bar's top (its
-    // grid must not grow rows the bar would hide), so what the
-    // glass blurs here is the terminal color, not terminal text.
+    // changes. The Ghostty view is full-screen now (it goes
+    // behind the top buttons and this bar), but the grid still
+    // ends at the bar's top — the surface height is the bar's
+    // top, set via surfaceBottomInset — so the prompt stays
+    // above the bar and the glass blurs the theme color, not
+    // terminal text, behind the keys. The scrollback is what
+    // goes behind the bar; the active prompt stays readable.
     // It is a container, not an element: VoiceOver reads the key
     // buttons inside it, not the bar.
     UIView *toolbar = [[UIView alloc] init];
+    _toolbar = toolbar;
     toolbar.backgroundColor = [UIColor clearColor];
     toolbar.translatesAutoresizingMaskIntoConstraints = NO;
     toolbar.layer.cornerRadius = 26;
@@ -411,10 +448,35 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [_output.topAnchor constraintEqualToAnchor:safe.topAnchor constant:60],
-        [_output.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
-        [_output.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
-        [_output.bottomAnchor constraintEqualToAnchor:toolbar.topAnchor],
+        // Edge to edge, like the ChatGPT app: the terminal goes
+        // from the very top (y=0, under the status bar and behind
+        // the floating top buttons) to the very bottom (behind
+        // the key row and the keyboard), so the text can scroll
+        // up behind the top buttons to the top edge and down
+        // behind the key row. The top buttons and the key row
+        // float over it; they do not shrink it. The grid itself
+        // ends above the key row (surfaceBottomInset, updated in
+        // viewDidLayoutSubviews), so the prompt stays readable
+        // above the key row while the scrollback goes behind
+        // the chrome.
+        [_output.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_output.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_output.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_output.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        // The edge fades: the top strip runs from the screen top
+        // to just below the floating top buttons; the bottom
+        // strip is one fade height tall above the key row. Both
+        // sit over the terminal and under the buttons and the
+        // key row (they were added before them), and neither
+        // takes touches.
+        [_topEdgeFade.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_topEdgeFade.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_topEdgeFade.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_topEdgeFade.bottomAnchor constraintEqualToAnchor:safe.topAnchor constant:TXConfigEdgeFadeHeightPt],
+        [_bottomEdgeFade.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_bottomEdgeFade.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_bottomEdgeFade.bottomAnchor constraintEqualToAnchor:toolbar.topAnchor],
+        [_bottomEdgeFade.heightAnchor constraintEqualToConstant:TXConfigEdgeFadeHeightPt],
         [toolbar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:8],
         [toolbar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-8],
         [rows.leadingAnchor constraintEqualToAnchor:toolbar.leadingAnchor constant:4],
@@ -443,9 +505,11 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     // scrollback starts anywhere and goes either way; this one only
     // fires for a drag that begins at the very top and moves
     // decisively down, so ordinary scrolling never triggers it.
-    // (There is no scrollback scrolling yet — Ghostty owns the
-    // scrollback and no scroll gesture is wired — so the drag only
-    // needs the top strip and the distance, not a scroll offset.)
+    // The scroll pan on the terminal yields a downward drag from
+    // the top strip at the bottom (see TXGhosttyView), and this
+    // one only fires when the drag began at the bottom (see
+    // onExitPan:), so a scroll that lands at the bottom never
+    // dismisses.
     UIPanGestureRecognizer *exitPan = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(onExitPan:)];
     exitPan.delegate = self;
@@ -476,7 +540,10 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     _guestStatusLabel.hidden = YES;
     [self.view addSubview:_guestStatusLabel];
     [NSLayoutConstraint activateConstraints:@[
-        [_guestStatusLabel.topAnchor constraintEqualToAnchor:_output.topAnchor],
+        // Below the floating top buttons, not at the screen top:
+        // the terminal now starts at y=0, so anchoring to it
+        // would put the notice under the status bar.
+        [_guestStatusLabel.topAnchor constraintEqualToAnchor:safe.topAnchor constant:60],
         [_guestStatusLabel.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
         [_guestStatusLabel.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
     ]];
@@ -605,6 +672,166 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     [self termXEngineDidChangeState:_engine.state status:_engine.statusText];
 }
 
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    // The grid ends at the key row: the surface's bottom inset is
+    // the distance from the view's bottom to the toolbar's top.
+    // The view itself is full-screen (its layer covers the whole
+    // screen), so only the grid is shortened. Updated on every
+    // layout, so the grid tracks the toolbar while the keyboard
+    // animates (the toolbar moves, the inset follows, the surface
+    // resizes with it — the same reflow the old resizing view
+    // did). The setter no-ops when the size is unchanged.
+    if (_toolbar) {
+        CGFloat toolbarTop = CGRectGetMinY(_toolbar.frame);
+        CGFloat inset = MAX(0, self.view.bounds.size.height - toolbarTop);
+        _output.surfaceBottomInset = inset;
+    }
+    [self tx_layoutEdgeFades];
+}
+
+// The edge fades (the scroll edge effect): one blur-and-fade
+// strip at the top and one at the bottom of the terminal, so
+// scrolling text disappears into the blur instead of being cut
+// sharply at the floating buttons and the key row. Each strip
+// is a container over the terminal and under the chrome (added
+// before the buttons and the key row, so they stay sharp and
+// legible), and takes no touches. Inside it: a blur view, masked
+// by a gradient so the blur itself fades out at the inner edge,
+// and a theme-color gradient over it that fades the text into
+// the background. No solid bar, no pill: the blur and the fade
+// live at the edges themselves.
+- (void)tx_buildEdgeFades {
+    // The blur style follows the theme's brightness: a dark blur
+    // over a light theme would read as a smudge, and a light blur
+    // over a dark theme the same. Picked from the theme
+    // background's luminance, rebuilt on a theme change.
+    UIColor *bg = TXTerminalThemeBackgroundColor();
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    UIBlurEffectStyle blurStyle = UIBlurEffectStyleDark;
+    if ([bg getRed:&r green:&g blue:&b alpha:&a]) {
+        CGFloat luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+        blurStyle = luminance > 0.5 ? UIBlurEffectStyleLight : UIBlurEffectStyleDark;
+    }
+    // Top strip: opaque at the very top, fading to transparent
+    // at its bottom (just below the floating top buttons). The
+    // blur is strongest at the top and fades out with it.
+    _topEdgeFade = [[UIView alloc] init];
+    _topEdgeFade.translatesAutoresizingMaskIntoConstraints = NO;
+    _topEdgeFade.userInteractionEnabled = NO;
+    _topEdgeBlur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:blurStyle]];
+    _topEdgeBlur.translatesAutoresizingMaskIntoConstraints = NO;
+    _topEdgeBlur.userInteractionEnabled = NO;
+    _topEdgeBlurMask = [CAGradientLayer layer];
+    _topEdgeBlurMask.colors = @[(id)[UIColor colorWithWhite:1 alpha:1].CGColor,
+                                (id)[UIColor colorWithWhite:1 alpha:0].CGColor];
+    _topEdgeBlurMask.locations = @[@0, @1];
+    _topEdgeBlurMask.startPoint = CGPointMake(0.5, 0);
+    _topEdgeBlurMask.endPoint = CGPointMake(0.5, 1);
+    _topEdgeBlur.layer.mask = _topEdgeBlurMask;
+    _topEdgeFadeView = [[UIView alloc] init];
+    _topEdgeFadeView.translatesAutoresizingMaskIntoConstraints = NO;
+    _topEdgeFadeView.userInteractionEnabled = NO;
+    _topEdgeFadeLayer = [CAGradientLayer layer];
+    _topEdgeFadeLayer.startPoint = CGPointMake(0.5, 0);
+    _topEdgeFadeLayer.endPoint = CGPointMake(0.5, 1);
+    [_topEdgeFadeView.layer addSublayer:_topEdgeFadeLayer];
+    [_topEdgeFade addSubview:_topEdgeBlur];
+    [_topEdgeFade addSubview:_topEdgeFadeView];
+    [NSLayoutConstraint activateConstraints:@[
+        [_topEdgeBlur.topAnchor constraintEqualToAnchor:_topEdgeFade.topAnchor],
+        [_topEdgeBlur.leadingAnchor constraintEqualToAnchor:_topEdgeFade.leadingAnchor],
+        [_topEdgeBlur.trailingAnchor constraintEqualToAnchor:_topEdgeFade.trailingAnchor],
+        [_topEdgeBlur.bottomAnchor constraintEqualToAnchor:_topEdgeFade.bottomAnchor],
+        [_topEdgeFadeView.topAnchor constraintEqualToAnchor:_topEdgeFade.topAnchor],
+        [_topEdgeFadeView.leadingAnchor constraintEqualToAnchor:_topEdgeFade.leadingAnchor],
+        [_topEdgeFadeView.trailingAnchor constraintEqualToAnchor:_topEdgeFade.trailingAnchor],
+        [_topEdgeFadeView.bottomAnchor constraintEqualToAnchor:_topEdgeFade.bottomAnchor],
+    ]];
+    [self.view addSubview:_topEdgeFade];
+    // Bottom strip: transparent at its top, fading to opaque at
+    // the very bottom (the key row). The fade starts late (the
+    // top three quarters stay clear) so the prompt — the grid's
+    // last row, just above the key row — stays readable at rest,
+    // and scrolling text fades out as it reaches the key row.
+    // The blur follows the same late fade.
+    _bottomEdgeFade = [[UIView alloc] init];
+    _bottomEdgeFade.translatesAutoresizingMaskIntoConstraints = NO;
+    _bottomEdgeFade.userInteractionEnabled = NO;
+    _bottomEdgeBlur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:blurStyle]];
+    _bottomEdgeBlur.translatesAutoresizingMaskIntoConstraints = NO;
+    _bottomEdgeBlur.userInteractionEnabled = NO;
+    _bottomEdgeBlurMask = [CAGradientLayer layer];
+    _bottomEdgeBlurMask.colors = @[(id)[UIColor colorWithWhite:1 alpha:0].CGColor,
+                                   (id)[UIColor colorWithWhite:1 alpha:0].CGColor,
+                                   (id)[UIColor colorWithWhite:1 alpha:1].CGColor];
+    _bottomEdgeBlurMask.locations = @[@0, @0.75, @1];
+    _bottomEdgeBlurMask.startPoint = CGPointMake(0.5, 0);
+    _bottomEdgeBlurMask.endPoint = CGPointMake(0.5, 1);
+    _bottomEdgeBlur.layer.mask = _bottomEdgeBlurMask;
+    _bottomEdgeFadeView = [[UIView alloc] init];
+    _bottomEdgeFadeView.translatesAutoresizingMaskIntoConstraints = NO;
+    _bottomEdgeFadeView.userInteractionEnabled = NO;
+    _bottomEdgeFadeLayer = [CAGradientLayer layer];
+    _bottomEdgeFadeLayer.startPoint = CGPointMake(0.5, 0);
+    _bottomEdgeFadeLayer.endPoint = CGPointMake(0.5, 1);
+    _bottomEdgeFadeLayer.locations = @[@0, @0.75, @1];
+    [_bottomEdgeFadeView.layer addSublayer:_bottomEdgeFadeLayer];
+    [_bottomEdgeFade addSubview:_bottomEdgeBlur];
+    [_bottomEdgeFade addSubview:_bottomEdgeFadeView];
+    [NSLayoutConstraint activateConstraints:@[
+        [_bottomEdgeBlur.topAnchor constraintEqualToAnchor:_bottomEdgeFade.topAnchor],
+        [_bottomEdgeBlur.leadingAnchor constraintEqualToAnchor:_bottomEdgeFade.leadingAnchor],
+        [_bottomEdgeBlur.trailingAnchor constraintEqualToAnchor:_bottomEdgeFade.trailingAnchor],
+        [_bottomEdgeBlur.bottomAnchor constraintEqualToAnchor:_bottomEdgeFade.bottomAnchor],
+        [_bottomEdgeFadeView.topAnchor constraintEqualToAnchor:_bottomEdgeFade.topAnchor],
+        [_bottomEdgeFadeView.leadingAnchor constraintEqualToAnchor:_bottomEdgeFade.leadingAnchor],
+        [_bottomEdgeFadeView.trailingAnchor constraintEqualToAnchor:_bottomEdgeFade.trailingAnchor],
+        [_bottomEdgeFadeView.bottomAnchor constraintEqualToAnchor:_bottomEdgeFade.bottomAnchor],
+    ]];
+    [self.view addSubview:_bottomEdgeFade];
+    [self tx_updateEdgeFadeColors];
+}
+
+// Recolor the edge fades from the theme background: the top
+// gradient is opaque at the screen top and transparent at its
+// bottom; the bottom gradient is transparent until three
+// quarters down, then opaque at the key row. Rebuilt when the
+// theme changes (and at build time), so the fades follow the
+// picked theme. The blur style follows the brightness too.
+- (void)tx_updateEdgeFadeColors {
+    UIColor *bg = TXTerminalThemeBackgroundColor();
+    if (_topEdgeFadeLayer) {
+        _topEdgeFadeLayer.colors = @[(id)[bg colorWithAlphaComponent:1].CGColor,
+                                     (id)[bg colorWithAlphaComponent:0].CGColor];
+        _topEdgeFadeLayer.locations = @[@0, @1];
+    }
+    if (_bottomEdgeFadeLayer) {
+        _bottomEdgeFadeLayer.colors = @[(id)[bg colorWithAlphaComponent:0].CGColor,
+                                        (id)[bg colorWithAlphaComponent:0].CGColor,
+                                        (id)[bg colorWithAlphaComponent:1].CGColor];
+    }
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    UIBlurEffectStyle blurStyle = UIBlurEffectStyleDark;
+    if ([bg getRed:&r green:&g blue:&b alpha:&a]) {
+        CGFloat luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+        blurStyle = luminance > 0.5 ? UIBlurEffectStyleLight : UIBlurEffectStyleDark;
+    }
+    UIBlurEffect *effect = [UIBlurEffect effectWithStyle:blurStyle];
+    if (_topEdgeBlur) _topEdgeBlur.effect = effect;
+    if (_bottomEdgeBlur) _bottomEdgeBlur.effect = effect;
+}
+
+// The gradient layers and blur masks are layers, not views, so
+// Auto Layout never resizes them: size them to their views
+// after every layout.
+- (void)tx_layoutEdgeFades {
+    if (_topEdgeFadeLayer) _topEdgeFadeLayer.frame = _topEdgeFadeView.bounds;
+    if (_bottomEdgeFadeLayer) _bottomEdgeFadeLayer.frame = _bottomEdgeFadeView.bounds;
+    if (_topEdgeBlurMask) _topEdgeBlurMask.frame = _topEdgeBlur.bounds;
+    if (_bottomEdgeBlurMask) _bottomEdgeBlurMask.frame = _bottomEdgeBlur.bounds;
+}
+
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     [_output setFocused:YES];
@@ -651,18 +878,20 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
-            // Home + erase + erase scrollback: ESC[2J alone erases
-            // only the visible screen, and ESC[H first puts the
-            // cursor at the top-left, so the prompt opens at the
-            // top, the way Termux opens. But the boot log stays in
-            // scrollback, and a pinch zoom (a font-size change)
-            // reflows the grid and pulls those scrollback lines
-            // back into the visible area, so the boot log reappears
-            // on zoom. ESC[3J erases the scrollback too, so the
-            // boot log is truly gone and zooming reflows only what
-            // is on screen. The log itself is not lost: it stays
+            // Erase + erase scrollback, without homing: ESC[2J
+            // erases the visible screen, and ESC[3J erases the
+            // scrollback too, so the boot log is truly gone and a
+            // pinch zoom (a font-size change) cannot reflow it
+            // back into view. The cursor is NOT homed to the top
+            // any more: the terminal is full-screen now, so the
+            // top rows sit behind the status bar and the floating
+            // top buttons, and a prompt homed there would be
+            // hidden behind them. The prompt stays where the boot
+            // log left it — the bottom row, above the key row
+            // (the grid ends there) — the usable position in
+            // this layout. The log itself is not lost: it stays
             // in guest.log and engine.log.
-            static const uint8_t clearSeq[] = { 0x1B, '[', 'H', 0x1B, '[', '2', 'J', 0x1B, '[', '3', 'J' };
+            static const uint8_t clearSeq[] = { 0x1B, '[', '2', 'J', 0x1B, '[', '3', 'J' };
             [strongSelf->_output feedGuestOutput:[NSData dataWithBytes:clearSeq length:sizeof(clearSeq)]];
             // The shell prompt is only ever printed by the shell
             // itself, never by the boot log, so "@iphone:" in the
@@ -1307,6 +1536,7 @@ static NSString *TXKeyGlyphForTitle(NSString *title) {
 - (void)terminalThemeDidChange:(NSNotification *)note {
     (void)note;
     self.view.backgroundColor = TXTerminalThemeBackgroundColor();
+    [self tx_updateEdgeFadeColors];
 }
 
 #pragma mark - Actions
@@ -1453,18 +1683,23 @@ static NSString *TXKeyGlyphForTitle(NSString *title) {
 // requirement is relaxed: the user is almost always pinned at the
 // bottom when the guest dies, and the notice tells them to swipe
 // down to return, so the drag must work from any scroll position
-// then. (With no scrollback scrolling wired yet, there is no scroll
-// offset to check; the top strip and the distance are the gate.)
+// then. The drag only fires when it BEGAN at the bottom of the
+// scrollback: a scroll through the history that lands at the
+// bottom is a scroll, not an exit, so the at-bottom state is
+// captured at Began, not read at Ended. (The scroll pan on the
+// terminal yields a downward drag from the top strip at the
+// bottom, so the two never fight over the same drag.)
 - (void)onExitPan:(UIPanGestureRecognizer *)pan {
     switch (pan.state) {
         case UIGestureRecognizerStateBegan:
             _exitPanStart = [pan locationInView:_output];
+            _exitPanBeganAtBottom = [_output isScrolledToBottom];
             break;
         case UIGestureRecognizerStateEnded: {
             CGPoint translation = [pan translationInView:_output];
             BOOL guestDead = _guestStatusLabel && !_guestStatusLabel.hidden;
             if ((_exitPanStart.y < TXConfigExitPanTopStripPt || guestDead) && translation.y > TXConfigExitPanTranslationThresholdPt &&
-                fabs(translation.y) > fabs(translation.x)) {
+                fabs(translation.y) > fabs(translation.x) && (_exitPanBeganAtBottom || guestDead)) {
                 [self dismissViewControllerAnimated:YES completion:nil];
             }
             break;
@@ -1637,9 +1872,11 @@ static NSString *TXKeyGlyphForTitle(NSString *title) {
 
 - (void)keyboardWillChange:(NSNotification *)note {
     // The keyboard showing or hiding moves the toolbar; the
-    // terminal view resizes with it and Ghostty re-lays out. The
-    // view itself takes no bottom inset — it ends at the toolbar,
-    // which already rides above the keyboard (see viewDidLoad).
+    // terminal's grid resizes with it (the surface bottom inset
+    // follows the toolbar in viewDidLayoutSubviews) and Ghostty
+    // re-lays out. The view itself is full-screen and never
+    // moves — only the grid shortens, so the prompt stays above
+    // the key row.
     CGRect end = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
     CGRect inView = [self.view convertRect:end fromView:nil];
     // The toolbar is anchored to the safe-area bottom, but the
