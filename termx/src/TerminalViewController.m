@@ -1059,6 +1059,19 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 
 #pragma mark - Typing
 
+// The software keyboard's Return reaches the delegate here, not
+// through shouldChangeCharactersInRange: (a UITextField never
+// inserts a newline). Without this method Return does nothing and
+// the command never runs. Send Ghostty's Enter and keep the
+// keyboard up.
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    (void)textField;
+    [_output sendKey:GHOSTTY_KEY_ENTER mods:[self latchedMods]];
+    [self releaseAlt];
+    [self releaseCtrl];
+    return NO;
+}
+
 - (BOOL)textField:(UITextField *)textField shouldChangeCharactersInRange:(NSRange)range
     replacementString:(NSString *)string {
     (void)textField;
