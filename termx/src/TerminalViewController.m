@@ -34,6 +34,12 @@
 #import "TXTheme.h"
 
 @interface TerminalViewController () <KernEngineDelegate, UITextFieldDelegate, UIGestureRecognizerDelegate, TXTerminalSessionManagerDelegate, UIDocumentPickerDelegate>
+// Chrome helpers (Sessions section): glass press scale and haptics.
+- (void)circleButtonPressed:(UIButton *)button;
+- (void)circleButtonReleased:(UIButton *)button;
+- (void)chromeLightHaptic;
+- (void)chromeMediumHaptic;
+- (void)chromeSelectionHaptic;
 @end
 
 static const uint8_t kFnBytes[12][6] = {
@@ -84,6 +90,18 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 }
 @end
 
+// The glass material for the multi-window chrome, matching
+// Swipterm's frosted glass: a dark system material blur, so the
+// terminal behind shows through blurred and dimmed. One helper so
+// the sidebar, the top bar, the circular buttons and the selected
+// session card all use the same material.
+static UIVisualEffectView *TXGlassEffectView(void) {
+    UIVisualEffectView *effectView = [[UIVisualEffectView alloc]
+        initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
+    effectView.translatesAutoresizingMaskIntoConstraints = NO;
+    return effectView;
+}
+
 @implementation TerminalViewController {
     KernEngine *_engine;
     TXGhosttyView *_output;
@@ -103,6 +121,9 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     ghostty_input_key_e _repeatKey; // the arrow key being repeated
     UIImpactFeedbackGenerator *_keyHaptic;  // light tap on key presses
     UIImpactFeedbackGenerator *_bellHaptic; // medium tap when the guest rings BEL
+    UIImpactFeedbackGenerator *_chromeLightHaptic; // light tap on chrome buttons
+    UIImpactFeedbackGenerator *_chromeMediumHaptic; // medium tap on session create/close
+    UISelectionFeedbackGenerator *_chromeSelectionHaptic; // selection: session switch, sidebar toggle
     UIButton *_copyButton; // secondary-row Copy, kept so onCopyAll can show "Copied"
     UILabel *_guestStatusLabel; // "Guest stopped/failed" notice over the terminal
     NSUInteger _copyFeedbackGeneration; // Copy taps, so a later tap's "Copied" is not cut short by an earlier tap's timer
@@ -124,6 +145,14 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [_keyHaptic prepare];
     _bellHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
     [_bellHaptic prepare];
+    // Chrome haptics (top bar, sidebar, Settings): created once and
+    // prepared after each use, so the tap lands with no delay.
+    _chromeLightHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [_chromeLightHaptic prepare];
+    _chromeMediumHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [_chromeMediumHaptic prepare];
+    _chromeSelectionHaptic = [[UISelectionFeedbackGenerator alloc] init];
+    [_chromeSelectionHaptic prepare];
 
     _engine = [KernEngine shared];
 
@@ -156,12 +185,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // Top bar (Swipterm's terminal header): a circular panel toggle
     // on the left, the session title centred in bold, and the +
     // on the RIGHT (the user's one change from Swipterm, where the
-    // + sits next to the panel icon on the left). Pure black, like
-    // the terminal below it. The Ghostty view starts under this bar.
+    // + sits next to the panel icon on the left). Glass, not flat
+    // black: a dark material blur, so the bar reads as frosted glass
+    // like Swipterm's header. The Ghostty view starts under this bar.
     _topBar = [[UIView alloc] init];
-    _topBar.backgroundColor = TXThemeBackgroundColor();
+    _topBar.backgroundColor = [UIColor clearColor];
     _topBar.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_topBar];
+    UIVisualEffectView *topBarGlass = TXGlassEffectView();
+    [_topBar insertSubview:topBarGlass atIndex:0];
     UIButton *panelButton = [self circleButtonWithSymbol:@"sidebar.left" action:@selector(onToggleSidebar)];
     panelButton.accessibilityLabel = @"Sessions";
     panelButton.accessibilityHint = @"Shows the session list.";
@@ -183,6 +215,10 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         [_topBar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [_topBar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [_topBar.heightAnchor constraintEqualToConstant:52],
+        [topBarGlass.topAnchor constraintEqualToAnchor:_topBar.topAnchor],
+        [topBarGlass.leadingAnchor constraintEqualToAnchor:_topBar.leadingAnchor],
+        [topBarGlass.trailingAnchor constraintEqualToAnchor:_topBar.trailingAnchor],
+        [topBarGlass.bottomAnchor constraintEqualToAnchor:_topBar.bottomAnchor],
         [panelButton.leadingAnchor constraintEqualToAnchor:_topBar.leadingAnchor constant:12],
         [panelButton.centerYAnchor constraintEqualToAnchor:_topBar.centerYAnchor],
         [panelButton.widthAnchor constraintEqualToConstant:44],
@@ -483,12 +519,15 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     [_sidebarDimView addGestureRecognizer:dimTap];
 
     // The sidebar itself: 300 pt wide (Swipterm's width), full
-    // height, hidden off-screen left until opened. Pure black,
-    // like the terminal.
+    // height, hidden off-screen left until opened. Glass, not flat
+    // black: a dark material blur, so the terminal behind shows
+    // through blurred and dimmed, the way Swipterm's sidebar does.
     _sidebarView = [[UIView alloc] init];
-    _sidebarView.backgroundColor = TXThemeBackgroundColor();
+    _sidebarView.backgroundColor = [UIColor clearColor];
     _sidebarView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_sidebarView];
+    UIVisualEffectView *sidebarGlass = TXGlassEffectView();
+    [_sidebarView insertSubview:sidebarGlass atIndex:0];
     _sidebarLeadingConstraint = [_sidebarView.leadingAnchor
         constraintEqualToAnchor:self.view.leadingAnchor constant:-300];
     _sidebarLeadingConstraint.active = YES;
@@ -500,6 +539,10 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         [_sidebarView.topAnchor constraintEqualToAnchor:safe.topAnchor],
         [_sidebarView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
         [_sidebarView.widthAnchor constraintEqualToConstant:300],
+        [sidebarGlass.topAnchor constraintEqualToAnchor:_sidebarView.topAnchor],
+        [sidebarGlass.leadingAnchor constraintEqualToAnchor:_sidebarView.leadingAnchor],
+        [sidebarGlass.trailingAnchor constraintEqualToAnchor:_sidebarView.trailingAnchor],
+        [sidebarGlass.bottomAnchor constraintEqualToAnchor:_sidebarView.bottomAnchor],
     ]];
 
     // Sidebar header: "TermX" bold on the left, the + and the panel
@@ -967,17 +1010,67 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     UIImage *image = [UIImage systemImageNamed:symbol withConfiguration:config];
     [b setImage:image forState:UIControlStateNormal];
     b.tintColor = [UIColor whiteColor];
-    // Circular dark button, like Swipterm's: a touch lighter than
-    // the black behind it, so the circle reads. 44 pt, so the
-    // corner radius (22) makes it a circle.
-    b.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1.0];
+    // A glass circle, like Swipterm's: a dark material blur clipped
+    // to the circle, so the terminal behind blurs through it. The
+    // flat 0.12 grey is gone. 44 pt, so the corner radius (22)
+    // makes it a circle.
+    b.backgroundColor = [UIColor clearColor];
+    UIVisualEffectView *glass = TXGlassEffectView();
+    [b insertSubview:glass atIndex:0];
+    [NSLayoutConstraint activateConstraints:@[
+        [glass.topAnchor constraintEqualToAnchor:b.topAnchor],
+        [glass.leadingAnchor constraintEqualToAnchor:b.leadingAnchor],
+        [glass.trailingAnchor constraintEqualToAnchor:b.trailingAnchor],
+        [glass.bottomAnchor constraintEqualToAnchor:b.bottomAnchor],
+    ]];
     b.layer.cornerRadius = 22;
     b.clipsToBounds = YES;
+    // Press scale: shrink slightly on touch, spring back on release.
+    [b addTarget:self action:@selector(circleButtonPressed:) forControlEvents:UIControlEventTouchDown];
+    [b addTarget:self action:@selector(circleButtonReleased:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
     [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
 
+// Press scale for the circular chrome buttons: shrink slightly on
+// touch, spring back on release, the way Swipterm's glass buttons
+// respond. Visual only; the haptic for the action fires in the
+// action itself.
+- (void)circleButtonPressed:(UIButton *)button {
+    [UIView animateWithDuration:0.12 animations:^{
+        button.transform = CGAffineTransformMakeScale(0.90, 0.90);
+    }];
+}
+
+- (void)circleButtonReleased:(UIButton *)button {
+    [UIView animateWithDuration:0.35 delay:0 usingSpringWithDamping:0.6 initialSpringVelocity:0 options:0 animations:^{
+        button.transform = CGAffineTransformIdentity;
+    } completion:nil];
+}
+
+// Haptics for the chrome only (top bar, sidebar, Settings): one
+// short tap per interaction, never a buzz. Typing and the key row
+// are untouched. Light for plain button taps, selection for a state
+// change (session switch, sidebar open/close), medium for creating
+// or closing a session. Each action fires exactly one of these;
+// the more specific one wins, so a tap never double-fires.
+- (void)chromeLightHaptic {
+    [_chromeLightHaptic impactOccurred];
+    [_chromeLightHaptic prepare];
+}
+
+- (void)chromeMediumHaptic {
+    [_chromeMediumHaptic impactOccurred];
+    [_chromeMediumHaptic prepare];
+}
+
+- (void)chromeSelectionHaptic {
+    [_chromeSelectionHaptic selectionChanged];
+    [_chromeSelectionHaptic prepare];
+}
+
 - (void)onToggleSidebar {
+    [self chromeSelectionHaptic];
     [self setSidebarVisible:!_sidebarVisible animated:YES];
 }
 
@@ -990,6 +1083,28 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
         // Swipterm shows the sidebar without a keyboard.
         [self.view endEditing:YES];
         _sidebarDimView.hidden = NO;
+        if (animated) {
+            // Cards stagger in: each starts slightly left and
+            // transparent, then springs to place one after another,
+            // so the list reads as arriving with the panel.
+            NSArray *cards = _sidebarSessionStack.arrangedSubviews;
+            for (NSUInteger i = 0; i < cards.count; i++) {
+                UIView *card = cards[i];
+                card.alpha = 0;
+                card.transform = CGAffineTransformMakeTranslation(-16, 0);
+                [UIView animateWithDuration:0.4 delay:0.05 + i * 0.05 usingSpringWithDamping:0.85 initialSpringVelocity:0 options:0 animations:^{
+                    card.alpha = 1;
+                    card.transform = CGAffineTransformIdentity;
+                } completion:nil];
+            }
+        } else {
+            // Non-animated open: cards plain, in case a previous
+            // animated open left one mid-flight.
+            for (UIView *card in _sidebarSessionStack.arrangedSubviews) {
+                card.alpha = 1;
+                card.transform = CGAffineTransformIdentity;
+            }
+        }
     }
     _sidebarLeadingConstraint.constant = visible ? 0 : -300;
     void (^animations)(void) = ^{
@@ -1006,7 +1121,10 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
         }
     };
     if (animated) {
-        [UIView animateWithDuration:0.3 animations:animations completion:completion];
+        // Spring, not a hard cut: the panel slides with a soft
+        // spring and the dim fades in sync with it, the way
+        // Swipterm's split-view sidebar moves.
+        [UIView animateWithDuration:0.5 delay:0 usingSpringWithDamping:0.8 initialSpringVelocity:0 options:UIViewAnimationOptionCurveEaseOut animations:animations completion:completion];
     } else {
         animations();
         completion(YES);
@@ -1014,11 +1132,13 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 }
 
 - (void)onSidebarDimTap {
+    [self chromeSelectionHaptic];
     [self setSidebarVisible:NO animated:YES];
 }
 
 - (void)onSidebarEdgePan:(UIScreenEdgePanGestureRecognizer *)pan {
     if (pan.state == UIGestureRecognizerStateRecognized) {
+        [self chromeSelectionHaptic];
         [self setSidebarVisible:YES animated:YES];
     }
 }
@@ -1039,7 +1159,20 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
         BOOL selected = (i == _sessionManager.currentIndex);
         UIButton *card = [UIButton buttonWithType:UIButtonTypeSystem];
         card.translatesAutoresizingMaskIntoConstraints = NO;
-        card.backgroundColor = selected ? TXThemeCardBackground() : [UIColor clearColor];
+        // The selected card is glass: a dark material blur in the
+        // rounded rect, slightly lighter than the sidebar panel.
+        // Unselected cards stay clear, like Swipterm's.
+        card.backgroundColor = [UIColor clearColor];
+        if (selected) {
+            UIVisualEffectView *glass = TXGlassEffectView();
+            [card insertSubview:glass atIndex:0];
+            [NSLayoutConstraint activateConstraints:@[
+                [glass.topAnchor constraintEqualToAnchor:card.topAnchor],
+                [glass.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
+                [glass.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
+                [glass.bottomAnchor constraintEqualToAnchor:card.bottomAnchor],
+            ]];
+        }
         card.layer.cornerRadius = 12;
         card.clipsToBounds = YES;
         card.tag = (NSInteger)i;
@@ -1091,15 +1224,18 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 }
 
 - (void)onSelectSession:(UIButton *)sender {
+    [self chromeSelectionHaptic];
     [_sessionManager switchToSessionAtIndex:(NSUInteger)sender.tag];
     [self setSidebarVisible:NO animated:YES];
 }
 
 - (void)onCloseSession:(UIButton *)sender {
+    [self chromeMediumHaptic];
     [_sessionManager closeSessionAtIndex:(NSUInteger)sender.tag];
 }
 
 - (void)onNewSession {
+    [self chromeMediumHaptic];
     [_sessionManager createSession];
     // A new session is the current one: close the sidebar so the
     // user lands in it. (If the sidebar was closed, this is a
@@ -1111,6 +1247,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 // controller, presented modally. The terminal's Ghostty view goes
 // with it so the font-size stepper can set the live size.
 - (void)onOpenSettings {
+    [self chromeLightHaptic];
     TXSettingsViewController *settings = [[TXSettingsViewController alloc] init];
     settings.terminalOutput = _output;
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:settings];
@@ -1127,6 +1264,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 // app cannot be opened, fall back to an in-app document picker
 // at the same folder.
 - (void)onOpenFiles {
+    [self chromeLightHaptic];
     NSURL *filesURL = [NSURL URLWithString:@"shareddocuments://"];
     __weak typeof(self) weakSelf = self;
     [[UIApplication sharedApplication] openURL:filesURL options:@{} completionHandler:^(BOOL success) {

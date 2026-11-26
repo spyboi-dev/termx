@@ -37,6 +37,9 @@ typedef NS_ENUM(NSInteger, TXSettingsContainerRow) {
 
 @interface TXSettingsViewController ()
 @property (nonatomic, strong) UISwitch *backgroundSwitch;
+// Light tap for row taps and the background switch; created once
+// and prepared after each use.
+@property (nonatomic, strong) UIImpactFeedbackGenerator *rowHaptic;
 @end
 
 @implementation TXSettingsViewController
@@ -52,10 +55,17 @@ typedef NS_ENUM(NSInteger, TXSettingsContainerRow) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.tableView.backgroundColor = TXThemeBackgroundColor();
+    self.rowHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [self.rowHaptic prepare];
     // A modal Settings needs a way back: Done, top right.
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc]
         initWithBarButtonSystemItem:UIBarButtonSystemItemDone
                              target:self action:@selector(onDone)];
+}
+
+- (void)rowHapticTap {
+    [self.rowHaptic impactOccurred];
+    [self.rowHaptic prepare];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -69,6 +79,7 @@ typedef NS_ENUM(NSInteger, TXSettingsContainerRow) {
 }
 
 - (void)onDone {
+    [self rowHapticTap];
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
@@ -104,7 +115,13 @@ typedef NS_ENUM(NSInteger, TXSettingsContainerRow) {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:kCellID];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:kCellID];
-        cell.backgroundColor = TXThemeCardBackground();
+        // Glassy card, not flat: the grouped cell's background is a
+        // dark material blur, so the card reads as frosted glass
+        // over the black table, matching Swipterm's grouped cards.
+        UIVisualEffectView *glass = [[UIVisualEffectView alloc]
+            initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
+        cell.backgroundView = glass;
+        cell.backgroundColor = [UIColor clearColor];
         cell.textLabel.textColor = [UIColor whiteColor];
         cell.textLabel.font = [UIFont systemFontOfSize:17];
         cell.detailTextLabel.textColor = TXThemeSecondaryTextColor();
@@ -176,26 +193,31 @@ typedef NS_ENUM(NSInteger, TXSettingsContainerRow) {
     if (indexPath.section == TXSettingsSectionContainer) {
         switch (indexPath.row) {
             case TXSettingsContainerRowJIT: {
+                [self rowHapticTap];
                 TXJITDetailViewController *detail = [[TXJITDetailViewController alloc] init];
                 [self.navigationController pushViewController:detail animated:YES];
                 break;
             }
             case TXSettingsContainerRowLocalhost: {
+                [self rowHapticTap];
                 TXLocalhostDetailViewController *detail = [[TXLocalhostDetailViewController alloc] init];
                 [self.navigationController pushViewController:detail animated:YES];
                 break;
             }
             case TXSettingsContainerRowReset:
+                [self rowHapticTap];
                 [self onResetGuestData];
                 break;
             default:
                 break;
         }
     } else if (indexPath.section == TXSettingsSectionTerminal) {
+        [self rowHapticTap];
         TXGhosttyConfigViewController *detail = [[TXGhosttyConfigViewController alloc] init];
         detail.terminalOutput = self.terminalOutput;
         [self.navigationController pushViewController:detail animated:YES];
     } else if (indexPath.section == TXSettingsSectionAbout) {
+        [self rowHapticTap];
         TXAboutViewController *about = [[TXAboutViewController alloc] init];
         [self.navigationController pushViewController:about animated:YES];
     }
@@ -215,6 +237,7 @@ typedef NS_ENUM(NSInteger, TXSettingsContainerRow) {
 }
 
 - (void)backgroundSwitchChanged:(UISwitch *)sender {
+    [self rowHapticTap];
     [[TXBackgroundKeepAlive shared] setEnabled:sender.isOn];
 }
 
