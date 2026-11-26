@@ -79,7 +79,7 @@ FWSHA=$(sha256sum Frameworks/KRuntime_6_18_4K.framework/KRuntime_6_18_4K | cut -
 CFLAGS="-target arm64-apple-ios$MIN -isysroot $SDK -miphoneos-version-min=$MIN -fobjc-arc -O2 -Wno-deprecated-declarations -DTERMX_BUILD_COMMIT=\"$COMMIT\" -DTERMX_FRAMEWORK_SHA256=\"$FWSHA\" -I$SRC -IFrameworks/Ghostty/include -F$SDK/System/Library/SubFrameworks -F$SDK/System/Library/PrivateFrameworks"
 
 echo "== compile"
-for f in main AppDelegate TerminalViewController KernEngine GuestInstall TXCrashLog TXLog TXLogViewController TXStartupViewController TXAboutViewController TXGuestFlow TXLocalhostProxy TXGhosttyView TXBackgroundKeepAlive TXJITManager TXStikJITCoordinator TXStikJITTransport; do
+for f in main AppDelegate TerminalViewController KernEngine GuestInstall TXCrashLog TXLog TXLogViewController TXStartupViewController TXAboutViewController TXGuestFlow TXLocalhostProxy TXGhosttyView TXBackgroundKeepAlive TXStikJITCoordinator TXStikJITTransport TXPairingStore TXLoopbackProbe TXOnDevicePairing; do
   echo "   $f.m"
   $CLANG $CFLAGS -c "$SRC/$f.m" -o "$OUT/$f.o"
 done
@@ -89,6 +89,20 @@ for f in vt; do
 done
 
 echo "== link"
+# On-device pairing library: the Rust static library built on the
+# Mac runner (.github/workflows/build-rppairing.yml, or
+# termx/rppairing/build.sh) and dropped here as
+# rppairing-artifact/libtx_rppairing.a. When it is absent the build
+# still links: the C functions in TXRPPairing.h are weak imports and
+# TXOnDevicePairing reports the library missing, so only the file
+# import path works. When it is present, on-device pairing works.
+RPPAIRING_LIB=""
+if [ -f "rppairing-artifact/libtx_rppairing.a" ]; then
+  RPPAIRING_LIB="rppairing-artifact/libtx_rppairing.a"
+  echo "   linking rppairing-artifact/libtx_rppairing.a"
+else
+  echo "   no rppairing-artifact/libtx_rppairing.a; host-only pairing (file import only)"
+fi
 ld64.lld-18 -arch arm64 -platform_version ios $MIN 26.5 \
   -syslibroot "$SDK" \
   -F"$SDK/System/Library/Frameworks" \
@@ -99,14 +113,16 @@ ld64.lld-18 -arch arm64 -platform_version ios $MIN 26.5 \
   "$OUT"/KernEngine.o "$OUT"/GuestInstall.o "$OUT"/TXCrashLog.o \
   "$OUT"/TXLog.o "$OUT"/TXLogViewController.o "$OUT"/TXStartupViewController.o \
   "$OUT"/TXAboutViewController.o "$OUT"/TXGuestFlow.o "$OUT"/TXLocalhostProxy.o \
-  "$OUT"/TXGhosttyView.o "$OUT"/TXBackgroundKeepAlive.o "$OUT"/TXJITManager.o \
+  "$OUT"/TXGhosttyView.o "$OUT"/TXBackgroundKeepAlive.o \
   "$OUT"/TXStikJITCoordinator.o "$OUT"/TXStikJITTransport.o \
+  "$OUT"/TXPairingStore.o "$OUT"/TXLoopbackProbe.o "$OUT"/TXOnDevicePairing.o \
   "$OUT"/vt.o \
   Frameworks/Ghostty/libghostty.a \
+  $RPPAIRING_LIB \
   -framework UIKit -framework Foundation -framework CoreGraphics \
   -framework QuartzCore -framework Metal -framework MetalKit \
   -framework CoreText -framework CoreLocation -framework IOSurface \
-  -framework Security \
+  -framework Security -framework BackgroundTasks -framework UserNotifications \
   -lz -lobjc -lSystem -lc++ \
   -o "$APP/TermX"
 
@@ -126,7 +142,7 @@ find "$APP/Frameworks" -name _CodeSignature -type d -exec rm -rf {} + 2>/dev/nul
 # under PlugIns/; the installer (SideStore) signs the whole bundle,
 # including the helper and its nested StikJIT.framework, at install
 # time. If it is absent, the build is host-only and the About JIT
-# card reports the helper unavailable (the Swipt client still works).
+# card reports the helper unavailable.
 if [ -d "helper-artifact/TermXJITHelper.appex" ]; then
   mkdir -p "$APP/PlugIns"
   cp -r helper-artifact/TermXJITHelper.appex "$APP/PlugIns/"
@@ -171,6 +187,15 @@ if [ -d "$APP/PlugIns/TermXJITHelper.appex" ]; then
   echo "   helper PlugIns/TermXJITHelper.appex ($HELPER_ARCH)"
 else
   echo "   no helper embedded (host-only build)"
+fi
+if [ -n "$RPPAIRING_LIB" ]; then
+  if ! grep -a -q "tx_rppairing_new" "$BIN"; then
+    echo "ERROR: pairing library linked but tx_rppairing_new not in the binary." >&2
+    exit 1
+  fi
+  echo "   on-device pairing library linked"
+else
+  echo "   on-device pairing library absent (file import only)"
 fi
 if [ "$COMMIT" = "nogit" ]; then
   echo "ERROR: no git commit — the build marker would be 'nogit' and the IPA unidentifiable." >&2

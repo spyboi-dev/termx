@@ -1,0 +1,66 @@
+# Build libtx_rppairing.a (on-device remote pairing for Built-in
+# StikJIT, termx/src/TXOnDevicePairing.m) for iOS arm64 and upload
+# it as an artifact. The host app is NOT built here; it is built on
+# a Linux VM by termx/build.sh, which cannot run cargo for iOS.
+# The .a from this job is copied into termx/rppairing-artifact/
+# by the packaging step (not this workflow) and linked there.
+#
+# Pipeline:
+#   1. rustup with the aarch64-apple-ios target.
+#   2. cargo build --release for aarch64-apple-ios
+#      (IPHONEOS_DEPLOYMENT_TARGET=17.0).
+#   3. Verify the .a (arm64 slice, tx_rppairing_* symbols) and
+#      upload it.
+#
+# Triggered manually, or on pushes to main that touch this workflow
+# or the pairing crate sources.
+name: Build TermX pairing library
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-rppairing.yml'
+      - 'termx/rppairing/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - name: Check out app
+        uses: actions/checkout@v4
+
+      - name: Install iOS Rust target
+        run: |
+          rustup target add aarch64-apple-ios
+          rustc --version
+          cargo --version
+
+      - name: Build libtx_rppairing.a
+        run: |
+          cd termx/rppairing
+          IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo build --release --target aarch64-apple-ios
+
+      - name: Verify the library
+        run: |
+          LIB=termx/rppairing/target/aarch64-apple-ios/release/libtermx_rppairing.a
+          test -s "$LIB" || { echo "no .a at $LIB"; exit 1; }
+          # arm64 device slice, not a simulator slice.
+          lipo -info "$LIB" | grep -q arm64 \
+            || { echo "pairing library is not arm64"; exit 1; }
+          # The C interface the host app calls (termx/src/TXRPPairing.h).
+          for sym in _tx_rppairing_new _tx_rppairing_accept _tx_rppairing_cancel _tx_rppairing_free; do
+            nm -g "$LIB" | grep -q " $sym\$" \
+              || { echo "missing symbol $sym"; exit 1; }
+          done
+          echo "libtx_rppairing.a verified"
+
+      - name: Upload pairing library
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtx_rppairing-a
+          path: termx/rppairing/target/aarch64-apple-ios/release/libtermx_rppairing.a

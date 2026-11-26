@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "TXStikJITCoordinator.h"
 #import "TXLog.h"
+#import "TXLoopbackProbe.h"
+#import "TXPairingStore.h"
 #import <stdlib.h>
+#import <sys/proc.h>
+#import <sys/sysctl.h>
 #import <unistd.h>
 
 // Security framework SPI (not in the public headers). Declared
@@ -20,6 +24,12 @@ static NSString *const kTXStikJITScriptName = @"universal.js";
 
 @interface TXStikJITCoordinator ()
 @property (nonatomic, copy, nullable) NSString *lastPrepareStatusTextValue;
+@property (nonatomic, copy, nullable) NSString *lastAutoEnableStatusTextValue;
+@property (nonatomic, assign) BOOL jitEnabledThisLaunchValue;
+@property (nonatomic, assign) BOOL autoEnableAttempted;
+@property (nonatomic, assign) BOOL loopbackCheckedValue;
+@property (nonatomic, assign) BOOL loopbackReachableValue;
+@property (nonatomic, copy, nullable) NSString *lastLoopbackDetailValue;
 @end
 
 @implementation TXStikJITCoordinator
@@ -35,21 +45,32 @@ static NSString *const kTXStikJITScriptName = @"universal.js";
     return getenv("LC_HOME_PATH") != NULL;
 }
 
++ (BOOL)isDebuggerAttached {
+    struct kinfo_proc info;
+    size_t size = sizeof(info);
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+    if (sysctl(mib, 4, &info, &size, NULL, 0) != 0) return NO;
+    return (info.kp_proc.p_flag & P_TRACED) != 0;
+}
+
 #pragma mark - Method selection
 
 - (TXStikJITMethod)selectedMethod {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSInteger stored = [defaults objectForKey:kTXStikJITMethodDefaultsKey]
         ? [defaults integerForKey:kTXStikJITMethodDefaultsKey]
-        : TXStikJITMethodWaitForDebugger;
-    if (stored < TXStikJITMethodBuiltInStikJIT || stored > TXStikJITMethodWaitForDebugger) {
-        stored = TXStikJITMethodWaitForDebugger;
+        : TXStikJITMethodBuiltInStikJIT;
+    if (stored < TXStikJITMethodBuiltInStikJIT || stored > TXStikJITMethodStikDebug) {
+        // A stale stored value (e.g. the removed Wait for Debugger
+        // method) falls back to StikDebug, the method available
+        // in every environment.
+        stored = TXStikJITMethodStikDebug;
     }
     // In LiveContainer a stored Built-in selection is not usable:
-    // read it as Wait for Debugger rather than attempting the
+    // read it as StikDebug rather than attempting the
     // helper. applyLiveContainerDefaultIfNeeded persists this.
     if (stored == TXStikJITMethodBuiltInStikJIT && [[self class] isRunningInLiveContainer]) {
-        return TXStikJITMethodWaitForDebugger;
+        return TXStikJITMethodStikDebug;
     }
     return (TXStikJITMethod)stored;
 }
@@ -58,7 +79,7 @@ static NSString *const kTXStikJITScriptName = @"universal.js";
     // Refuse Built-in in LiveContainer at the setter too, so no
     // path can store an unusable method there.
     if (method == TXStikJITMethodBuiltInStikJIT && [[self class] isRunningInLiveContainer]) {
-        method = TXStikJITMethodWaitForDebugger;
+        method = TXStikJITMethodStikDebug;
     }
     [[NSUserDefaults standardUserDefaults] setInteger:method forKey:kTXStikJITMethodDefaultsKey];
 }
@@ -68,7 +89,7 @@ static NSString *const kTXStikJITScriptName = @"universal.js";
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     if ([defaults objectForKey:kTXStikJITMethodDefaultsKey]
         && [defaults integerForKey:kTXStikJITMethodDefaultsKey] == TXStikJITMethodBuiltInStikJIT) {
-        [defaults setInteger:TXStikJITMethodWaitForDebugger forKey:kTXStikJITMethodDefaultsKey];
+        [defaults setInteger:TXStikJITMethodStikDebug forKey:kTXStikJITMethodDefaultsKey];
     }
 }
 
@@ -106,83 +127,144 @@ static NSString *const kTXStikJITScriptName = @"universal.js";
     return allowed;
 }
 
-#pragma mark - Pairing file
+#pragma mark - Pairing
 
 + (NSURL *)pairingFileURL {
-    NSURL *documents = [[[NSFileManager defaultManager]
-        URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask] firstObject];
-    return [[documents URLByAppendingPathComponent:@"StikJIT"]
-        URLByAppendingPathComponent:@"pairingFile.plist"];
+    return [TXPairingStore legacyPairingFileURL];
+}
+
+- (BOOL)pairingStored {
+    return [[TXPairingStore shared] pairingStored];
+}
+
+- (TXPairingSource)pairingSource {
+    return [[TXPairingStore shared] pairingSource];
+}
+
+- (NSString *)pairingStatusText {
+    switch ([self pairingSource]) {
+        case TXPairingSourceOnDevice: return @"Paired on this iPhone";
+        case TXPairingSourceImported: return @"Imported";
+        case TXPairingSourceNone: return @"Not paired";
+    }
+}
+
+- (NSData *)readPairingDataWithError:(NSError **)error {
+    // The bytes cross to the helper over the transport; the
+    // contents are never logged anywhere.
+    NSData *data = [[TXPairingStore shared] pairingData];
+    if (!data && error) {
+        *error = [NSError errorWithDomain:@"TXStikJITCoordinatorErrorDomain"
+                                     code:1
+                                 userInfo:@{NSLocalizedDescriptionKey: @"No pairing stored."}];
+    }
+    return data;
 }
 
 - (BOOL)pairingFileExists {
-    return [[NSFileManager defaultManager] fileExistsAtPath:[[[self class] pairingFileURL] path]];
+    return [self pairingStored];
 }
 
 - (NSString *)pairingFileName {
-    if (![self pairingFileExists]) return nil;
-    return [[[self class] pairingFileURL] lastPathComponent];
+    return [self pairingStored] ? @"pairingFile.plist" : nil;
 }
 
 - (NSString *)pairingFileStatusText {
-    NSString *name = [self pairingFileName];
-    return name ?: @"Not imported";
+    return [self pairingStatusText];
 }
 
 - (NSData *)readPairingFileDataWithError:(NSError **)error {
-    // The bytes cross to the helper over the transport; the
-    // contents are never logged anywhere.
-    return [NSData dataWithContentsOfURL:[[self class] pairingFileURL]
-                                 options:0
-                                   error:error];
+    return [self readPairingDataWithError:error];
 }
 
 - (void)importPairingFileFromURL:(NSURL *)sourceURL
                       completion:(void (^)(BOOL success, NSString *statusText))completion {
-    NSURL *destination = [[self class] pairingFileURL];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSError *error = nil;
     BOOL scoped = [sourceURL startAccessingSecurityScopedResource];
-    BOOL ok = NO;
-    NSString *status = nil;
+    NSData *data = nil;
+    NSError *readError = nil;
     @try {
-        NSURL *directory = [destination URLByDeletingLastPathComponent];
-        if (![fm createDirectoryAtURL:directory
-          withIntermediateDirectories:YES attributes:nil error:&error]) {
-            status = @"Could not create StikJIT folder.";
-        } else {
-            // Copy to a temp file first, then atomically replace
-            // the stored pairing file.
-            NSURL *temp = [[directory URLByAppendingPathComponent:
-                [[NSUUID UUID].UUIDString stringByAppendingPathExtension:@"plist"]]
-                URLByAppendingPathExtension:@"tmp"];
-            if (![fm copyItemAtURL:sourceURL toURL:temp error:&error]) {
-                status = @"Could not copy pairing file.";
-            } else if (![fm replaceItemAtURL:destination
-                              withItemAtURL:temp
-                             backupItemName:nil
-                                    options:NSFileManagerItemReplacementUsingNewMetadataOnly
-                           resultingItemURL:nil
-                                      error:&error]) {
-                [fm removeItemAtURL:temp error:nil];
-                status = @"Could not replace pairing file.";
-            } else {
-                ok = YES;
-                status = [self pairingFileStatusText];
-            }
-        }
+        data = [NSData dataWithContentsOfURL:sourceURL options:0 error:&readError];
     } @finally {
         if (scoped) [sourceURL stopAccessingSecurityScopedResource];
     }
-    if (ok) {
-        // A new pairing file invalidates any shown readiness.
-        self.lastPrepareStatusTextValue = nil;
-        TXLogEngine(@"StikJIT pairing file imported");
+    BOOL ok = NO;
+    NSString *status = nil;
+    if (!data) {
+        status = @"Could not read pairing file.";
+        TXLogEngine(@"StikJIT pairing file import failed: %@", readError.localizedDescription ?: @"unknown");
     } else {
-        TXLogEngine(@"StikJIT pairing file import failed: %@", error.localizedDescription ?: @"unknown");
+        NSError *storeError = nil;
+        ok = [[TXPairingStore shared] storePairingData:data
+                                                source:TXPairingSourceImported
+                                                 error:&storeError];
+        if (ok) {
+            // A legacy file is superseded by the Keychain copy.
+            [[NSFileManager defaultManager] removeItemAtURL:[[self class] pairingFileURL] error:nil];
+            status = [self pairingStatusText];
+            TXLogEngine(@"StikJIT pairing file imported");
+        } else {
+            status = storeError.localizedDescription ?: @"Import failed.";
+            TXLogEngine(@"StikJIT pairing file import failed: %@", status);
+        }
+    }
+    if (ok) {
+        // A new pairing invalidates any shown readiness.
+        self.lastPrepareStatusTextValue = nil;
     }
     NSString *finalStatus = status ?: @"Import failed.";
     dispatch_async(dispatch_get_main_queue(), ^{ completion(ok, finalStatus); });
+}
+
+#pragma mark - Loopback (LocalDevVPN)
+
+- (BOOL)loopbackChecked {
+    return self.loopbackCheckedValue;
+}
+
+- (BOOL)loopbackReachable {
+    return self.loopbackReachableValue;
+}
+
+- (NSString *)lastLoopbackDetail {
+    return self.lastLoopbackDetailValue;
+}
+
+- (void)checkLoopbackWithCompletion:(void (^)(BOOL reachable, NSString *detail))completion {
+    __weak TXStikJITCoordinator *weakSelf = self;
+    [TXLoopbackProbe checkWithTimeout:0.4 completion:^(TXLoopbackProbeResult *result) {
+        TXStikJITCoordinator *strongSelf = weakSelf;
+        if (strongSelf) {
+            strongSelf.loopbackCheckedValue = YES;
+            strongSelf.loopbackReachableValue = result.reachable;
+            strongSelf.lastLoopbackDetailValue = result.detail;
+            TXLogEngine(@"[jit-loopback] %@ in %.0f ms (%@)",
+                        result.reachable ? @"reachable" : @"unreachable",
+                        result.milliseconds, result.detail);
+        }
+        completion(result.reachable, result.detail);
+    }];
+}
+
++ (BOOL)localDevVPNInstalled {
+    return [[UIApplication sharedApplication] canOpenURL:[NSURL URLWithString:@"localdevvpn://"]];
+}
+
++ (NSURL *)localDevVPNConnectURL {
+    return [NSURL URLWithString:@"localdevvpn://enable"];
+}
+
++ (NSURL *)localDevVPNAppStoreURL {
+    return [NSURL URLWithString:@"https://apps.apple.com/us/app/localdevvpn/id6755608044"];
+}
+
++ (NSString *)localDevVPNActionTitle {
+    return [self localDevVPNInstalled] ? @"Connect LocalDevVPN" : @"Get LocalDevVPN";
+}
+
++ (void)openLocalDevVPN {
+    NSURL *url = [self localDevVPNInstalled] ? [self localDevVPNConnectURL] : [self localDevVPNAppStoreURL];
+    TXLogEngine(@"[jit] LocalDevVPN %@", [self localDevVPNInstalled] ? @"connect" : @"app-store");
+    [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
 }
 
 #pragma mark - TXM/SPTM status
@@ -199,6 +281,14 @@ static NSString *const kTXStikJITScriptName = @"universal.js";
     return self.lastPrepareStatusTextValue;
 }
 
+- (NSString *)lastAutoEnableStatusText {
+    return self.lastAutoEnableStatusTextValue;
+}
+
+- (BOOL)jitEnabledThisLaunch {
+    return self.jitEnabledThisLaunchValue || [[self class] isDebuggerAttached];
+}
+
 #pragma mark - Helper operations
 
 // Shared preflight for prepare/enable. Returns nil when all three
@@ -212,8 +302,29 @@ static NSString *const kTXStikJITScriptName = @"universal.js";
     NSString *reason = nil;
     if (![self supportsOSVersionWithReason:&reason]) return reason;
     if (![self hasGetTaskAllowWithReason:&reason]) return reason;
-    if (![self pairingFileExists]) return @"Import a pairing file first.";
+    if (![self pairingStored]) return @"Pair on this iPhone or import a pairing file.";
     return nil;
+}
+
+// The loopback gate shared by prepare/enable: when LocalDevVPN
+// does not reach the device, the helper cannot either, so fail
+// here with the fix instead of a helper error. `proceed` runs on
+// the main queue when the loopback answers.
+- (void)withLoopbackThen:(void (^)(void))proceed
+               otherwise:(void (^)(NSString *reason))otherwise {
+    __weak TXStikJITCoordinator *weakSelf = self;
+    [self checkLoopbackWithCompletion:^(BOOL reachable, NSString *detail) {
+        (void)detail;
+        TXStikJITCoordinator *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (reachable) {
+            proceed();
+        } else {
+            NSString *reason = @"LocalDevVPN is not reaching this iPhone. Connect LocalDevVPN and try again.";
+            strongSelf.lastPrepareStatusTextValue = reason;
+            otherwise(reason);
+        }
+    }];
 }
 
 - (void)prepareJITWithCompletion:(TXStikJITReadinessHandler)completion {
@@ -225,10 +336,21 @@ static NSString *const kTXStikJITScriptName = @"universal.js";
         });
         return;
     }
+    __weak TXStikJITCoordinator *weakSelf = self;
+    [self withLoopbackThen:^{
+        TXStikJITCoordinator *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf prepareJITAfterLoopbackWithCompletion:completion];
+    } otherwise:^(NSString *reason) {
+        completion(TXStikJITReadinessNotReady, reason);
+    }];
+}
+
+- (void)prepareJITAfterLoopbackWithCompletion:(TXStikJITReadinessHandler)completion {
     NSError *readError = nil;
-    NSData *pairingData = [self readPairingFileDataWithError:&readError];
+    NSData *pairingData = [self readPairingDataWithError:&readError];
     if (!pairingData) {
-        NSString *reason = @"Could not read pairing file.";
+        NSString *reason = @"Could not read pairing.";
         self.lastPrepareStatusTextValue = reason;
         dispatch_async(dispatch_get_main_queue(), ^{
             completion(TXStikJITReadinessNotReady, reason);
@@ -260,10 +382,21 @@ static NSString *const kTXStikJITScriptName = @"universal.js";
         dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, failure); });
         return;
     }
+    __weak TXStikJITCoordinator *weakSelf = self;
+    [self withLoopbackThen:^{
+        TXStikJITCoordinator *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf enableJITAfterLoopbackWithCompletion:completion];
+    } otherwise:^(NSString *reason) {
+        completion(NO, reason);
+    }];
+}
+
+- (void)enableJITAfterLoopbackWithCompletion:(TXStikJITResultHandler)completion {
     NSError *readError = nil;
-    NSData *pairingData = [self readPairingFileDataWithError:&readError];
+    NSData *pairingData = [self readPairingDataWithError:&readError];
     if (!pairingData) {
-        NSString *reason = @"Could not read pairing file.";
+        NSString *reason = @"Could not read pairing.";
         self.lastPrepareStatusTextValue = reason;
         dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, reason); });
         return;
@@ -277,8 +410,44 @@ static NSString *const kTXStikJITScriptName = @"universal.js";
         (void)stage;
     } completion:^(TXStikJITTransportResult *result) {
         TXStikJITCoordinator *strongSelf = weakSelf;
-        if (strongSelf) strongSelf.lastPrepareStatusTextValue = result.statusText;
+        if (strongSelf) {
+            strongSelf.lastPrepareStatusTextValue = result.statusText;
+            if (result.success) strongSelf.jitEnabledThisLaunchValue = YES;
+        }
         completion(result.success, result.statusText);
+    }];
+}
+
+- (void)autoEnableJITBestEffort {
+    if ([[self class] isRunningInLiveContainer]) return;
+    if ([self selectedMethod] != TXStikJITMethodBuiltInStikJIT) return;
+    if (self.autoEnableAttempted) return;
+    self.autoEnableAttempted = YES;
+    if ([[self class] isDebuggerAttached]) {
+        self.jitEnabledThisLaunchValue = YES;
+        TXLogEngine(@"[jit-auto] JIT already enabled, skipping");
+        return;
+    }
+    if (![self pairingStored]) {
+        self.lastAutoEnableStatusTextValue = @"JIT skipped: not paired.";
+        TXLogEngine(@"[jit-auto] skipped: no pairing stored");
+        return;
+    }
+    TXLogEngine(@"[jit-auto] enabling JIT for the guest start");
+    __weak TXStikJITCoordinator *weakSelf = self;
+    [self enableJITWithCompletion:^(BOOL success, NSString *statusText) {
+        TXStikJITCoordinator *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (success) {
+            strongSelf.lastAutoEnableStatusTextValue = @"JIT enabled.";
+            TXLogEngine(@"[jit-auto] enabled: %@", statusText);
+        } else {
+            // Best-effort: the guest boots without JIT. The reason
+            // stays visible in About for diagnosis.
+            strongSelf.lastAutoEnableStatusTextValue =
+                [NSString stringWithFormat:@"JIT not enabled: %@", statusText];
+            TXLogEngine(@"[jit-auto] failed: %@", statusText);
+        }
     }];
 }
 

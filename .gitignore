@@ -30,3 +30,7 @@ termx/CRASH-*.txt
 # aarch64-linux-gnu-gcc -static -O2 -o tx-vsock-bridge tx-vsock-bridge.c).
 rootfs-build/tx-vsock-bridge
 termx/helper-artifact/
+# The on-device pairing library (Rust, built by CI from
+# termx/rppairing): not in git — a `git add -A` must never stage it.
+termx/rppairing-artifact/
+termx/rppairing/target/

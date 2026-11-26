@@ -68,6 +68,10 @@
 	<array>
 		<string>location</string>
 	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>app.termx.ios.pairing.*</string>
+	</array>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>TermX keeps the Linux guest running in the background using low-precision location. Your location is never stored or shared.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
@@ -78,14 +82,15 @@
 	<true/>
 	<key>NSBonjourServices</key>
 	<array>
-		<string>_swipt._tcp</string>
 		<string>_remotepairing._tcp</string>
+		<string>_remotepairing-pairable-host._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Find the device's Remote Pairing service to enable JIT.</string>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
 		<string>stikdebug</string>
+		<string>localdevvpn</string>
 	</array>
 </dict>
 </plist>

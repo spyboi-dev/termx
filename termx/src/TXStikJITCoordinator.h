@@ -1,9 +1,9 @@
 // TXStikJITCoordinator - host side of Built-in StikJIT and the
-// one router for all three JIT methods.
+// one router for both JIT methods.
 //
 // TermX's JIT allocator (Kernarium) already implements the
 // universal brk #0xf00d protocol, so the host only has to acquire
-// JIT, never to change the allocator. The three mutually exclusive
+// JIT, never to change the allocator. The two mutually exclusive
 // methods, persisted in NSUserDefaults under "termx.jitMethod":
 //
 //   Built-in StikJIT  - this coordinator + the StikJIT helper
@@ -13,27 +13,31 @@
 //   StikDebug URL     - opens stikdebug://enable-jit with this
 //     app's bundle ID, current PID, and script-name=universal.js.
 //     Opening the URL only confirms iOS accepted the request.
-//   Wait for Debugger - the existing Swipt client (TXJITManager).
-//     This coordinator does not own that flow; it only routes to
-//     it by method selection.
 //
 // Before any Built-in StikJIT work the host checks, in its own
 // process (the entitlement belongs to the host PID, so checking
 // from the helper would check the wrong executable):
 //   1. iOS 17.4 or later,
 //   2. get-task-allow == true (Security framework SPI),
-//   3. a pairing file at Documents/StikJIT/pairingFile.plist.
+//   3. pairing bytes stored in the Keychain (TXPairingStore).
 // The host app never strongly links StikJIT: the framework lives
 // in the helper extension only, and all helper traffic goes
-// through TXStikJITTransport (currently a stub reporting the
-// helper as unavailable; see that file).
+// through TXStikJITTransport.
 //
-// The pairing file is only ever copied as opaque bytes and is
+// The pairing bytes are only ever copied as opaque bytes and are
 // never logged. The configured script is .universal, fixed in
 // backend code; it is not a user setting.
+//
+// Auto-enable: when the guest starts, the startup screen asks this
+// coordinator to enable JIT on its own (autoEnableJITBestEffort).
+// It runs the same enable flow in the background and never blocks
+// the boot: the guest runs natively without JIT (JIT is only for
+// in-guest compilers like Node V8), so a failure is logged and
+// shown in About, and the guest boots anyway.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import "TXPairingStore.h"
 #import "TXStikJITTransport.h"
 
 NS_ASSUME_NONNULL_BEGIN
@@ -43,7 +47,6 @@ NS_ASSUME_NONNULL_BEGIN
 typedef NS_ENUM(NSInteger, TXStikJITMethod) {
     TXStikJITMethodBuiltInStikJIT = 0,
     TXStikJITMethodStikDebug = 1,
-    TXStikJITMethodWaitForDebugger = 2,
 };
 
 extern NSString *const kTXStikJITMethodDefaultsKey;
@@ -53,7 +56,7 @@ extern NSString *const kTXStikJITForceScriptDefaultsKey;
 typedef NS_ENUM(NSInteger, TXStikJITReadiness) {
     // Preflight passed and the helper reported Ready.
     TXStikJITReadinessReady = 0,
-    // Preflight failed (OS, get-task-allow, or pairing file);
+    // Preflight failed (OS, get-task-allow, pairing, or loopback);
     // `reason` names the failed check.
     TXStikJITReadinessNotReady,
     // Preflight passed but the helper could not be reached;
@@ -73,9 +76,13 @@ typedef void (^TXStikJITResultHandler)(BOOL success, NSString *statusText);
 // create the required helper extension.
 + (BOOL)isRunningInLiveContainer;
 
+// YES when a debugger is attached to this process right now
+// (P_TRACED): JIT is already enabled.
++ (BOOL)isDebuggerAttached;
+
 // The selected method, corrected for the environment: when in
-// LiveContainer a stored Built-in selection reads as Wait for
-// Debugger (see applyLiveContainerDefaultIfNeeded, which persists
+// LiveContainer a stored Built-in selection reads as StikDebug
+// (see applyLiveContainerDefaultIfNeeded, which persists
 // that correction). Never silently falls through at enable time.
 - (TXStikJITMethod)selectedMethod;
 - (void)setSelectedMethod:(TXStikJITMethod)method;
@@ -100,25 +107,50 @@ typedef void (^TXStikJITResultHandler)(BOOL success, NSString *statusText);
 // otherwise. Needs Security.framework linked.
 - (BOOL)hasGetTaskAllowWithReason:(NSString * _Nullable * _Nullable)reason;
 
-// --- Pairing file ---
+// --- Pairing (Keychain, TXPairingStore) ---
 
-// Documents/StikJIT/pairingFile.plist.
-+ (NSURL *)pairingFileURL;
+// YES when pairing bytes are stored (paired on this iPhone, or
+// imported). A legacy Documents/StikJIT/pairingFile.plist is
+// migrated into the Keychain on first read.
+- (BOOL)pairingStored;
+- (TXPairingSource)pairingSource;
+// "Paired on this iPhone", "Imported", or "Not paired".
+- (NSString *)pairingStatusText;
+// The stored pairing bytes for the transport. Never logged.
+- (nullable NSData *)readPairingDataWithError:(NSError **)error;
+
+// Legacy names, kept for existing callers: the pairing lives in
+// the Keychain now, not in a file.
 - (BOOL)pairingFileExists;
-// The imported filename ("pairingFile.plist"), or nil when none
-// is imported. Only the filename is ever shown or logged.
 - (nullable NSString *)pairingFileName;
-// "pairingFile.plist" when imported, "Not imported" otherwise.
 - (NSString *)pairingFileStatusText;
-// Raw pairing-file bytes for the transport. Never logged.
 - (nullable NSData *)readPairingFileDataWithError:(NSError **)error;
-// Copy a picked file to Documents/StikJIT/pairingFile.plist,
-// replacing atomically. Uses security-scoped access while
-// copying; never logs the file contents. Changing the pairing
-// file clears the last prepare status. Completion is on the main
-// queue with success and a short status string.
++ (NSURL *)pairingFileURL;
+
+// Store picked pairing bytes in the Keychain, replacing any
+// stored pairing. Completion is on the main queue with success
+// and a short status string.
 - (void)importPairingFileFromURL:(NSURL *)sourceURL
                       completion:(void (^)(BOOL success, NSString *statusText))completion;
+
+// --- Loopback (LocalDevVPN, TXLoopbackProbe) ---
+
+// The last loopback check's outcome. NO until a check has run.
+@property (nonatomic, readonly) BOOL loopbackChecked;
+@property (nonatomic, readonly) BOOL loopbackReachable;
+@property (nonatomic, readonly, copy, nullable) NSString *lastLoopbackDetail;
+// Runs the loopback check off the main thread; completion is on
+// the main queue. Records the outcome above.
+- (void)checkLoopbackWithCompletion:(void (^)(BOOL reachable, NSString *detail))completion;
+
+// LocalDevVPN, which Built-in StikJIT and StikDebug reach the
+// device through: open it to connect when it is installed,
+// otherwise its App Store page.
++ (BOOL)localDevVPNInstalled;
++ (NSURL *)localDevVPNConnectURL;
++ (NSURL *)localDevVPNAppStoreURL;
++ (NSString *)localDevVPNActionTitle;
++ (void)openLocalDevVPN;
 
 // TXM/SPTM status from the helper (Unknown while the transport
 // is a stub). Informational only; the script stays .universal.
@@ -126,21 +158,38 @@ typedef void (^TXStikJITResultHandler)(BOOL success, NSString *statusText);
 - (NSString *)txmSPTMStatusText;
 
 // Last prepare/enable status text, for the About card to show
-// across appearances. Cleared when the pairing file changes.
+// across appearances. Cleared when the pairing changes.
 @property (nonatomic, readonly, copy, nullable) NSString *lastPrepareStatusText;
 
-// Run the preflight, then ask the helper to prepare the device
-// (reachability, DDI mount, TXM detection). Do not require the
-// user to prepare before enabling: enableJIT does preparation
-// itself. In LiveContainer this returns HelperUnavailable
-// without launching anything.
+// Last best-effort auto-enable outcome, for the About card.
+// Nil until an auto-enable has been attempted this launch.
+@property (nonatomic, readonly, copy, nullable) NSString *lastAutoEnableStatusText;
+// YES once an auto-enable (or a manual enable) has attached a
+// debugger this launch.
+@property (nonatomic, readonly) BOOL jitEnabledThisLaunch;
+
+// Run the preflight, then the loopback check, then ask the helper
+// to prepare the device (reachability, DDI mount, TXM detection).
+// Do not require the user to prepare before enabling: enableJIT
+// does preparation itself. In LiveContainer this returns
+// HelperUnavailable without launching anything.
 - (void)prepareJITWithCompletion:(TXStikJITReadinessHandler)completion;
 
-// Run the preflight, then ask the helper to enable JIT for this
-// process with the .universal script. Success here means the
-// helper completed enablement; JIT readiness itself is still
-// confirmed through the existing breakpoint protocol.
+// Run the preflight, then the loopback check, then ask the helper
+// to enable JIT for this process with the .universal script.
+// Success here means the helper completed enablement; JIT
+// readiness itself is still confirmed through the existing
+// breakpoint protocol.
 - (void)enableJITWithCompletion:(TXStikJITResultHandler)completion;
+
+// Best-effort auto-enable for the guest start path: when the
+// selected method is Built-in StikJIT and no debugger is attached
+// yet, runs the enable flow in the background, once per launch.
+// Never blocks the boot and never throws: a failure is logged and
+// recorded in lastAutoEnableStatusText, and the guest boots
+// without JIT. No-op in LiveContainer, for the StikDebug method,
+// without stored pairing, or when JIT is already on.
+- (void)autoEnableJITBestEffort;
 
 // Ask the helper to delete its cached Developer Disk Image files.
 // The next preparation re-downloads them.

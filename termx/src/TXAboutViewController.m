@@ -4,9 +4,9 @@
 #import "GuestInstall.h"
 #import "KernEngine.h"
 #import "TXBackgroundKeepAlive.h"
-#import "TXJITManager.h"
 #import "TXLocalhostProxy.h"
 #import "TXLog.h"
+#import "TXOnDevicePairing.h"
 #import "TXStikJITCoordinator.h"
 #import "TXTheme.h"
 
@@ -18,13 +18,6 @@
 // The background keep-alive switch, synced on every appearance so
 // it shows off when the location authorization denied it.
 @property (nonatomic, strong) UISwitch *backgroundSwitch;
-// The JIT switch and status line, synced on every appearance and
-// whenever the JIT manager posts a status change, so the discovery
-// progress shows live while the view is on screen. The token row
-// only appears when the discovered Swipt server asks for one.
-@property (nonatomic, strong) UISwitch *jitSwitch;
-@property (nonatomic, strong) UILabel *jitStatusLabel;
-@property (nonatomic, strong) UIButton *jitTokenButton;
 // JIT method picker: one checkmark label per method row, indexed
 // by TXStikJITMethod, plus the per-method sections shown only
 // when that method is selected.
@@ -33,8 +26,13 @@
 @property (nonatomic, strong) UILabel *jitLiveContainerNoteLabel;
 @property (nonatomic, strong) UIStackView *jitBuiltInStack;
 @property (nonatomic, strong) UIStackView *jitStikDebugStack;
-@property (nonatomic, strong) UIStackView *jitWaitStack;
 @property (nonatomic, strong) UILabel *jitPairingFileLabel;
+@property (nonatomic, strong) UILabel *jitPairingPinLabel;
+@property (nonatomic, strong) UIButton *jitPairButton;
+@property (nonatomic, strong) UIButton *jitPairCancelButton;
+@property (nonatomic, strong) UILabel *jitLoopbackLabel;
+@property (nonatomic, strong) UIButton *jitLocalDevVPNButton;
+@property (nonatomic, strong) UILabel *jitAutoEnableLabel;
 @property (nonatomic, strong) UILabel *jitPrepareStatusLabel;
 @property (nonatomic, strong) UILabel *jitTXMStatusLabel;
 @property (nonatomic, strong) UISwitch *jitForceScriptSwitch;
@@ -42,6 +40,11 @@
 @property (nonatomic, strong) UILabel *jitStikDebugStatusLabel;
 // Guards re-entry on the async Built-in prepare/enable actions.
 @property (nonatomic, assign) BOOL jitBuiltInBusy;
+// Guards stacking loopback checks while the card refreshes.
+@property (nonatomic, assign) BOOL jitLoopbackCheckInFlight;
+// The loopback check runs once per appearance, not on every card
+// refresh (its completion re-enters syncJITCard).
+@property (nonatomic, assign) BOOL jitLoopbackCheckedThisAppearance;
 // Refreshes the Localhost card's port list while the view is on
 // screen, so auto-detected ports appear and leave as guest
 // services start and stop.
@@ -55,11 +58,8 @@
     [self refreshLocalhostPorts];
     self.backgroundSwitch.on = [[TXBackgroundKeepAlive shared] isEnabled];
     [[TXStikJITCoordinator shared] applyLiveContainerDefaultIfNeeded];
+    self.jitLoopbackCheckedThisAppearance = NO;
     [self syncJITCard];
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(syncJITCard)
-                                                 name:TXJITManagerStatusDidChangeNotification
-                                               object:nil];
     __weak TXAboutViewController *weakSelf = self;
     self.localhostRefreshTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
                                                                  repeats:YES
@@ -70,9 +70,6 @@
 
 - (void)viewDidDisappear:(BOOL)animated {
     [super viewDidDisappear:animated];
-    [[NSNotificationCenter defaultCenter] removeObserver:self
-                                                    name:TXJITManagerStatusDidChangeNotification
-                                                  object:nil];
     [self.localhostRefreshTimer invalidate];
     self.localhostRefreshTimer = nil;
 }
@@ -159,9 +156,7 @@
     // a low-precision location session (see TXBackgroundKeepAlive).
     UIView *backgroundCard = [self backgroundCard];
 
-    // JIT: native JIT for the guest via the Swipt helper app
-    // (see TXJITManager). The Swipt app must be installed and
-    // running on this phone; without it the status stays Not Found.
+    // JIT: native JIT for the guest (see TXStikJITCoordinator).
     UIView *jitCard = [self jitCard];
 
     UILabel *licenseNote = [self noteLabelWithText:
@@ -515,15 +510,12 @@
 }
 
 // JIT card: a method picker plus one section per method, styled
-// like the Background card. The three methods are mutually
+// like the Background card. The two methods are mutually
 // exclusive and persist in NSUserDefaults ("termx.jitMethod"):
 // Built-in StikJIT (TXStikJITCoordinator + helper extension,
-// recommended when available), StikDebug URL (opens StikDebug
-// for this process), and Wait for Debugger (the existing Swipt
-// client, TXJITManager). In LiveContainer the Built-in row is
-// disabled and the stored method defaults to Wait for Debugger.
-// The Swipt switch, status, and token row live in the Wait for
-// Debugger section only.
+// recommended when available) and StikDebug URL (opens StikDebug
+// for this process). In LiveContainer the Built-in row is
+// disabled and the stored method defaults to StikDebug.
 - (UIView *)jitCard {
     UIView *card = [[UIView alloc] init];
     card.backgroundColor = TXThemeCardBackground();
@@ -544,17 +536,17 @@
     detailLabel.numberOfLines = 0;
     detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
-    // Method picker: three tappable rows, one checkmark on the
+    // Method picker: two tappable rows, one checkmark on the
     // selected row. Built-in is disabled in LiveContainer.
     NSArray<NSString *> *methodTitles = @[
-        @"Built-in StikJIT", @"StikDebug", @"Wait for Debugger"];
+        @"Built-in StikJIT", @"StikDebug"];
     NSMutableArray<UILabel *> *checks = [NSMutableArray array];
     NSMutableArray<UIButton *> *buttons = [NSMutableArray array];
     UIStackView *pickerStack = [[UIStackView alloc] init];
     pickerStack.axis = UILayoutConstraintAxisVertical;
     pickerStack.spacing = 0;
     pickerStack.translatesAutoresizingMaskIntoConstraints = NO;
-    for (NSInteger method = 0; method < 3; method++) {
+    for (NSInteger method = 0; method < 2; method++) {
         UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
         button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
         button.titleLabel.font = [UIFont systemFontOfSize:15];
@@ -604,12 +596,11 @@
     // syncJITCard.
     self.jitBuiltInStack = [self jitBuiltInSection];
     self.jitStikDebugStack = [self jitStikDebugSection];
-    self.jitWaitStack = [self jitWaitSection];
     [self syncJITCard];
 
     UIStackView *cardStack = [[UIStackView alloc] initWithArrangedSubviews:@[
         titleLabel, detailLabel, pickerStack, liveContainerNote,
-        self.jitBuiltInStack, self.jitStikDebugStack, self.jitWaitStack]];
+        self.jitBuiltInStack, self.jitStikDebugStack]];
     cardStack.axis = UILayoutConstraintAxisVertical;
     cardStack.spacing = 12;
     cardStack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -635,9 +626,10 @@
     return button;
 }
 
-// Built-in StikJIT section: pairing file import + status,
-// Prepare/Enable JIT + readiness status, TXM/SPTM status, Force
-// JIT Script toggle, Reset Developer Disk Image.
+// Built-in StikJIT section: on-device pairing + PIN, pairing
+// file import (older path), loopback status, Prepare/Enable JIT +
+// readiness status, TXM/SPTM status, Force JIT Script toggle,
+// Reset Developer Disk Image.
 - (UIStackView *)jitBuiltInSection {
     UILabel *pairingLabel = [[UILabel alloc] init];
     pairingLabel.font = [UIFont systemFontOfSize:15];
@@ -647,14 +639,46 @@
     pairingLabel.translatesAutoresizingMaskIntoConstraints = NO;
     self.jitPairingFileLabel = pairingLabel;
     UIStackView *pairingRow = [[UIStackView alloc] initWithArrangedSubviews:@[
-        [self jitSectionKeyLabel:@"Pairing file"], pairingLabel]];
+        [self jitSectionKeyLabel:@"Pairing"], pairingLabel]];
     pairingRow.axis = UILayoutConstraintAxisHorizontal;
     pairingRow.spacing = 12;
     pairingRow.alignment = UIStackViewAlignmentTop;
     pairingRow.translatesAutoresizingMaskIntoConstraints = NO;
 
-    UIButton *importButton = [self jitActionButtonWithTitle:@"Import Pairing File"
+    UIButton *pairButton = [self jitActionButtonWithTitle:@"Pair on this iPhone"
+                                                   action:@selector(jitPairTapped:)];
+    self.jitPairButton = pairButton;
+    UIButton *pairCancelButton = [self jitActionButtonWithTitle:@"Cancel pairing"
+                                                        action:@selector(jitPairCancelTapped:)];
+    self.jitPairCancelButton = pairCancelButton;
+
+    UILabel *pinLabel = [[UILabel alloc] init];
+    pinLabel.font = [UIFont monospacedDigitSystemFontOfSize:32 weight:UIFontWeightBold];
+    pinLabel.textColor = [UIColor whiteColor];
+    pinLabel.textAlignment = NSTextAlignmentCenter;
+    pinLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.jitPairingPinLabel = pinLabel;
+
+    UIButton *importButton = [self jitActionButtonWithTitle:@"Import pairing file (older path)"
                                                      action:@selector(jitImportPairingFileTapped:)];
+
+    UILabel *loopbackLabel = [[UILabel alloc] init];
+    loopbackLabel.font = [UIFont systemFontOfSize:15];
+    loopbackLabel.textColor = [UIColor whiteColor];
+    loopbackLabel.textAlignment = NSTextAlignmentRight;
+    loopbackLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.jitLoopbackLabel = loopbackLabel;
+    UIStackView *loopbackRow = [[UIStackView alloc] initWithArrangedSubviews:@[
+        [self jitSectionKeyLabel:@"LocalDevVPN"], loopbackLabel]];
+    loopbackRow.axis = UILayoutConstraintAxisHorizontal;
+    loopbackRow.spacing = 12;
+    loopbackRow.alignment = UIStackViewAlignmentTop;
+    loopbackRow.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIButton *localDevVPNButton = [self jitActionButtonWithTitle:@"Connect LocalDevVPN"
+                                                          action:@selector(jitLocalDevVPNTapped:)];
+    self.jitLocalDevVPNButton = localDevVPNButton;
+
     UIButton *prepareButton = [self jitActionButtonWithTitle:@"Prepare JIT"
                                                       action:@selector(jitPrepareTapped:)];
     UIButton *enableButton = [self jitActionButtonWithTitle:@"Enable JIT"
@@ -666,6 +690,13 @@
     prepareStatus.numberOfLines = 0;
     prepareStatus.translatesAutoresizingMaskIntoConstraints = NO;
     self.jitPrepareStatusLabel = prepareStatus;
+
+    UILabel *autoEnableLabel = [[UILabel alloc] init];
+    autoEnableLabel.font = [UIFont systemFontOfSize:13];
+    autoEnableLabel.textColor = TXThemeSecondaryTextColor();
+    autoEnableLabel.numberOfLines = 0;
+    autoEnableLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.jitAutoEnableLabel = autoEnableLabel;
 
     UILabel *txmLabel = [[UILabel alloc] init];
     txmLabel.font = [UIFont systemFontOfSize:15];
@@ -701,8 +732,9 @@
                                                     action:@selector(jitResetDDITapped:)];
 
     UIStackView *section = [[UIStackView alloc] initWithArrangedSubviews:@[
-        pairingRow, importButton, prepareButton, enableButton,
-        prepareStatus, txmRow, forceRow, resetButton]];
+        pairingRow, pairButton, pairCancelButton, pinLabel, importButton,
+        loopbackRow, localDevVPNButton, prepareButton, enableButton,
+        prepareStatus, autoEnableLabel, txmRow, forceRow, resetButton]];
     section.axis = UILayoutConstraintAxisVertical;
     section.spacing = 12;
     section.translatesAutoresizingMaskIntoConstraints = NO;
@@ -752,66 +784,6 @@
     return section;
 }
 
-// Wait for Debugger section: the existing Swipt client
-// (TXJITManager) switch, live status, and token row. The Swipt
-// app must be installed and running on this phone; without it
-// the status stays Not Found.
-- (UIStackView *)jitWaitSection {
-    UILabel *keyLabel = [[UILabel alloc] init];
-    keyLabel.font = [UIFont systemFontOfSize:15];
-    keyLabel.textColor = TXThemeSecondaryTextColor();
-    keyLabel.text = @"JIT";
-    keyLabel.translatesAutoresizingMaskIntoConstraints = NO;
-
-    UILabel *detailLabel = [[UILabel alloc] init];
-    detailLabel.font = [UIFont systemFontOfSize:13];
-    detailLabel.textColor = TXThemeSecondaryTextColor();
-    detailLabel.text = @"Waits for the Swipt helper app on this phone to enable JIT. Swipt must be installed and running.";
-    detailLabel.numberOfLines = 0;
-    detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
-
-    UIStackView *labels = [[UIStackView alloc] initWithArrangedSubviews:@[keyLabel, detailLabel]];
-    labels.axis = UILayoutConstraintAxisVertical;
-    labels.spacing = 2;
-    labels.translatesAutoresizingMaskIntoConstraints = NO;
-
-    UISwitch *jitSwitch = [[UISwitch alloc] init];
-    jitSwitch.on = [[TXJITManager shared] jitEnabled];
-    jitSwitch.onTintColor = TXThemeAccentColor();
-    jitSwitch.accessibilityLabel = @"JIT";
-    jitSwitch.accessibilityHint = @"Enables native JIT for the guest via the Swipt helper app.";
-    [jitSwitch addTarget:self action:@selector(jitSwitchChanged:) forControlEvents:UIControlEventValueChanged];
-    jitSwitch.translatesAutoresizingMaskIntoConstraints = NO;
-    self.jitSwitch = jitSwitch;
-
-    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[labels, jitSwitch]];
-    row.axis = UILayoutConstraintAxisHorizontal;
-    row.spacing = 12;
-    row.alignment = UIStackViewAlignmentCenter;
-    row.translatesAutoresizingMaskIntoConstraints = NO;
-
-    UILabel *statusLabel = [[UILabel alloc] init];
-    statusLabel.font = [UIFont systemFontOfSize:13];
-    statusLabel.textColor = TXThemeSecondaryTextColor();
-    statusLabel.text = [[TXJITManager shared] statusText];
-    statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.jitStatusLabel = statusLabel;
-
-    UIButton *tokenButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    tokenButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-    tokenButton.titleLabel.font = [UIFont systemFontOfSize:15];
-    [tokenButton setTitleColor:TXThemeSecondaryTextColor() forState:UIControlStateNormal];
-    [tokenButton addTarget:self action:@selector(jitTokenButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    tokenButton.translatesAutoresizingMaskIntoConstraints = NO;
-    self.jitTokenButton = tokenButton;
-
-    UIStackView *section = [[UIStackView alloc] initWithArrangedSubviews:@[row, statusLabel, tokenButton]];
-    section.axis = UILayoutConstraintAxisVertical;
-    section.spacing = 12;
-    section.translatesAutoresizingMaskIntoConstraints = NO;
-    return section;
-}
-
 - (UILabel *)jitSectionKeyLabel:(NSString *)text {
     UILabel *label = [[UILabel alloc] init];
     label.font = [UIFont systemFontOfSize:15];
@@ -823,17 +795,13 @@
     return label;
 }
 
-- (void)jitSwitchChanged:(UISwitch *)sender {
-    [[TXJITManager shared] setJITEnabled:sender.isOn];
-}
-
 - (void)syncJITCard {
     TXStikJITCoordinator *coordinator = [TXStikJITCoordinator shared];
     TXStikJITMethod method = [coordinator selectedMethod];
     BOOL inLiveContainer = [TXStikJITCoordinator isRunningInLiveContainer];
     // Picker: checkmark on the selected row; Built-in disabled
     // in LiveContainer.
-    for (NSInteger i = 0; i < 3; i++) {
+    for (NSInteger i = 0; i < 2; i++) {
         if (i < self.jitMethodCheckLabels.count) {
             self.jitMethodCheckLabels[i].hidden = (i != method);
         }
@@ -854,12 +822,55 @@
     if (self.jitStikDebugStack) {
         self.jitStikDebugStack.hidden = (method != TXStikJITMethodStikDebug);
     }
-    if (self.jitWaitStack) {
-        self.jitWaitStack.hidden = (method != TXStikJITMethodWaitForDebugger);
-    }
     // Built-in section state.
     if (self.jitPairingFileLabel) {
-        self.jitPairingFileLabel.text = [coordinator pairingFileStatusText];
+        self.jitPairingFileLabel.text = [coordinator pairingStatusText];
+    }
+    TXOnDevicePairing *pairing = [TXOnDevicePairing shared];
+    if (self.jitPairButton) {
+        self.jitPairButton.hidden = pairing.active;
+    }
+    if (self.jitPairCancelButton) {
+        self.jitPairCancelButton.hidden = !pairing.active;
+    }
+    if (self.jitPairingPinLabel) {
+        if (pairing.phase == TXOnDevicePairingPhasePIN && pairing.pin) {
+            self.jitPairingPinLabel.font = [UIFont monospacedDigitSystemFontOfSize:32 weight:UIFontWeightBold];
+            self.jitPairingPinLabel.textColor = [UIColor whiteColor];
+            self.jitPairingPinLabel.numberOfLines = 1;
+            self.jitPairingPinLabel.text = pairing.pin;
+            self.jitPairingPinLabel.hidden = NO;
+        } else if (pairing.phase == TXOnDevicePairingPhaseWaiting) {
+            self.jitPairingPinLabel.text = pairing.backgroundLimited
+                ? @"Open Settings > Privacy & Security > Developer Mode, then tap Pair with TermX. Go straight away: this install can only wait briefly in the background."
+                : @"Open Settings > Privacy & Security > Developer Mode, then tap Pair with TermX.";
+            self.jitPairingPinLabel.font = [UIFont systemFontOfSize:13];
+            self.jitPairingPinLabel.textColor = TXThemeSecondaryTextColor();
+            self.jitPairingPinLabel.numberOfLines = 0;
+            self.jitPairingPinLabel.hidden = NO;
+        } else {
+            self.jitPairingPinLabel.hidden = YES;
+        }
+    }
+    if (self.jitLoopbackLabel) {
+        if ([coordinator loopbackChecked]) {
+            self.jitLoopbackLabel.text = [coordinator loopbackReachable] ? @"Connected" : @"Not connected";
+        } else {
+            self.jitLoopbackLabel.text = @"Checking…";
+        }
+    }
+    if (self.jitLocalDevVPNButton) {
+        // Shown only when the loopback check found LocalDevVPN
+        // down; the title follows whether it is installed.
+        BOOL show = [coordinator loopbackChecked] && ![coordinator loopbackReachable];
+        self.jitLocalDevVPNButton.hidden = !show;
+        if (show) [self.jitLocalDevVPNButton setTitle:[TXStikJITCoordinator localDevVPNActionTitle]
+                                              forState:UIControlStateNormal];
+    }
+    if (self.jitAutoEnableLabel) {
+        NSString *autoStatus = coordinator.lastAutoEnableStatusText;
+        self.jitAutoEnableLabel.text = autoStatus ?: @"";
+        self.jitAutoEnableLabel.hidden = (autoStatus == nil);
     }
     if (self.jitPrepareStatusLabel) {
         self.jitPrepareStatusLabel.text = coordinator.lastPrepareStatusText ?: @"";
@@ -874,28 +885,68 @@
     if (self.jitStikDebugAppLabel) {
         self.jitStikDebugAppLabel.text = [coordinator canOpenStikDebug] ? @"Installed" : @"Not installed";
     }
-    // Wait for Debugger section state (the Swipt client).
-    TXJITManager *jit = [TXJITManager shared];
-    if (self.jitSwitch) self.jitSwitch.on = jit.jitEnabled;
-    if (self.jitStatusLabel) {
-        self.jitStatusLabel.text = [NSString stringWithFormat:@"Status: %@", jit.statusText];
-    }
-    if (self.jitTokenButton) {
-        BOOL showToken = jit.requiresToken || jit.swiptToken.length > 0;
-        self.jitTokenButton.hidden = !showToken;
-        NSString *value = jit.swiptToken.length > 0 ? @"•••" : @"Required";
-        [self.jitTokenButton setTitle:[NSString stringWithFormat:@"Swipt Token: %@", value]
-                             forState:UIControlStateNormal];
+    // Refresh the loopback row once per appearance: the check is
+    // off the main thread and updates the labels when it answers.
+    if (method == TXStikJITMethodBuiltInStikJIT
+        && !self.jitLoopbackCheckedThisAppearance
+        && !self.jitLoopbackCheckInFlight) {
+        self.jitLoopbackCheckedThisAppearance = YES;
+        self.jitLoopbackCheckInFlight = YES;
+        __weak TXAboutViewController *weakSelf = self;
+        [coordinator checkLoopbackWithCompletion:^(BOOL reachable, NSString *detail) {
+            (void)reachable; (void)detail;
+            TXAboutViewController *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            strongSelf.jitLoopbackCheckInFlight = NO;
+            [strongSelf syncJITCard];
+        }];
     }
 }
 
 - (void)jitMethodTapped:(UIButton *)sender {
     TXStikJITMethod method = (TXStikJITMethod)sender.tag;
     [[TXStikJITCoordinator shared] setSelectedMethod:method];
-    if (method == TXStikJITMethodWaitForDebugger) {
-        [[TXJITManager shared] refresh];
-    }
     [self syncJITCard];
+}
+
+- (void)jitPairTapped:(UIButton *)sender {
+    (void)sender;
+    TXOnDevicePairing *pairing = [TXOnDevicePairing shared];
+    if (pairing.active) return;
+    __weak TXAboutViewController *weakSelf = self;
+    pairing.onPIN = ^(NSString *pin) {
+        (void)pin;
+        TXAboutViewController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf syncJITCard];
+    };
+    pairing.completion = ^(BOOL success, NSString *deviceName, NSString *message) {
+        TXAboutViewController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        // syncJITCard rewrites the status label from the
+        // coordinator's last status; keep the pairing result
+        // visible instead.
+        [strongSelf syncJITCard];
+        if (success) {
+            strongSelf.jitPrepareStatusLabel.text =
+                [NSString stringWithFormat:@"Paired with %@.", deviceName ?: @"this iPhone"];
+        } else if (message) {
+            strongSelf.jitPrepareStatusLabel.text = message;
+        }
+    };
+    [pairing start];
+    [self syncJITCard];
+}
+
+- (void)jitPairCancelTapped:(UIButton *)sender {
+    (void)sender;
+    [[TXOnDevicePairing shared] cancelWithReason:nil];
+    [self syncJITCard];
+}
+
+- (void)jitLocalDevVPNTapped:(UIButton *)sender {
+    (void)sender;
+    [TXStikJITCoordinator openLocalDevVPN];
 }
 
 - (void)jitForceScriptChanged:(UISwitch *)sender {
@@ -1011,34 +1062,6 @@
             ? @"Request sent to StikDebug."
             : @"Could not open StikDebug.";
     }];
-}
-
-- (void)jitTokenButtonTapped:(UIButton *)sender {
-    (void)sender;
-    UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Swipt Token"
-                         message:@"Enter the token shown by the Swipt app."
-                  preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.text = [[TXJITManager shared] swiptToken];
-        textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
-        textField.autocorrectionType = UITextAutocorrectionTypeNo;
-    }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
-    __weak TXAboutViewController *weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *action) {
-        (void)action;
-        NSString *token = alert.textFields.firstObject.text ?: @"";
-        [[TXJITManager shared] setSwiptToken:
-            [token stringByTrimmingCharactersInSet:
-                [NSCharacterSet whitespaceAndNewlineCharacterSet]]];
-        [weakSelf syncJITCard];
-    }]];
-    [self presentViewController:alert animated:YES completion:nil];
 }
 
 // Diagnostics card: one switch row, styled like the other cards.

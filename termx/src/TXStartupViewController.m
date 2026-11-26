@@ -5,6 +5,7 @@
 #import "TXAboutViewController.h"
 #import "TXLog.h"
 #import "TXLogViewController.h"
+#import "TXStikJITCoordinator.h"
 #import "TXTheme.h"
 #import "TerminalViewController.h"
 #import <MetalKit/MetalKit.h>
@@ -892,6 +893,15 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
 // backgrounded would fight iOS for CPU it will not give. If the
 // install finished while backgrounded, the flag stays clear and the
 // poll tick after the return to the foreground boots instead.
+// Best-effort JIT for the boot: when Built-in StikJIT is selected
+// and JIT is not on yet, the coordinator enables it in the
+// background. It never blocks or delays the boot: the guest runs
+// natively without JIT, so a JIT failure only lands in the log and
+// in About.
+- (void)autoEnableJITForBoot {
+    [[TXStikJITCoordinator shared] autoEnableJITBestEffort];
+}
+
 - (void)maybeAutoBoot {
     KernEngine *engine = [KernEngine shared];
     if (engine.state != TermXStateReady) return;
@@ -924,6 +934,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
             engine.flow.autoBootDeferredSince = nil;
             engine.flow.autoBootDone = YES;
             TXLogEngine(@"Auto-boot: guest is ready, starting the engine");
+            [self autoEnableJITForBoot];
             [engine bootOnView:self.guestView];
         }
         return;
@@ -931,6 +942,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
     engine.flow.autoBootDeferredSince = nil;
     engine.flow.autoBootDone = YES;
     TXLogEngine(@"Auto-boot: guest is ready, starting the engine");
+    [self autoEnableJITForBoot];
     [engine bootOnView:self.guestView];
 }
 
@@ -1095,11 +1107,13 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         TXLogEngine(@"Start fresh: data disk erased after the last run crashed — booting clean");
         [engine.flow acknowledgeCrash];
         [engine.flow resetRetry];
+        [self autoEnableJITForBoot];
         [engine bootOnView:self.guestView];
         return;
     }
     if (engine.state != TermXStateStopped) return;
     [engine.flow resetRetry];
+    [self autoEnableJITForBoot];
     [engine bootOnView:self.guestView];
 }
 
@@ -1114,6 +1128,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         // below even when an update is available.
         [engine.flow acknowledgeCrash];
         [engine.flow resetRetry];
+        [self autoEnableJITForBoot];
         [engine bootOnView:self.guestView];
         return;
     }
@@ -1156,6 +1171,7 @@ typedef NS_ENUM(NSInteger, TXStartupRowState) {
         // crash choice is showing.
         [engine.flow acknowledgeCrash];
         [engine.flow resetRetry];
+        [self autoEnableJITForBoot];
         [engine bootOnView:self.guestView];
         return;
     }

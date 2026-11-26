@@ -1,0 +1,22 @@
+[package]
+name = "termx_rppairing"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# On-device remote pairing only: idevice's PairableHost. No Apple ID
+# sign-in (no isideload), no profile install, no tunnel. idevice is
+# MIT, jkcoxson/idevice.
+idevice = { version = "=0.1.68", default-features = false, features = ["remote_pairing", "tcp", "ring"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "macros", "time"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
