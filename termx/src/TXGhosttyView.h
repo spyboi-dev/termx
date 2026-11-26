@@ -48,7 +48,25 @@
 // exists: they are buffered and flushed once it is sized.
 - (void)feedGuestOutput:(NSData *)data;
 
-// Typed text (from the hidden input field) into the terminal.
+// Guest console bytes that are history, not live output (the boot
+// log replayed when the terminal first appears). Parsed the same
+// way, but the replies the bytes would trigger — device attributes,
+// status and cursor reports, OSC colour queries, title reports —
+// are dropped: those queries were answered when the bytes were
+// live, and a second answer reaches the shell as typed input.
+// Same buffering as feedGuestOutput before the surface is sized.
+- (void)feedGuestOutputReplay:(NSData *)data;
+
+// Typed text (from the hidden input field) into the terminal, on
+// the key path like libghostty-spm's sendTypedText: a key event
+// with keycode 0xFFFF (unidentified) and the text, so Ghostty
+// encodes it as keystrokes. NOT the text path (sendText:), which
+// Ghostty treats as a paste and wraps in bracketed paste.
+- (void)sendTypedText:(NSString *)text mods:(ghostty_input_mods_e)mods;
+
+// Raw text into the terminal on the text path: Ghostty treats it
+// as a paste. Only for key-row byte sequences and control bytes,
+// never for typed letters (see sendTypedText:).
 - (void)sendText:(NSString *)text;
 
 // A special key (arrows, Esc, Tab, Backspace, Enter) with the

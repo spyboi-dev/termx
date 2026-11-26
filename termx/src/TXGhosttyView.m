@@ -342,7 +342,12 @@ static void TXGhosttyWriteClipboard(
     if (!_surface || !_pendingOutput.length) return;
     NSData *data = [_pendingOutput copy];
     [_pendingOutput setLength:0];
-    ghostty_surface_write_buffer(_surface, (const uint8_t *)data.bytes, (uintptr_t)data.length);
+    // Replay, not live: everything buffered here arrived before
+    // the surface was sized, so it is history. Answering its
+    // queries live would send a second set of CPR/DA replies to
+    // a guest whose programs have moved on, and they land in the
+    // shell as typed input.
+    ghostty_surface_write_buffer_replay(_surface, (const uint8_t *)data.bytes, (uintptr_t)data.length);
     _needsFrame = YES;
 }
 
@@ -394,6 +399,29 @@ static void TXGhosttyWriteClipboard(
     _needsFrame = YES;
 }
 
+// History into the terminal: same buffering as feedGuestOutput,
+// but parsed with write_buffer_replay, so the replies the bytes
+// would trigger (CPR/DA/OSC queries, title reports) are dropped
+// instead of reaching the guest as a second answer.
+- (void)feedGuestOutputReplay:(NSData *)data {
+    if (!data.length) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self feedGuestOutputReplay:data]; });
+        return;
+    }
+    if (!_surface || !_surfaceReady) {
+        [_pendingOutput appendData:data];
+        const NSUInteger cap = 256 * 1024;
+        if (_pendingOutput.length > cap) {
+            [_pendingOutput replaceBytesInRange:NSMakeRange(0, _pendingOutput.length - cap)
+                                      withBytes:NULL length:0];
+        }
+        return;
+    }
+    ghostty_surface_write_buffer_replay(_surface, (const uint8_t *)data.bytes, (uintptr_t)data.length);
+    _needsFrame = YES;
+}
+
 - (void)sendText:(NSString *)text {
     if (!text.length) return;
     if (![NSThread isMainThread]) {
@@ -404,6 +432,51 @@ static void TXGhosttyWriteClipboard(
     NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
     if (!data.length) return;
     ghostty_surface_text(_surface, (const char *)data.bytes, (uintptr_t)data.length);
+}
+
+// Typed text on the key path, like libghostty-spm's sendTypedText:
+// a key event with keycode 0xFFFF (outside the keycode table, so
+// Ghostty resolves it to unidentified) and the text, so the
+// encoder writes the characters as keystrokes. Text with newlines
+// goes to the text path instead: a shell must not read those lines
+// as Return presses.
+- (void)sendTypedText:(NSString *)text mods:(ghostty_input_mods_e)mods {
+    if (!text.length) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self sendTypedText:text mods:mods]; });
+        return;
+    }
+    if (!_surface) return;
+    if ([text rangeOfCharacterFromSet:[NSCharacterSet newlineCharacterSet]].location != NSNotFound) {
+        [self sendText:text];
+        return;
+    }
+    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data.length) return;
+    // First Unicode scalar, for the kitty encoder (which keys its
+    // event off unshifted_codepoint). Surrogate pairs combine.
+    uint32_t codepoint = 0;
+    unichar c0 = [text characterAtIndex:0];
+    if (c0 >= 0xD800 && c0 <= 0xDBFF && text.length > 1) {
+        unichar c1 = [text characterAtIndex:1];
+        if (c1 >= 0xDC00 && c1 <= 0xDFFF) {
+            codepoint = 0x10000 + ((uint32_t)(c0 - 0xD800) << 10) + (uint32_t)(c1 - 0xDC00);
+        } else {
+            codepoint = c0;
+        }
+    } else {
+        codepoint = c0;
+    }
+    ghostty_input_key_s k;
+    memset(&k, 0, sizeof(k));
+    k.action = GHOSTTY_ACTION_PRESS;
+    k.mods = mods;
+    k.consumed_mods = 0;
+    k.keycode = 0xFFFF;
+    k.text = (const char *)data.bytes;
+    k.unshifted_codepoint = codepoint;
+    k.composing = false;
+    ghostty_surface_key(_surface, k);
 }
 
 - (void)sendKey:(ghostty_input_key_e)key mods:(ghostty_input_mods_e)mods {

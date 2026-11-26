@@ -169,8 +169,11 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // the view and the terminal would start black. Ghostty takes the
     // whole buffer in one feed; output fed before the surface is
     // sized is buffered by the view and flushed on first layout.
+    // Replay, not live: the boot log holds DSR/DA queries the guest
+    // sent while booting, and answering them live sends a second set
+    // of CPR/DA replies that land in the shell as typed input.
     if (backlog.length) {
-        [_output feedGuestOutput:backlog];
+        [_output feedGuestOutputReplay:backlog];
     }
 
     // Hidden field that owns the software keyboard.
@@ -1113,9 +1116,14 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
         [self releaseCtrl];
         return NO;
     }
-    // No Ctrl: Alt prefixes ESC to the text, whatever it is.
-    if (_altLatched) [_output sendText:@"\x1B"];
-    [_output sendText:string];
+    // No Ctrl: typed text on the key path (sendTypedText:), not
+    // the text path. The text path is a paste: Ghostty wraps it in
+    // bracketed paste, so each letter lands as pasted text instead
+    // of a keystroke. Alt rides as a modifier on the key event —
+    // Ghostty's encoder emits ESC plus the character — instead of
+    // a separate ESC sent as text.
+    [_output sendTypedText:string
+                      mods:(_altLatched ? GHOSTTY_MODS_ALT : GHOSTTY_MODS_NONE)];
     [self releaseAlt];
     return NO;
 }
