@@ -7,7 +7,7 @@
 # .github/workflows/build-kernarium.yml on its kernarium-engine branch,
 # same order, but cloning this project's Termx-Kernel fork instead of
 # upstream imxieyi/Kernarium):
-#   1. Clone Termx-Kernel at the pinned commit 57f56a935 (no
+#   1. Clone Termx-Kernel at the pinned commit ba74db6cf (no
 #      vendoring). The fork already carries the TermX patches (the
 #      boot-ramdisk persistent-upper change) and the localhost proxy,
 #      so no patch step runs here.
@@ -226,9 +226,9 @@ jobs:
           git init kernarium
           cd kernarium
           git remote add origin https://github.com/spyboi-dev/Termx-Kernel.git
-          git fetch --depth 1 origin 57f56a9359d0eb5e0cfc1d53ec92f4d887dbc936
+          git fetch --depth 1 origin ba74db6cf27b17e2c204bb0cd35053fddddc01bc
           git checkout FETCH_HEAD
-          test "$(git rev-parse HEAD)" = 57f56a9359d0eb5e0cfc1d53ec92f4d887dbc936
+          test "$(git rev-parse HEAD)" = ba74db6cf27b17e2c204bb0cd35053fddddc01bc
 
       - name: Restore build cache
         uses: actions/cache@v4
