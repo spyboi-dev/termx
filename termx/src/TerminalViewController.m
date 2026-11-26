@@ -832,6 +832,37 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     if (_bottomEdgeBlurMask) _bottomEdgeBlurMask.frame = _bottomEdgeBlur.bounds;
 }
 
+// The row the prompt opens on after a boot clear: the first row
+// fully below the top chrome (the floating buttons and the top
+// edge fade), so the prompt reads at the top instead of hiding
+// behind the buttons or opening at the bottom. The target is the
+// guest-dead notice's anchor (safe.top + 60): the buttons end at
+// safe.top + 52 and the fade at safe.top + 56, so a row starting
+// at or below safe.top + 60 is sharp and fully visible. Computed
+// from the live row height — the surface height over the viewport
+// rows — so it stays right at any font size, not just 14 pt.
+- (NSUInteger)tx_bootPromptRow {
+    CGFloat safeTop = self.view.safeAreaInsets.top;
+    CGFloat targetY = safeTop + 60;
+    CGFloat gridHeight = _output.bounds.size.height - _output.surfaceBottomInset;
+    uint16_t rows = _output.viewportRows;
+    CGFloat rowHeight;
+    if (rows > 0 && gridHeight > 0) {
+        rowHeight = gridHeight / rows;
+    } else {
+        // The grid has not reported yet (the resize callback is
+        // async). Fall back to the font size, which underestimates
+        // the real row height, so the prompt lands a row or two
+        // low — still visible below the buttons, never hidden
+        // behind them.
+        rowHeight = TXTermFontSize();
+    }
+    if (rowHeight <= 0) rowHeight = TXTermFontSize();
+    NSUInteger n = (NSUInteger)ceil(targetY / rowHeight);
+    if (rows > 0 && n >= rows) n = rows - 1;
+    return n;
+}
+
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     [_output setFocused:YES];
@@ -878,21 +909,28 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
-            // Erase + erase scrollback, without homing: ESC[2J
-            // erases the visible screen, and ESC[3J erases the
-            // scrollback too, so the boot log is truly gone and a
-            // pinch zoom (a font-size change) cannot reflow it
-            // back into view. The cursor is NOT homed to the top
-            // any more: the terminal is full-screen now, so the
-            // top rows sit behind the status bar and the floating
-            // top buttons, and a prompt homed there would be
-            // hidden behind them. The prompt stays where the boot
-            // log left it — the bottom row, above the key row
-            // (the grid ends there) — the usable position in
-            // this layout. The log itself is not lost: it stays
-            // in guest.log and engine.log.
-            static const uint8_t clearSeq[] = { 0x1B, '[', '2', 'J', 0x1B, '[', '3', 'J' };
-            [strongSelf->_output feedGuestOutput:[NSData dataWithBytes:clearSeq length:sizeof(clearSeq)]];
+            // Erase + erase scrollback, then home the cursor to
+            // the first visible row below the top buttons, so the
+            // prompt opens at the top. ESC[2J erases the visible
+            // screen, and ESC[3J erases the scrollback too, so
+            // the boot log is truly gone and a pinch zoom (a
+            // font-size change) cannot reflow it back into view.
+            // The terminal is full-screen, so row 0 sits behind
+            // the status bar and the floating top buttons — a
+            // prompt homed there would be hidden behind them.
+            // So after the erase, ESC[H homes the cursor and
+            // ESC[<N>B moves it down to the first row fully
+            // below the top chrome (tx_bootPromptRow, computed
+            // from the live row height). The surface stays
+            // full-screen, so the scrollback still scrolls behind
+            // the top buttons and behind the key row; only the
+            // cursor's starting row moves. The log itself is not
+            // lost: it stays in guest.log and engine.log.
+            NSUInteger promptRow = [strongSelf tx_bootPromptRow];
+            NSString *seq = promptRow > 0
+                ? [NSString stringWithFormat:@"\x1B[2J\x1B[3J\x1B[H\x1B[%luB", (unsigned long)promptRow]
+                : @"\x1B[2J\x1B[3J\x1B[H";
+            [strongSelf->_output feedGuestOutput:[seq dataUsingEncoding:NSASCIIStringEncoding]];
             // The shell prompt is only ever printed by the shell
             // itself, never by the boot log, so "@iphone:" in the
             // buffer means the guest reached the shell and is idle
