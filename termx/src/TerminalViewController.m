@@ -16,9 +16,10 @@
 // The engine buffers console output from boot and the terminal replays
 // it on presentation, so the boot log and the login prompt are visible
 // even though the terminal only exists 0.7 s after the shell is ready.
-// There is no top bar and no control button on this screen at all: the
-// startup screen is the control centre, and a swipe down from the top
-// edge returns to it.
+// There is no top bar on this screen: the two floating glass
+// buttons (panel, +) are the only chrome, the startup screen is
+// the control centre, and a swipe down from the top edge returns
+// to it.
 //
 // The look is the shared TXTheme: a pure black background with
 // soft-white text, and one 14 pt monospace font.
@@ -90,15 +91,16 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 @end
 
 // Liquid Glass for the custom views that really need it: the
-// sidebar panel and the floating top pill. Apple's doc says
-// standard bars and buttons pick up Liquid Glass automatically,
-// and custom backgrounds only interfere — so the buttons inside a
-// glass surface are plain icons, never glass buttons of their own:
-// glass on glass is the double ring the user saw (the toolbar's
-// glass edge plus the button's own glass edge). The sidebar and
-// the pill are each one glass surface; the icons on top of them
-// are plain. The glass is the panel's background; the session
-// cards on top of it are plain rows, no glass.
+// sidebar panel. Apple's doc says standard bars and buttons pick
+// up Liquid Glass automatically, and custom backgrounds only
+// interfere — so the buttons inside a glass surface are plain
+// icons, never glass buttons of their own, and a button standing
+// alone over the terminal is a glass button itself:
+// glass on glass is the double ring the user saw (a glass
+// container's edge plus the button's own glass edge). The sidebar
+// is one glass surface; the icons on top of it are plain. The
+// glass is the panel's background; the session cards on top of it
+// are plain rows, no glass.
 static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     UIGlassEffect *effect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
     UIVisualEffectView *effectView = [[UIVisualEffectView alloc] initWithEffect:effect];
@@ -131,10 +133,8 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     UIButton *_copyButton; // secondary-row Copy, kept so onCopyAll can show "Copied"
     UILabel *_guestStatusLabel; // "Guest stopped/failed" notice over the terminal
     NSUInteger _copyFeedbackGeneration; // Copy taps, so a later tap's "Copied" is not cut short by an earlier tap's timer
-    // Multiple windows (Swipterm's UI): the top pill and the sidebar.
+    // Multiple windows (Swipterm's UI): the floating top buttons and the sidebar.
     TXTerminalSessionManager *_sessionManager;
-    UIView *_topPill; // floating glass pill: panel left, title centred, + right
-    UILabel *_pillTitleLabel;
     UIView *_sidebarView; // slides in from the left, terminal dimmed behind
     UIView *_sidebarDimView;
     UIStackView *_sidebarSessionStack; // session cards, rebuilt on change
@@ -146,7 +146,7 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     [super viewDidLoad];
     // The root view is the theme's background color, not black:
     // it shows through behind the key row and the strip behind
-    // the floating top pill, so those areas follow the terminal
+    // the floating top buttons, so those areas follow the terminal
     // color instead of staying black when the theme changes.
     self.view.backgroundColor = TXTerminalThemeBackgroundColor();
     [[NSNotificationCenter defaultCenter] addObserver:self
@@ -157,7 +157,7 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     [_keyHaptic prepare];
     _bellHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
     [_bellHaptic prepare];
-    // Chrome haptics (top bar, sidebar, Settings): created once and
+    // Chrome haptics (top buttons, sidebar, Settings): created once and
     // prepared after each use, so the tap lands with no delay.
     _chromeLightHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     [_chromeLightHaptic prepare];
@@ -194,56 +194,35 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     };
     [self.view addSubview:_output];
 
-    // Top pill: a floating glass pill, the ChatGPT app's top bar.
-    // No full-width bar and no solid color at the top: the
-    // terminal extends to the top of the screen behind it, and the
-    // pill floats over it with transparent space around it (16 pt
-    // from the screen edges, 8 pt below the status bar). The pill
-    // is ONE glass surface; the panel icon, the title and the +
-    // inside it are plain, so there is no second glass layer to
-    // double the ring. Panel toggle on the left, the session title
-    // centred in bold, and the + on the RIGHT (the user's one
-    // change from Swipterm, where the + sits next to the panel
-    // icon on the left). The Ghostty view starts below the pill,
-    // so the prompt is never covered by it.
-    _topPill = [[UIView alloc] init];
-    _topPill.translatesAutoresizingMaskIntoConstraints = NO;
-    _topPill.layer.cornerRadius = 26;
-    _topPill.clipsToBounds = YES;
-    [self.view addSubview:_topPill];
-    UIVisualEffectView *pillGlass = TXLiquidGlassEffectView();
-    [_topPill insertSubview:pillGlass atIndex:0];
-    UIButton *panelButton = [self plainIconButtonWithSymbol:@"sidebar.left" action:@selector(onToggleSidebar)];
+    // Top buttons: two standalone circular glass buttons floating
+    // over the terminal, the ChatGPT app's top UI — no pill, no
+    // bar, nothing connecting them. ChatGPT has a circular menu
+    // button on the left and a separate pill on the right; TermX
+    // has the panel button on the left and the + on the right,
+    // each its own glass circle, 44 pt, 16 pt in from the screen
+    // edge, 8 pt below the status bar. Each button IS its own
+    // glass (glassButtonConfiguration): there is no glass
+    // container behind them, so a plain icon would be invisible
+    // over the terminal, and a glass button inside a glass
+    // container would double the ring. The Ghostty view starts
+    // below them, so the prompt is never covered; the root view
+    // behind is the theme color, so the top reads as the
+    // terminal extending to the top. No title up here: the
+    // session name shows in the sidebar cards.
+    UIButton *panelButton = [self glassCircleButtonWithSymbol:@"sidebar.left" action:@selector(onToggleSidebar)];
     panelButton.accessibilityLabel = @"Sessions";
     panelButton.accessibilityHint = @"Shows the session list.";
-    [_topPill addSubview:panelButton];
-    _pillTitleLabel = [[UILabel alloc] init];
-    _pillTitleLabel.font = [UIFont boldSystemFontOfSize:17];
-    _pillTitleLabel.textColor = [UIColor whiteColor];
-    _pillTitleLabel.textAlignment = NSTextAlignmentCenter;
-    _pillTitleLabel.text = @"iphone";
-    _pillTitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [_topPill addSubview:_pillTitleLabel];
-    UIButton *addButton = [self plainIconButtonWithSymbol:@"plus" action:@selector(onNewSession)];
+    [self.view addSubview:panelButton];
+    UIButton *addButton = [self glassCircleButtonWithSymbol:@"plus" action:@selector(onNewSession)];
     addButton.accessibilityLabel = @"New session";
     addButton.accessibilityHint = @"Opens a new terminal window.";
-    [_topPill addSubview:addButton];
+    [self.view addSubview:addButton];
     UILayoutGuide *topSafe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [_topPill.topAnchor constraintEqualToAnchor:topSafe.topAnchor constant:8],
-        [_topPill.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
-        [_topPill.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
-        [_topPill.heightAnchor constraintEqualToConstant:52],
-        [pillGlass.topAnchor constraintEqualToAnchor:_topPill.topAnchor],
-        [pillGlass.leadingAnchor constraintEqualToAnchor:_topPill.leadingAnchor],
-        [pillGlass.trailingAnchor constraintEqualToAnchor:_topPill.trailingAnchor],
-        [pillGlass.bottomAnchor constraintEqualToAnchor:_topPill.bottomAnchor],
-        [panelButton.leadingAnchor constraintEqualToAnchor:_topPill.leadingAnchor constant:4],
-        [panelButton.centerYAnchor constraintEqualToAnchor:_topPill.centerYAnchor],
-        [addButton.trailingAnchor constraintEqualToAnchor:_topPill.trailingAnchor constant:-4],
-        [addButton.centerYAnchor constraintEqualToAnchor:_topPill.centerYAnchor],
-        [_pillTitleLabel.centerXAnchor constraintEqualToAnchor:_topPill.centerXAnchor],
-        [_pillTitleLabel.centerYAnchor constraintEqualToAnchor:_topPill.centerYAnchor],
+        [panelButton.topAnchor constraintEqualToAnchor:topSafe.topAnchor constant:8],
+        [panelButton.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [addButton.topAnchor constraintEqualToAnchor:topSafe.topAnchor constant:8],
+        [addButton.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
     ]];
 
     // Replay the console output from before this screen existed, and
@@ -279,20 +258,18 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     [self.view addSubview:_input];
 
     // The keyboard toolbar, NewTerm's model: the key rows riding
-    // above the software keyboard. A floating glass bar, Safari's
-    // bottom address bar: one glass surface (UIGlassEffect) with
-    // the key rows on it, 16 pt in from the screen edges like the
-    // top pill, so it floats over the terminal instead of being a
-    // solid black bar attached to the bottom. No solid black
-    // anywhere: the bar is glass, the keys on it are glass, and
-    // the theme's background color shows through both — the root
-    // view behind the bar is the theme color, so the key area
-    // follows the terminal color when the theme changes. The
-    // Ghostty view still ends at the bar's top (its grid must not
-    // grow rows the bar would hide), so what the glass blurs here
-    // is the terminal color, not terminal text. It is a container,
-    // not an element: VoiceOver reads the key buttons inside it,
-    // not the bar.
+    // above the software keyboard. A floating bar, 8 pt in from
+    // the screen edges, so it floats over the terminal instead of
+    // being a solid black bar attached to the bottom. No solid
+    // black anywhere: the bar itself is clear, the keys on it are
+    // glass circles, and the theme's background color shows
+    // through — the root view behind the bar is the theme color,
+    // so the key area follows the terminal color when the theme
+    // changes. The Ghostty view still ends at the bar's top (its
+    // grid must not grow rows the bar would hide), so what the
+    // glass blurs here is the terminal color, not terminal text.
+    // It is a container, not an element: VoiceOver reads the key
+    // buttons inside it, not the bar.
     UIView *toolbar = [[UIView alloc] init];
     toolbar.backgroundColor = [UIColor clearColor];
     toolbar.translatesAutoresizingMaskIntoConstraints = NO;
@@ -314,8 +291,9 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     UIStackView *fnStack = [[UIStackView alloc] init];
     fnStack.translatesAutoresizingMaskIntoConstraints = NO;
     fnStack.axis = UILayoutConstraintAxisHorizontal;
-    fnStack.spacing = 6;
-    fnStack.distribution = UIStackViewDistributionFillEqually;
+    fnStack.spacing = 4;
+    fnStack.distribution = UIStackViewDistributionEqualSpacing;
+    fnStack.alignment = UIStackViewAlignmentCenter;
     [_fnRow addSubview:fnStack];
     for (int i = 0; i < 12; i++) {
         NSString *title = [NSString stringWithFormat:@"f%d", i + 1];
@@ -334,7 +312,7 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
         [fnStack addArrangedSubview:b];
     }
     // Pin to the content layout guide, not the frame: the twelve
-    // F-keys are wider than the screen (~462 pt), so pinning to the
+    // F-keys are wider than the screen (~452 pt), so pinning to the
     // frame forced the stack to the scroll view's width and squeezed
     // every key. Pinned to the content guide the stack sizes to its
     // buttons and the row scrolls horizontally, which is what the
@@ -350,15 +328,14 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     [rows addArrangedSubview:_fnRow];
 
     // Secondary row (hidden until More is toggled): Home End PgUp PgDn Del Copy Fn.
-    // Same layout as the primary row: equal widths at 3 pt spacing,
-    // so its keys line up with the primary row's. The spacer views
-    // are gone: under FillEqually they would take an equal share
-    // each and shrink the keys.
+    // Same circles as the primary row, spaced evenly across the
+    // row — seven keys in the same width, so the gaps are wider.
     _secondaryRow = [[UIStackView alloc] init];
     _secondaryRow.translatesAutoresizingMaskIntoConstraints = NO;
     _secondaryRow.axis = UILayoutConstraintAxisHorizontal;
-    _secondaryRow.spacing = 6;
-    _secondaryRow.distribution = UIStackViewDistributionFillEqually;
+    _secondaryRow.spacing = 4;
+    _secondaryRow.distribution = UIStackViewDistributionEqualSpacing;
+    _secondaryRow.alignment = UIStackViewAlignmentCenter;
     [self addKey:_secondaryRow title:@"home" bytes:"\x1B[H" length:3];
     [self addKey:_secondaryRow title:@"end" bytes:"\x1B[F" length:3];
     [self addKey:_secondaryRow title:@"pgup" bytes:"\x1B[5~" length:4];
@@ -382,19 +359,18 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     [rows addArrangedSubview:_secondaryRow];
 
     // Primary row: Ctrl Alt Esc Tab More Paste ... four arrows ...
-    // hide-keyboard. All eleven keys are the same width: the row
-    // distributes equally, so the arrows are as wide as the text
-    // keys instead of squeezed into the leftover space, and the icon
-    // keys (paste, hide-keyboard) are as wide as the rest instead of
-    // narrow. On a 430 pt screen each key is ~33 pt at 6 pt spacing —
-    // the four-letter labels shrink slightly to fit (see keyButton).
-    // Paste is a clipboard icon, not the word: the word took the
-    // most width in the row, and the icon reads just as clearly.
+    // hide-keyboard. Eleven circles, all the same size, all icons
+    // — no words (see keyButton). The diameter is the largest that
+    // fits all 11 in one row (see keyCircleDiameter); the stack
+    // spaces them evenly at 4 pt gaps. Paste is a clipboard icon,
+    // not the word: the word took the most width in the row, and
+    // the icon reads just as clearly.
     UIStackView *primary = [[UIStackView alloc] init];
     primary.translatesAutoresizingMaskIntoConstraints = NO;
     primary.axis = UILayoutConstraintAxisHorizontal;
-    primary.spacing = 6;
-    primary.distribution = UIStackViewDistributionFillEqually;
+    primary.spacing = 4;
+    primary.distribution = UIStackViewDistributionEqualSpacing;
+    primary.alignment = UIStackViewAlignmentCenter;
     _ctrlButton = [self keyButton:@"ctrl"];
     [_ctrlButton addTarget:self action:@selector(onCtrl) forControlEvents:UIControlEventTouchUpInside];
     _ctrlButton.accessibilityHint = @"Toggles the Control modifier for the next key.";
@@ -409,31 +385,17 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     [_moreButton addTarget:self action:@selector(onMore) forControlEvents:UIControlEventTouchUpInside];
     _moreButton.accessibilityHint = @"Shows or hides the second key row.";
     [primary addArrangedSubview:_moreButton];
-    // Paste as a clipboard icon: the title is swapped for the
-    // SF Symbol so it takes one key's width like everything else.
-    // Same action, same chunked paste, same haptics as before.
-    // Paste is the Font Awesome solid clipboard icon, at the
-    // user's direction — not the SF Symbol doc.on.clipboard, which
-    // is a document with a badge. The icon is a bundled PNG
-    // (FAClipboard, rendered from the Font Awesome Free 6.7.2
-    // clipboard SVG, CC BY 4.0), white on transparent, so it
-    // renders as a template in the button's white tint. The
-    // icon's holes (the clip ring and the text line) are
-    // transparent, so the key's grey shows through them, the way
-    // the Font Awesome icon is drawn.
+    // Paste: the clipboard icon (the icon itself is picked in
+    // keyButton). Same action, same chunked paste, same haptics
+    // as before.
     UIButton *pasteButton = [self keyButton:@"paste"];
-    UIButtonConfiguration *pasteConfig = [pasteButton.configuration copy];
-    pasteConfig.title = nil;
-    pasteConfig.image = [[UIImage imageNamed:@"FAClipboard"]
-        imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
-    pasteButton.configuration = pasteConfig;
     pasteButton.accessibilityHint = @"Pastes the clipboard into the terminal.";
     [pasteButton addTarget:self action:@selector(onPaste) forControlEvents:UIControlEventTouchUpInside];
     [primary addArrangedSubview:pasteButton];
-    // Arrows: four separate full-height buttons, left right up down,
-    // each with its own touch target and its own equal share of the
-    // row — they used to share one nested stack squeezed into the
-    // leftover width, which made them the smallest keys in the row.
+    // Arrows: four separate circular buttons, left right up down,
+    // each with its own touch target and hold-to-repeat — they used
+    // to share one nested stack squeezed into the leftover width,
+    // which made them the smallest keys in the row.
     // All four repeat while held. The tag is the direction (0 left,
     // 1 up, 2 down, 3 right), not the position, so the order here
     // is visual only: left/right next to each other, then up/down.
@@ -449,12 +411,12 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [_output.topAnchor constraintEqualToAnchor:_topPill.bottomAnchor constant:8],
+        [_output.topAnchor constraintEqualToAnchor:safe.topAnchor constant:60],
         [_output.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
         [_output.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
         [_output.bottomAnchor constraintEqualToAnchor:toolbar.topAnchor],
-        [toolbar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
-        [toolbar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+        [toolbar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:8],
+        [toolbar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-8],
         [rows.leadingAnchor constraintEqualToAnchor:toolbar.leadingAnchor constant:4],
         [rows.trailingAnchor constraintEqualToAnchor:toolbar.trailingAnchor constant:-4],
         [rows.topAnchor constraintEqualToAnchor:toolbar.topAnchor constant:8],
@@ -514,7 +476,7 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     _guestStatusLabel.hidden = YES;
     [self.view addSubview:_guestStatusLabel];
     [NSLayoutConstraint activateConstraints:@[
-        [_guestStatusLabel.topAnchor constraintEqualToAnchor:_topPill.bottomAnchor constant:8],
+        [_guestStatusLabel.topAnchor constraintEqualToAnchor:_output.topAnchor],
         [_guestStatusLabel.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
         [_guestStatusLabel.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
     ]];
@@ -749,36 +711,87 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     return title;
 }
 
+// What a key shows: an SF Symbol or bundled image where one
+// exists, otherwise the standard Mac keyboard glyph. The title
+// is the key's identity (actions and VoiceOver use it); the
+// display is what the user sees. Only fn and F1-F12 have no
+// icon — they keep their short label.
+static UIImage *TXKeyIconForTitle(NSString *title) {
+    UIImageSymbolConfiguration *sym = [UIImageSymbolConfiguration
+        configurationWithPointSize:18 weight:UIImageSymbolWeightMedium];
+    if ([title isEqualToString:@"more"]) {
+        return [UIImage systemImageNamed:@"ellipsis" withConfiguration:sym];
+    }
+    if ([title isEqualToString:@"copy"]) {
+        return [UIImage systemImageNamed:@"doc.on.doc" withConfiguration:sym];
+    }
+    if ([title isEqualToString:@"paste"]) {
+        // The Font Awesome solid clipboard icon, at the user's
+        // direction — not the SF Symbol doc.on.clipboard, which is
+        // a document with a badge. Bundled PNG (FAClipboard,
+        // rendered from the Font Awesome Free 6.7.2 clipboard SVG,
+        // CC BY 4.0), white on transparent, so it renders as a
+        // template in the button's white tint.
+        return [[UIImage imageNamed:@"FAClipboard"]
+            imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    }
+    return nil;
+}
+
+static NSString *TXKeyGlyphForTitle(NSString *title) {
+    if ([title isEqualToString:@"ctrl"]) return @"⌃";
+    if ([title isEqualToString:@"alt"]) return @"⌥";
+    if ([title isEqualToString:@"esc"]) return @"⎋";
+    if ([title isEqualToString:@"tab"]) return @"⇥";
+    if ([title isEqualToString:@"home"]) return @"↖";
+    if ([title isEqualToString:@"end"]) return @"↘";
+    if ([title isEqualToString:@"pgup"]) return @"⇞";
+    if ([title isEqualToString:@"pgdn"]) return @"⇟";
+    if ([title isEqualToString:@"del"]) return @"⌦";
+    return title; // arrows, hide-keyboard glyph, "fn", "f1".."f12" show as-is
+}
+
+// The key circle diameter: the largest uniform circle that fits
+// all 11 primary keys in one row. The toolbar is 8 pt in from
+// each screen edge, the rows have 4 pt insets, the gaps are 4 pt:
+// (portrait width - 16 - 8 - 40) / 11. On a 430 pt screen that
+// is 33 pt, close to the send button's ~36 pt. Computed from the
+// screen, so it adapts to narrower phones instead of overflowing.
+- (CGFloat)keyCircleDiameter {
+    CGFloat portraitWidth = MIN(UIScreen.mainScreen.bounds.size.width,
+                                UIScreen.mainScreen.bounds.size.height);
+    return floor((portraitWidth - 16 - 8 - 40) / 11.0);
+}
+
 - (UIButton *)keyButton:(NSString *)title {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     b.translatesAutoresizingMaskIntoConstraints = NO;
-    // System glass button (iOS 26): the configuration is the glass,
-    // so there is no solid fill, no manual border, and no shadow —
-    // the terminal blurs through the key itself. The system draws
-    // the title over its own glass and gives the press response, so
-    // a key never renders as an empty pill. The key row keeps its
-    // sizes, spacing, and 9 pt-ish roundness (Medium corner style).
-    // Single glyphs (arrows, hide-keyboard) at 18 pt like the
-    // keyboard's own symbols; three-letter words at 16 pt;
-    // four-letter words ("more", "home", "pgup", "copy", "ctrl")
-    // at 12 pt, or they do not fit: on a 430 pt screen each key in
-    // the 11-key primary row is ~30 pt wide inside the floating
-    // bar (16 pt in from each edge) and "more" at 13 pt is ~31 pt. The font size is
-    // chosen here, in the configuration, because the old
-    // titleLabel.adjustsFontSizeToFitWidth did nothing: with a
-    // UIButtonConfiguration the button's title is not rendered by
-    // titleLabel at all, so the shrink never applied and "more"
-    // wrapped to two lines ("mor" / "e"). The line break mode is
-    // truncating tail as a backstop, so no label can ever wrap
-    // again; the horizontal insets are 0 so the words get the
-    // key's full width.
+    // A circular glass key, the send button's shape: one glass
+    // circle, the same diameter for every key, with an icon or a
+    // single glyph inside — never a word. Text labels have
+    // different widths, which is why the keys came out different
+    // sizes and "more" wrapped, then truncated. The system draws
+    // the icon over its own glass and gives the press response,
+    // so a key never renders as an empty circle. The Ctrl/Alt
+    // latch still reads: setToggle tints the glass teal through
+    // the configuration's baseBackgroundColor.
     UIButtonConfiguration *config = [UIButtonConfiguration glassButtonConfiguration];
-    config.title = title;
+    UIImage *icon = TXKeyIconForTitle(title);
+    NSString *glyph = nil;
+    if (icon) {
+        config.image = icon;
+    } else {
+        glyph = TXKeyGlyphForTitle(title);
+        config.title = glyph;
+    }
     config.baseForegroundColor = [UIColor whiteColor];
-    config.cornerStyle = UIButtonConfigurationCornerStyleMedium;
-    config.contentInsets = NSDirectionalEdgeInsetsMake(6, 0, 6, 0);
-    config.titleLineBreakMode = NSLineBreakByTruncatingTail;
-    CGFloat fontSize = (title.length == 1) ? 18 : (title.length <= 3) ? 16 : 12;
+    config.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+    config.contentInsets = NSDirectionalEdgeInsetsMake(0, 0, 0, 0);
+    // Single glyphs at 18 pt like the keyboard's own symbols;
+    // short labels ("fn", "f1".."f12") at 16 pt so they fit the
+    // circle. The title is rendered by the configuration, not
+    // titleLabel, so the font is set here through the transformer.
+    CGFloat fontSize = (glyph.length == 1) ? 18 : 16;
     UIFont *font = [UIFont systemFontOfSize:fontSize weight:UIFontWeightMedium];
     config.titleTextAttributesTransformer = ^NSDictionary<NSAttributedStringKey, id> *(NSDictionary<NSAttributedStringKey, id> *incoming) {
         NSMutableDictionary<NSAttributedStringKey, id> *attrs = [incoming mutableCopy];
@@ -786,6 +799,11 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
         return attrs;
     };
     b.configuration = config;
+    CGFloat diameter = [self keyCircleDiameter];
+    [NSLayoutConstraint activateConstraints:@[
+        [b.widthAnchor constraintEqualToConstant:diameter],
+        [b.heightAnchor constraintEqualToConstant:diameter],
+    ]];
     // VoiceOver: a glyph or abbreviation alone reads as nothing.
     b.accessibilityLabel = TXKeyAccessibilityLabel(title);
     b.accessibilityHint = @"Sends this key to the terminal.";
@@ -915,12 +933,11 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     }
 }
 
-// An arrow key: a full-height keyButton like every other key, with
+// An arrow key: a circular keyButton like every other key, with
 // its own touch target and hold-to-repeat. The single glyph is
-// 18 pt (set in keyButton), so it fills the taller 42 pt key the
-// way the keyboard's own symbols do. They sit directly in the
-// primary row now, one equal share each — the nested stack that
-// used to squeeze them into the leftover width is gone.
+// 18 pt (set in keyButton). They sit directly in the primary row
+// now — the nested stack that used to squeeze them into the
+// leftover width is gone.
 - (void)addArrowKey:(UIStackView *)row title:(NSString *)title tag:(NSInteger)tag {
     UIButton *b = [self keyButton:title];
     b.tag = tag;
@@ -979,16 +996,40 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     button.accessibilityValue = on ? @"On" : @"Off";
 }
 
-#pragma mark - Sessions (top bar / sidebar)
+#pragma mark - Sessions (top buttons / sidebar)
+
+// A standalone circular glass button: the button itself is the
+// glass (glassButtonConfiguration, capsule corner style at 44 pt
+// renders as a circle), so it floats over the terminal with
+// exactly one glass layer. Used only where there is no glass
+// container behind the button — the top panel and + buttons.
+// Inside a glass surface (the sidebar panel) use
+// plainIconButtonWithSymbol instead, or the ring doubles.
+- (UIButton *)glassCircleButtonWithSymbol:(NSString *)symbol action:(SEL)action {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButtonConfiguration *config = [UIButtonConfiguration glassButtonConfiguration];
+    config.image = [UIImage systemImageNamed:symbol withConfiguration:
+        [UIImageSymbolConfiguration configurationWithPointSize:20 weight:UIImageSymbolWeightMedium]];
+    config.baseForegroundColor = [UIColor whiteColor];
+    config.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+    config.contentInsets = NSDirectionalEdgeInsetsMake(0, 0, 0, 0);
+    b.configuration = config;
+    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [NSLayoutConstraint activateConstraints:@[
+        [b.widthAnchor constraintEqualToConstant:44],
+        [b.heightAnchor constraintEqualToConstant:44],
+    ]];
+    return b;
+}
 
 - (UIButton *)plainIconButtonWithSymbol:(NSString *)symbol action:(SEL)action {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     b.translatesAutoresizingMaskIntoConstraints = NO;
     // A plain icon on the glass surface behind it — never a glass
-    // button of its own. The pill and the sidebar panel are each
-    // one glass surface; a glass button inside one adds a second
-    // glass edge, the double ring the user saw on the + and panel
-    // buttons. A system button dims its image on highlight, so
+    // button of its own. The sidebar panel is one glass surface;
+    // a glass button inside it adds a second glass edge, the
+    // double ring the user saw on the + and panel buttons. A system button dims its image on highlight, so
     // the press still reads, and the haptic is in the action.
     // 44 pt, the same size as the old circle buttons.
     [b setImage:[UIImage systemImageNamed:symbol withConfiguration:
@@ -1003,7 +1044,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     return b;
 }
 
-// Haptics for the chrome only (top bar, sidebar, Settings): one
+// Haptics for the chrome only (top buttons, sidebar, Settings): one
 // short tap per interaction, never a buzz. Typing and the key row
 // are untouched. Light for plain button taps, selection for a state
 // change (session switch, sidebar open/close), medium for creating
@@ -1242,10 +1283,10 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 }
 
 // Session manager delegate: the list or the current session
-// changed — update the top bar title and rebuild the sidebar.
+// changed — rebuild the sidebar. There is no top bar title any
+// more; the session name shows in the sidebar cards.
 - (void)sessionManagerDidUpdateSessions:(id)manager {
     (void)manager;
-    _pillTitleLabel.text = _sessionManager.currentSession.displayName;
     [self rebuildSidebarSessions];
 }
 
@@ -1261,7 +1302,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 // The terminal theme changed live (TXGhosttyView reloadConfig
 // posts this after pushing the new config): repaint the root
 // view in the new theme's background color, so the key row and
-// the strip behind the top pill follow the terminal color at
+// the strip behind the top buttons follow the terminal color at
 // once instead of staying black until a restart.
 - (void)terminalThemeDidChange:(NSNotification *)note {
     (void)note;
