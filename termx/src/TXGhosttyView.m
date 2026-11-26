@@ -21,6 +21,7 @@
 - (void)tx_setViewportColumns:(uint16_t)cols rows:(uint16_t)rows widthPx:(uint32_t)w heightPx:(uint32_t)h;
 - (void)tx_completeClipboardRead:(void *)request;
 - (void)tx_ringBell;
+- (void)tx_handlePinch:(UIPinchGestureRecognizer *)gesture;
 @end
 
 // Weak proxy for the display link: a CADisplayLink retains its
@@ -161,6 +162,8 @@ static void TXGhosttyWriteClipboard(
     BOOL _focused;
     BOOL _needsFrame; // a frame is owed (wakeup, output, resize, focus)
     CGSize _lastSizePx;
+    CGFloat _pinchLastScale; // pinch-zoom: scale at the last step taken
+    CGFloat _pinchFontSize;  // pinch-zoom: font size tracked on this side
 }
 
 @synthesize viewportColumns = _viewportColumns;
@@ -176,7 +179,15 @@ static void TXGhosttyWriteClipboard(
     _focused = YES;
     _pendingOutput = [NSMutableData data];
     _lastSizePx = CGSizeZero;
+    _pinchLastScale = 1.0;
+    _pinchFontSize = TXTermFontSize();
     [self tx_createApp];
+    // Pinch to zoom the font, like the reference wrapper: a plain
+    // two-finger pinch, one font-size step per 0.1 of scale. The
+    // exit pan is one finger only, so it never sees the pinch.
+    UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc]
+        initWithTarget:self action:@selector(tx_handlePinch:)];
+    [self addGestureRecognizer:pinch];
     return self;
 }
 
@@ -479,22 +490,236 @@ static void TXGhosttyWriteClipboard(
     ghostty_surface_key(_surface, k);
 }
 
+// Ghostty's key event takes the platform-native keycode, and
+// libghostty's lookup uses macOS AppKit keycodes on iOS too, so a
+// Ghostty key enum must be translated to the AppKit keycode for
+// the same physical key — the way the reference wrapper does it
+// (TerminalHardwareKeyRouter.appKitKeyCode). Sending the enum
+// value itself as the keycode is wrong: BACKSPACE (53) lands on
+// AppKit Escape (0x35), ENTER (58) on AppKit Alt, and both
+// silently do nothing. This is the reference's appKitMap
+// (the mac column of libghostty's src/input/keycodes.zig),
+// inverted. Keys with no AppKit equivalent (Help, Fn,
+// NumpadClear, IntlBackslash, IntlYen, IntlRo, media and
+// clipboard keys) get the sentinel 0x10000 — outside the 8-bit
+// AppKit range, where plain 0 would collide with AppKit A — and
+// are not sent at all.
+static uint32_t TXAppKitKeyCodeForGhosttyKey(ghostty_input_key_e key) {
+    switch (key) {
+        case GHOSTTY_KEY_A: return 0x00;
+        case GHOSTTY_KEY_S: return 0x01;
+        case GHOSTTY_KEY_D: return 0x02;
+        case GHOSTTY_KEY_F: return 0x03;
+        case GHOSTTY_KEY_H: return 0x04;
+        case GHOSTTY_KEY_G: return 0x05;
+        case GHOSTTY_KEY_Z: return 0x06;
+        case GHOSTTY_KEY_X: return 0x07;
+        case GHOSTTY_KEY_C: return 0x08;
+        case GHOSTTY_KEY_V: return 0x09;
+        case GHOSTTY_KEY_B: return 0x0B;
+        case GHOSTTY_KEY_Q: return 0x0C;
+        case GHOSTTY_KEY_W: return 0x0D;
+        case GHOSTTY_KEY_E: return 0x0E;
+        case GHOSTTY_KEY_R: return 0x0F;
+        case GHOSTTY_KEY_Y: return 0x10;
+        case GHOSTTY_KEY_T: return 0x11;
+        case GHOSTTY_KEY_DIGIT_1: return 0x12;
+        case GHOSTTY_KEY_DIGIT_2: return 0x13;
+        case GHOSTTY_KEY_DIGIT_3: return 0x14;
+        case GHOSTTY_KEY_DIGIT_4: return 0x15;
+        case GHOSTTY_KEY_DIGIT_6: return 0x16;
+        case GHOSTTY_KEY_DIGIT_5: return 0x17;
+        case GHOSTTY_KEY_EQUAL: return 0x18;
+        case GHOSTTY_KEY_DIGIT_9: return 0x19;
+        case GHOSTTY_KEY_DIGIT_7: return 0x1A;
+        case GHOSTTY_KEY_MINUS: return 0x1B;
+        case GHOSTTY_KEY_DIGIT_8: return 0x1C;
+        case GHOSTTY_KEY_DIGIT_0: return 0x1D;
+        case GHOSTTY_KEY_BRACKET_RIGHT: return 0x1E;
+        case GHOSTTY_KEY_O: return 0x1F;
+        case GHOSTTY_KEY_U: return 0x20;
+        case GHOSTTY_KEY_BRACKET_LEFT: return 0x21;
+        case GHOSTTY_KEY_I: return 0x22;
+        case GHOSTTY_KEY_P: return 0x23;
+        case GHOSTTY_KEY_ENTER: return 0x24;
+        case GHOSTTY_KEY_L: return 0x25;
+        case GHOSTTY_KEY_J: return 0x26;
+        case GHOSTTY_KEY_QUOTE: return 0x27;
+        case GHOSTTY_KEY_K: return 0x28;
+        case GHOSTTY_KEY_SEMICOLON: return 0x29;
+        case GHOSTTY_KEY_BACKSLASH: return 0x2A;
+        case GHOSTTY_KEY_COMMA: return 0x2B;
+        case GHOSTTY_KEY_SLASH: return 0x2C;
+        case GHOSTTY_KEY_N: return 0x2D;
+        case GHOSTTY_KEY_M: return 0x2E;
+        case GHOSTTY_KEY_PERIOD: return 0x2F;
+        case GHOSTTY_KEY_TAB: return 0x30;
+        case GHOSTTY_KEY_SPACE: return 0x31;
+        case GHOSTTY_KEY_BACKQUOTE: return 0x32;
+        case GHOSTTY_KEY_BACKSPACE: return 0x33;
+        case GHOSTTY_KEY_ESCAPE: return 0x35;
+        case GHOSTTY_KEY_META_RIGHT: return 0x36;
+        case GHOSTTY_KEY_META_LEFT: return 0x37;
+        case GHOSTTY_KEY_SHIFT_LEFT: return 0x38;
+        case GHOSTTY_KEY_CAPS_LOCK: return 0x39;
+        case GHOSTTY_KEY_ALT_LEFT: return 0x3A;
+        case GHOSTTY_KEY_CONTROL_LEFT: return 0x3B;
+        case GHOSTTY_KEY_SHIFT_RIGHT: return 0x3C;
+        case GHOSTTY_KEY_ALT_RIGHT: return 0x3D;
+        case GHOSTTY_KEY_CONTROL_RIGHT: return 0x3E;
+        case GHOSTTY_KEY_F17: return 0x40;
+        case GHOSTTY_KEY_NUMPAD_DECIMAL: return 0x41;
+        case GHOSTTY_KEY_NUMPAD_MULTIPLY: return 0x43;
+        case GHOSTTY_KEY_NUMPAD_ADD: return 0x45;
+        case GHOSTTY_KEY_NUM_LOCK: return 0x47;
+        case GHOSTTY_KEY_AUDIO_VOLUME_UP: return 0x48;
+        case GHOSTTY_KEY_AUDIO_VOLUME_DOWN: return 0x49;
+        case GHOSTTY_KEY_AUDIO_VOLUME_MUTE: return 0x4A;
+        case GHOSTTY_KEY_NUMPAD_DIVIDE: return 0x4B;
+        case GHOSTTY_KEY_NUMPAD_ENTER: return 0x4C;
+        case GHOSTTY_KEY_NUMPAD_SUBTRACT: return 0x4E;
+        case GHOSTTY_KEY_F18: return 0x4F;
+        case GHOSTTY_KEY_F19: return 0x50;
+        case GHOSTTY_KEY_NUMPAD_EQUAL: return 0x51;
+        case GHOSTTY_KEY_NUMPAD_0: return 0x52;
+        case GHOSTTY_KEY_NUMPAD_1: return 0x53;
+        case GHOSTTY_KEY_NUMPAD_2: return 0x54;
+        case GHOSTTY_KEY_NUMPAD_3: return 0x55;
+        case GHOSTTY_KEY_NUMPAD_4: return 0x56;
+        case GHOSTTY_KEY_NUMPAD_5: return 0x57;
+        case GHOSTTY_KEY_NUMPAD_6: return 0x58;
+        case GHOSTTY_KEY_NUMPAD_7: return 0x59;
+        case GHOSTTY_KEY_F20: return 0x5A;
+        case GHOSTTY_KEY_NUMPAD_8: return 0x5B;
+        case GHOSTTY_KEY_NUMPAD_9: return 0x5C;
+        case GHOSTTY_KEY_F5: return 0x60;
+        case GHOSTTY_KEY_F6: return 0x61;
+        case GHOSTTY_KEY_F7: return 0x62;
+        case GHOSTTY_KEY_F3: return 0x63;
+        case GHOSTTY_KEY_F8: return 0x64;
+        case GHOSTTY_KEY_F9: return 0x65;
+        case GHOSTTY_KEY_F11: return 0x67;
+        case GHOSTTY_KEY_F13: return 0x69;
+        case GHOSTTY_KEY_F16: return 0x6A;
+        case GHOSTTY_KEY_F14: return 0x6B;
+        case GHOSTTY_KEY_F10: return 0x6D;
+        case GHOSTTY_KEY_CONTEXT_MENU: return 0x6E;
+        case GHOSTTY_KEY_F12: return 0x6F;
+        case GHOSTTY_KEY_F15: return 0x71;
+        case GHOSTTY_KEY_INSERT: return 0x72;
+        case GHOSTTY_KEY_HOME: return 0x73;
+        case GHOSTTY_KEY_PAGE_UP: return 0x74;
+        case GHOSTTY_KEY_DELETE: return 0x75;
+        case GHOSTTY_KEY_F4: return 0x76;
+        case GHOSTTY_KEY_END: return 0x77;
+        case GHOSTTY_KEY_F2: return 0x78;
+        case GHOSTTY_KEY_PAGE_DOWN: return 0x79;
+        case GHOSTTY_KEY_F1: return 0x7A;
+        case GHOSTTY_KEY_ARROW_LEFT: return 0x7B;
+        case GHOSTTY_KEY_ARROW_RIGHT: return 0x7C;
+        case GHOSTTY_KEY_ARROW_DOWN: return 0x7D;
+        case GHOSTTY_KEY_ARROW_UP: return 0x7E;
+        default: return 0x10000;
+    }
+}
+
+// The codepoint the key types with no modifier at all, on a US
+// layout — what the kitty encoder reports, and what the legacy
+// encoder derives Ctrl bytes from (the reference's
+// TerminalKeyPress.unshiftedCodepoint). Zero for a key that types
+// nothing. A..Z and the digits are consecutive in the Ghostty
+// enum, like the Ctrl+letter code in the controller already
+// assumes; punctuation is by name.
+static uint32_t TXUnshiftedCodepointForGhosttyKey(ghostty_input_key_e key) {
+    if (key >= GHOSTTY_KEY_A && key <= GHOSTTY_KEY_Z)
+        return (uint32_t)('a' + (key - GHOSTTY_KEY_A));
+    if (key >= GHOSTTY_KEY_DIGIT_0 && key <= GHOSTTY_KEY_DIGIT_9)
+        return (uint32_t)('0' + (key - GHOSTTY_KEY_DIGIT_0));
+    switch (key) {
+        case GHOSTTY_KEY_MINUS: return '-';
+        case GHOSTTY_KEY_EQUAL: return '=';
+        case GHOSTTY_KEY_BRACKET_LEFT: return '[';
+        case GHOSTTY_KEY_BRACKET_RIGHT: return ']';
+        case GHOSTTY_KEY_BACKSLASH: return '\\';
+        case GHOSTTY_KEY_SEMICOLON: return ';';
+        case GHOSTTY_KEY_QUOTE: return '\'';
+        case GHOSTTY_KEY_COMMA: return ',';
+        case GHOSTTY_KEY_PERIOD: return '.';
+        case GHOSTTY_KEY_SLASH: return '/';
+        case GHOSTTY_KEY_BACKQUOTE: return '`';
+        case GHOSTTY_KEY_SPACE: return ' ';
+        default: return 0;
+    }
+}
+
 - (void)sendKey:(ghostty_input_key_e)key mods:(ghostty_input_mods_e)mods {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ [self sendKey:key mods:mods]; });
         return;
     }
     if (!_surface) return;
+    // No AppKit keycode for this key: libghostty would resolve it
+    // to unidentified, so do not send it at all (the reference's
+    // hasPlatformKeycode guard).
+    uint32_t keycode = TXAppKitKeyCodeForGhosttyKey(key);
+    if (keycode == 0x10000) return;
     ghostty_input_key_s k;
     memset(&k, 0, sizeof(k));
-    k.action = GHOSTTY_ACTION_PRESS;
     k.mods = mods;
     k.consumed_mods = 0;
-    k.keycode = (uint32_t)key;
+    k.keycode = keycode;
     k.text = NULL;
-    k.unshifted_codepoint = 0;
+    k.unshifted_codepoint = TXUnshiftedCodepointForGhosttyKey(key);
     k.composing = false;
+    // Press then release, like the reference: the release follows
+    // so a program on the kitty keyboard protocol never sees a key
+    // held down; in the legacy encoding a release encodes nothing.
+    k.action = GHOSTTY_ACTION_PRESS;
     ghostty_surface_key(_surface, k);
+    k.action = GHOSTTY_ACTION_RELEASE;
+    ghostty_surface_key(_surface, k);
+}
+
+// Pinch to zoom the font size, the way the reference wrapper does
+// it (TerminalPinchFontZoom): one font-size step per 0.1 of scale,
+// accumulated across the gesture, so a slow pinch still moves and
+// the leftover fraction carries to the next move. Each step goes
+// through Ghostty's increase/decrease_font_size binding action,
+// which is display size only — the guest keeps its 48-column
+// layout. The size is tracked on this side (the C API cannot
+// report it) and persisted, so a new surface starts at the zoomed
+// size. Clamped to the app's font-size range.
+- (void)tx_handlePinch:(UIPinchGestureRecognizer *)gesture {
+    if (!_surface) return;
+    switch (gesture.state) {
+        case UIGestureRecognizerStateBegan:
+            _pinchLastScale = gesture.scale;
+            _pinchFontSize = TXTermFontSize();
+            break;
+        case UIGestureRecognizerStateChanged: {
+            CGFloat delta = gesture.scale - _pinchLastScale;
+            NSInteger steps = (NSInteger)(delta / 0.1);
+            if (steps == 0) return;
+            _pinchLastScale += (CGFloat)steps * 0.1;
+            for (NSInteger i = 0; i < labs(steps); i++) {
+                BOOL growing = steps > 0;
+                CGFloat next = _pinchFontSize + (growing ? 1.0 : -1.0);
+                if (next < TXConfigTermFontSizeMin || next > TXConfigTermFontSizeMax) break;
+                const char *action = growing ? "increase_font_size:1" : "decrease_font_size:1";
+                if (!ghostty_surface_binding_action(_surface, action, strlen(action))) break;
+                _pinchFontSize = next;
+                TXSetTermFontSize(_pinchFontSize);
+            }
+            break;
+        }
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed:
+            _pinchLastScale = 1.0;
+            break;
+        default:
+            break;
+    }
 }
 
 - (void)pasteText:(NSString *)text {

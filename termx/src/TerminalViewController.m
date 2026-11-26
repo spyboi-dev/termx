@@ -96,20 +96,6 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     UIScrollView *_fnRow;
     NSLayoutConstraint *_toolbarBottom;
     BOOL _didClearScreenOnBoot; // clear-on-boot already done for this terminal instance
-    // Gated fresh prompt (see viewDidAppear): the clear wipes the
-    // replayed prompt, and a newline is only sent once the guest has
-    // been quiet for a while and the terminal is still empty — so a
-    // prompt still in flight is not doubled by the newline.
-    // _clearOnBootDate is when the clear ran; _lastConsoleOutputDate
-    // is the last console byte on the main thread (also the clear
-    // time until any output arrives, so "quiet" is measured from the
-    // clear); _clearOnBootNewlineSent marks the decision made, either
-    // way. "Empty" is read from the dates now (no output since the
-    // clear), not from the old VT: the clear wipes the screen, and
-    // any output after it means a prompt is already on screen.
-    NSDate *_clearOnBootDate;
-    NSDate *_lastConsoleOutputDate;
-    BOOL _clearOnBootNewlineSent;
     CGPoint _exitPanStart; // where the top-edge exit drag began
     NSTimer *_repeatTimer; // arrow key repeat (NewTerm 2.4: hold to repeat)
     ghostty_input_key_e _repeatKey; // the arrow key being repeated
@@ -436,17 +422,11 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
     // stays in guest.log and engine.log.
     if (self.clearScreenOnBoot && !_didClearScreenOnBoot) {
         _didClearScreenOnBoot = YES;
-        // No command is typed into the terminal at boot — the width
-        // (stty cols / COLUMNS) and the device-info files used to be
-        // injected here, but auto-running commands at boot is not
-        // wanted, so both injections are gone. The width is still
-        // covered by the image itself (the shell startup sets stty
-        // cols 48 + COLUMNS=48 at login), but the device-info files
-        // are no longer written, so fastfetch falls back to Unknown
-        // for Host, CPU and GPU. There is no way to pass the device
-        // to the guest without typing a command: the runtime boot
-        // struct has no kernel command line field, so the guest
-        // cannot read it at its own boot either.
+        // No command is typed into the terminal at boot: auto-running
+        // commands after boot is not wanted, so the width is not
+        // injected here. It is still covered by the image itself
+        // (the shell startup sets stty cols 48 + COLUMNS=48 at
+        // login).
         //
         // The clear and the fresh prompt run async on the main queue,
         // not synchronously here. Console output arrives on the
@@ -458,87 +438,41 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         // saw. Queuing the clear after the pending output means the
         // clear wipes everything.
         //
-        // The newline is NOT sent here. The guest's own first bash
-        // prompt can still be in flight when the clear runs (login
-        // slower than the 0.7 s present delay, most likely on a cold
-        // boot or the first boot after an image update), and a
-        // newline sent now sits in the tty input buffer: the prompt
-        // arrives as prompt one, bash reads the newline as an empty
-        // command and prints prompt two. Instead the newline is
-        // gated (see checkClearOnBootPrompt): after a short quiet
-        // period with no new console output, the terminal is checked
-        // — a prompt already on screen means no newline, and only a
-        // quiet, empty terminal gets one newline to elicit a fresh
-        // prompt. A fixed delay would only move the race to a slower
-        // login.
+        // Whether the newline is sent is decided from what the guest
+        // has already printed, not from a timer. A quiet period
+        // cannot tell a finished login from a slow one: bash can sit
+        // silent for longer than 300 ms while it starts, so the
+        // gated check fired the newline and the late prompt arrived
+        // after it — two prompts, every cold boot. Instead, the
+        // console buffer is checked at the clear: if it holds the
+        // shell prompt (termx@iphone:), the guest is already at its
+        // shell and idle, so one newline elicits exactly one fresh
+        // prompt and no other prompt is coming. If it does not, the
+        // guest is still logging in, so no newline is sent and its
+        // prompt arrives live and prints once. Either way, one
+        // prompt. A bare newline is not a command, it only requests
+        // the prompt, and the byte must be exactly LF.
         __weak typeof(self) weakSelf = self;
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
             static const uint8_t ed2[] = { 0x1B, '[', '2', 'J' };
             [strongSelf->_output feedGuestOutput:[NSData dataWithBytes:ed2 length:sizeof(ed2)]];
-            // The quiet clock starts at the clear: no output has
-            // arrived since it yet, so "quiet for 300 ms" is first
-            // true 300 ms from here unless output arrives.
-            strongSelf->_clearOnBootDate = [NSDate date];
-            strongSelf->_lastConsoleOutputDate = strongSelf->_clearOnBootDate;
-            strongSelf->_clearOnBootNewlineSent = NO;
-            [strongSelf scheduleClearOnBootPromptCheck];
+            // The shell prompt is only ever printed by the shell
+            // itself, never by the boot log, so "@iphone:" in the
+            // buffer means the guest reached the shell and is idle
+            // at the prompt.
+            NSData *buffer = [strongSelf->_engine bufferedConsoleOutput];
+            NSData *marker = [NSData dataWithBytes:"@iphone:" length:8];
+            BOOL hasPrompt = buffer.length >= marker.length &&
+                [buffer rangeOfData:marker options:0
+                              range:NSMakeRange(0, buffer.length)].location != NSNotFound;
+            if (hasPrompt) {
+                uint8_t nl = '\n';
+                [strongSelf->_engine sendConsoleInput:[NSData dataWithBytes:&nl length:1]];
+            }
         });
     }
-}
-
-// Gated fresh prompt after the clear-on-boot (see viewDidAppear):
-// the newline is only sent once the guest has been quiet and the
-// terminal is still empty. Three cases, all ending in exactly one
-// prompt:
-//   - the prompt is already on screen (it arrived after the clear):
-//     no newline, the prompt stands.
-//   - the guest is still printing (output within the quiet period):
-//     wait for a full quiet period, up to the cap, so a prompt
-//     still in flight is not doubled.
-//   - quiet and empty (the prompt was wiped by the clear and
-//     nothing is coming): one newline elicits a fresh prompt.
-// A bare newline is not a command, it only requests the prompt.
-// Everything here runs on the main queue, like the clear and the
-// console feed, so the timestamps cannot race.
-- (void)scheduleClearOnBootPromptCheck {
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                 (int64_t)(TXConfigClearOnBootQuietPeriodSec * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        [strongSelf checkClearOnBootPrompt];
-    });
-}
-
-- (void)checkClearOnBootPrompt {
-    if (_clearOnBootNewlineSent) return; // the decision is made, either way
-    NSDate *now = [NSDate date];
-    NSTimeInterval sinceOutput = [now timeIntervalSinceDate:_lastConsoleOutputDate];
-    NSTimeInterval sinceClear = [now timeIntervalSinceDate:_clearOnBootDate];
-    // Still printing: wait for a full quiet period before deciding,
-    // up to the cap, so a slow login is not cut off mid-print.
-    if (sinceOutput < TXConfigClearOnBootQuietPeriodSec &&
-        sinceClear < TXConfigClearOnBootMaxWaitSec) {
-        [self scheduleClearOnBootPromptCheck];
-        return;
-    }
-    // Quiet now. If anything arrived after the clear, the prompt is
-    // already on screen — the clear wiped it and the guest reprinted
-    // it. Only a terminal with no output since the clear is empty.
-    if (![_lastConsoleOutputDate isEqualToDate:_clearOnBootDate]) {
-        _clearOnBootNewlineSent = YES;
-        return;
-    }
-    // Quiet and empty: the prompt was wiped by the clear and nothing
-    // is coming. One newline asks bash for a fresh prompt. It goes
-    // straight to the engine, as before: it is the app eliciting a
-    // prompt, not user input, and the byte must be exactly LF.
-    uint8_t nl = '\n';
-    [_engine sendConsoleInput:[NSData dataWithBytes:&nl length:1]];
-    _clearOnBootNewlineSent = YES;
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -1045,14 +979,8 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 
 - (void)kernEngineDidReceiveConsoleOutput:(NSData *)data {
     // The runtime calls this on its own thread; Ghostty is only ever
-    // fed on the main thread (the view bounces to main itself, but
-    // the arrival time below is also read on main, so keep the whole
-    // block there).
+    // fed on the main thread, so keep the whole block there.
     dispatch_async(dispatch_get_main_queue(), ^{
-        // The arrival time, for the clear-on-boot gate: a prompt
-        // that arrives after the clear means the guest is still
-        // printing, so the gated newline must wait for quiet.
-        self->_lastConsoleOutputDate = [NSDate date];
         [self->_output feedGuestOutput:data];
     });
 }
