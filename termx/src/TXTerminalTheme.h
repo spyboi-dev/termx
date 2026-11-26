@@ -9,6 +9,7 @@
 // file; every other line the user may have added in Files is kept.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
 typedef struct {
     const char *name; // display name, e.g. "One Dark"
@@ -29,6 +30,17 @@ void TXTerminalThemeSetSelectedIndex(NSInteger index);
 
 // The live Ghostty config path (Documents/ghostty-config.conf).
 NSString *TXTerminalThemeConfigPath(void);
+
+// The selected theme's background color, for the chrome around
+// the terminal (the root view behind the key row and the top
+// pill): the key area must follow the terminal color instead of
+// staying black.
+UIColor *TXTerminalThemeBackgroundColor(void);
+
+// Posted on the main thread when a theme is applied live (by a
+// reloadConfig), so the controller can repaint its chrome in the
+// new theme's background color.
+extern NSString *const TXTerminalThemeDidChangeNotification;
 
 // Rewrite the config file with the selected theme's color lines:
 // drops any existing lines for the owned color keys, inserts the

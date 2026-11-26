@@ -29,6 +29,7 @@
 #import "TXConfig.h"
 #import "TXGhosttyView.h"
 #import "TXLog.h"
+#import "TXTerminalTheme.h"
 #import "TXSettingsViewController.h"
 #import "TXTerminalSessionManager.h"
 #import "TXTheme.h"
@@ -88,15 +89,16 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
 }
 @end
 
-// Liquid Glass for the one custom view that really needs it: the
-// sidebar panel. Apple's doc says standard bars and buttons pick
-// up Liquid Glass automatically, and custom backgrounds only
-// interfere — so the top bar is a UIToolbar and the buttons use
-// the system glass button style, and no hand-made blur remains
-// anywhere. The sidebar is a custom floating panel, so it uses
-// UIGlassEffect (the doc's fallback for custom views), regular
-// style, not interactive. The glass is the panel's background;
-// the session cards on top of it are plain rows, no glass.
+// Liquid Glass for the custom views that really need it: the
+// sidebar panel and the floating top pill. Apple's doc says
+// standard bars and buttons pick up Liquid Glass automatically,
+// and custom backgrounds only interfere — so the buttons inside a
+// glass surface are plain icons, never glass buttons of their own:
+// glass on glass is the double ring the user saw (the toolbar's
+// glass edge plus the button's own glass edge). The sidebar and
+// the pill are each one glass surface; the icons on top of them
+// are plain. The glass is the panel's background; the session
+// cards on top of it are plain rows, no glass.
 static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     UIGlassEffect *effect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
     UIVisualEffectView *effectView = [[UIVisualEffectView alloc] initWithEffect:effect];
@@ -129,10 +131,10 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     UIButton *_copyButton; // secondary-row Copy, kept so onCopyAll can show "Copied"
     UILabel *_guestStatusLabel; // "Guest stopped/failed" notice over the terminal
     NSUInteger _copyFeedbackGeneration; // Copy taps, so a later tap's "Copied" is not cut short by an earlier tap's timer
-    // Multiple windows (Swipterm's UI): the top bar and the sidebar.
+    // Multiple windows (Swipterm's UI): the top pill and the sidebar.
     TXTerminalSessionManager *_sessionManager;
-    UIToolbar *_topBar; // system toolbar: Liquid Glass bar, panel left, title centred, + right
-    UILabel *_topBarTitleLabel;
+    UIView *_topPill; // floating glass pill: panel left, title centred, + right
+    UILabel *_pillTitleLabel;
     UIView *_sidebarView; // slides in from the left, terminal dimmed behind
     UIView *_sidebarDimView;
     UIStackView *_sidebarSessionStack; // session cards, rebuilt on change
@@ -142,7 +144,15 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = TXThemeBackgroundColor();
+    // The root view is the theme's background color, not black:
+    // it shows through behind the key row and the strip behind
+    // the floating top pill, so those areas follow the terminal
+    // color instead of staying black when the theme changes.
+    self.view.backgroundColor = TXTerminalThemeBackgroundColor();
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(terminalThemeDidChange:)
+                                                 name:TXTerminalThemeDidChangeNotification
+                                               object:nil];
     _keyHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     [_keyHaptic prepare];
     _bellHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
@@ -184,44 +194,56 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     };
     [self.view addSubview:_output];
 
-    // Top bar: a system UIToolbar, so the bar itself is Liquid
-    // Glass automatically — no custom background, no hand-made
-    // blur. Panel toggle on the left, the session title centred in
-    // bold, and the + on the RIGHT (the user's one change from
-    // Swipterm, where the + sits next to the panel icon on the
-    // left). The buttons are system glass buttons (see
-    // circleButtonWithSymbol), so the system draws each icon over
-    // its own glass. The title is a plain label subview, centred
-    // on the bar. The Ghostty view starts under this bar.
-    _topBar = [[UIToolbar alloc] init];
-    _topBar.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:_topBar];
-    UIButton *panelButton = [self circleButtonWithSymbol:@"sidebar.left" action:@selector(onToggleSidebar)];
+    // Top pill: a floating glass pill, the ChatGPT app's top bar.
+    // No full-width bar and no solid color at the top: the
+    // terminal extends to the top of the screen behind it, and the
+    // pill floats over it with transparent space around it (16 pt
+    // from the screen edges, 8 pt below the status bar). The pill
+    // is ONE glass surface; the panel icon, the title and the +
+    // inside it are plain, so there is no second glass layer to
+    // double the ring. Panel toggle on the left, the session title
+    // centred in bold, and the + on the RIGHT (the user's one
+    // change from Swipterm, where the + sits next to the panel
+    // icon on the left). The Ghostty view starts below the pill,
+    // so the prompt is never covered by it.
+    _topPill = [[UIView alloc] init];
+    _topPill.translatesAutoresizingMaskIntoConstraints = NO;
+    _topPill.layer.cornerRadius = 26;
+    _topPill.clipsToBounds = YES;
+    [self.view addSubview:_topPill];
+    UIVisualEffectView *pillGlass = TXLiquidGlassEffectView();
+    [_topPill insertSubview:pillGlass atIndex:0];
+    UIButton *panelButton = [self plainIconButtonWithSymbol:@"sidebar.left" action:@selector(onToggleSidebar)];
     panelButton.accessibilityLabel = @"Sessions";
     panelButton.accessibilityHint = @"Shows the session list.";
-    _topBarTitleLabel = [[UILabel alloc] init];
-    _topBarTitleLabel.font = [UIFont boldSystemFontOfSize:17];
-    _topBarTitleLabel.textColor = [UIColor whiteColor];
-    _topBarTitleLabel.textAlignment = NSTextAlignmentCenter;
-    _topBarTitleLabel.text = @"iphone";
-    _topBarTitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [_topBar addSubview:_topBarTitleLabel];
-    UIButton *addButton = [self circleButtonWithSymbol:@"plus" action:@selector(onNewSession)];
+    [_topPill addSubview:panelButton];
+    _pillTitleLabel = [[UILabel alloc] init];
+    _pillTitleLabel.font = [UIFont boldSystemFontOfSize:17];
+    _pillTitleLabel.textColor = [UIColor whiteColor];
+    _pillTitleLabel.textAlignment = NSTextAlignmentCenter;
+    _pillTitleLabel.text = @"iphone";
+    _pillTitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [_topPill addSubview:_pillTitleLabel];
+    UIButton *addButton = [self plainIconButtonWithSymbol:@"plus" action:@selector(onNewSession)];
     addButton.accessibilityLabel = @"New session";
     addButton.accessibilityHint = @"Opens a new terminal window.";
-    UIBarButtonItem *panelItem = [[UIBarButtonItem alloc] initWithCustomView:panelButton];
-    UIBarButtonItem *addItem = [[UIBarButtonItem alloc] initWithCustomView:addButton];
-    UIBarButtonItem *flex = [[UIBarButtonItem alloc]
-        initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
-    _topBar.items = @[panelItem, flex, addItem];
+    [_topPill addSubview:addButton];
     UILayoutGuide *topSafe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [_topBar.topAnchor constraintEqualToAnchor:topSafe.topAnchor],
-        [_topBar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [_topBar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [_topBar.heightAnchor constraintEqualToConstant:52],
-        [_topBarTitleLabel.centerXAnchor constraintEqualToAnchor:_topBar.centerXAnchor],
-        [_topBarTitleLabel.centerYAnchor constraintEqualToAnchor:_topBar.centerYAnchor],
+        [_topPill.topAnchor constraintEqualToAnchor:topSafe.topAnchor constant:8],
+        [_topPill.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [_topPill.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+        [_topPill.heightAnchor constraintEqualToConstant:52],
+        [pillGlass.topAnchor constraintEqualToAnchor:_topPill.topAnchor],
+        [pillGlass.leadingAnchor constraintEqualToAnchor:_topPill.leadingAnchor],
+        [pillGlass.trailingAnchor constraintEqualToAnchor:_topPill.trailingAnchor],
+        [pillGlass.bottomAnchor constraintEqualToAnchor:_topPill.bottomAnchor],
+        [panelButton.leadingAnchor constraintEqualToAnchor:_topPill.leadingAnchor constant:4],
+        [panelButton.centerYAnchor constraintEqualToAnchor:_topPill.centerYAnchor],
+        [addButton.trailingAnchor constraintEqualToAnchor:_topPill.trailingAnchor constant:-4],
+        [addButton.centerYAnchor constraintEqualToAnchor:_topPill.centerYAnchor],
+        [_pillTitleLabel.centerXAnchor constraintEqualToAnchor:_topPill.centerXAnchor],
+        [_pillTitleLabel.centerYAnchor constraintEqualToAnchor:_topPill.centerYAnchor],
     ]];
 
     // Replay the console output from before this screen existed, and
@@ -256,16 +278,26 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     _input.returnKeyType = UIReturnKeyDefault;
     [self.view addSubview:_input];
 
-    // The keyboard toolbar, NewTerm's model: a solid black bar with
-    // the key rows, riding above the software keyboard. Pure black,
-    // not a blur: the bar is continuous with the terminal above it,
-    // so the whole screen reads as one black surface, and a blur
-    // would smear the terminal text scrolling behind it. It is a
-    // container, not an element: VoiceOver reads the key buttons
-    // inside it, not the bar.
+    // The keyboard toolbar, NewTerm's model: the key rows riding
+    // above the software keyboard. A floating glass bar, Safari's
+    // bottom address bar: one glass surface (UIGlassEffect) with
+    // the key rows on it, 16 pt in from the screen edges like the
+    // top pill, so it floats over the terminal instead of being a
+    // solid black bar attached to the bottom. No solid black
+    // anywhere: the bar is glass, the keys on it are glass, and
+    // the theme's background color shows through both — the root
+    // view behind the bar is the theme color, so the key area
+    // follows the terminal color when the theme changes. The
+    // Ghostty view still ends at the bar's top (its grid must not
+    // grow rows the bar would hide), so what the glass blurs here
+    // is the terminal color, not terminal text. It is a container,
+    // not an element: VoiceOver reads the key buttons inside it,
+    // not the bar.
     UIView *toolbar = [[UIView alloc] init];
-    toolbar.backgroundColor = TXThemeBackgroundColor();
+    toolbar.backgroundColor = [UIColor clearColor];
     toolbar.translatesAutoresizingMaskIntoConstraints = NO;
+    toolbar.layer.cornerRadius = 26;
+    toolbar.clipsToBounds = YES;
     toolbar.isAccessibilityElement = NO;
     [self.view addSubview:toolbar];
 
@@ -417,12 +449,12 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [_output.topAnchor constraintEqualToAnchor:_topBar.bottomAnchor],
+        [_output.topAnchor constraintEqualToAnchor:_topPill.bottomAnchor constant:8],
         [_output.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
         [_output.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
         [_output.bottomAnchor constraintEqualToAnchor:toolbar.topAnchor],
-        [toolbar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [toolbar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [toolbar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [toolbar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
         [rows.leadingAnchor constraintEqualToAnchor:toolbar.leadingAnchor constant:4],
         [rows.trailingAnchor constraintEqualToAnchor:toolbar.trailingAnchor constant:-4],
         [rows.topAnchor constraintEqualToAnchor:toolbar.topAnchor constant:8],
@@ -482,7 +514,7 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     _guestStatusLabel.hidden = YES;
     [self.view addSubview:_guestStatusLabel];
     [NSLayoutConstraint activateConstraints:@[
-        [_guestStatusLabel.topAnchor constraintEqualToAnchor:_topBar.bottomAnchor constant:8],
+        [_guestStatusLabel.topAnchor constraintEqualToAnchor:_topPill.bottomAnchor constant:8],
         [_guestStatusLabel.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
         [_guestStatusLabel.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
     ]];
@@ -544,11 +576,11 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     sidebarTitle.text = @"TermX";
     sidebarTitle.translatesAutoresizingMaskIntoConstraints = NO;
     [_sidebarView addSubview:sidebarTitle];
-    UIButton *sidebarAddButton = [self circleButtonWithSymbol:@"plus" action:@selector(onNewSession)];
+    UIButton *sidebarAddButton = [self plainIconButtonWithSymbol:@"plus" action:@selector(onNewSession)];
     sidebarAddButton.accessibilityLabel = @"New session";
     sidebarAddButton.accessibilityHint = @"Opens a new terminal window.";
     [_sidebarView addSubview:sidebarAddButton];
-    UIButton *sidebarPanelButton = [self circleButtonWithSymbol:@"sidebar.left" action:@selector(onToggleSidebar)];
+    UIButton *sidebarPanelButton = [self plainIconButtonWithSymbol:@"sidebar.left" action:@selector(onToggleSidebar)];
     sidebarPanelButton.accessibilityLabel = @"Hide sessions";
     sidebarPanelButton.accessibilityHint = @"Hides the session list.";
     [_sidebarView addSubview:sidebarPanelButton];
@@ -566,11 +598,11 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
 
     // Sidebar bottom row: the gear (Settings) and, next to it, the
     // folder (Files), both circular like Swipterm's gear.
-    UIButton *gearButton = [self circleButtonWithSymbol:@"gearshape" action:@selector(onOpenSettings)];
+    UIButton *gearButton = [self plainIconButtonWithSymbol:@"gearshape" action:@selector(onOpenSettings)];
     gearButton.accessibilityLabel = @"Settings";
     gearButton.accessibilityHint = @"Opens Settings.";
     [_sidebarView addSubview:gearButton];
-    UIButton *filesButton = [self circleButtonWithSymbol:@"folder" action:@selector(onOpenFiles)];
+    UIButton *filesButton = [self plainIconButtonWithSymbol:@"folder" action:@selector(onOpenFiles)];
     filesButton.accessibilityLabel = @"Files";
     filesButton.accessibilityHint = @"Opens the TermX folder in the Files app.";
     [_sidebarView addSubview:filesButton];
@@ -727,28 +759,33 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
     // a key never renders as an empty pill. The key row keeps its
     // sizes, spacing, and 9 pt-ish roundness (Medium corner style).
     // Single glyphs (arrows, hide-keyboard) at 18 pt like the
-    // keyboard's own symbols; words at 16 pt.
+    // keyboard's own symbols; three-letter words at 16 pt;
+    // four-letter words ("more", "home", "pgup", "copy", "ctrl")
+    // at 12 pt, or they do not fit: on a 430 pt screen each key in
+    // the 11-key primary row is ~30 pt wide inside the floating
+    // bar (16 pt in from each edge) and "more" at 13 pt is ~31 pt. The font size is
+    // chosen here, in the configuration, because the old
+    // titleLabel.adjustsFontSizeToFitWidth did nothing: with a
+    // UIButtonConfiguration the button's title is not rendered by
+    // titleLabel at all, so the shrink never applied and "more"
+    // wrapped to two lines ("mor" / "e"). The line break mode is
+    // truncating tail as a backstop, so no label can ever wrap
+    // again; the horizontal insets are 0 so the words get the
+    // key's full width.
     UIButtonConfiguration *config = [UIButtonConfiguration glassButtonConfiguration];
     config.title = title;
     config.baseForegroundColor = [UIColor whiteColor];
     config.cornerStyle = UIButtonConfigurationCornerStyleMedium;
-    config.contentInsets = NSDirectionalEdgeInsetsMake(6, 1, 6, 1);
-    UIFont *font = (title.length == 1)
-        ? [UIFont systemFontOfSize:18 weight:UIFontWeightMedium]
-        : [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    config.contentInsets = NSDirectionalEdgeInsetsMake(6, 0, 6, 0);
+    config.titleLineBreakMode = NSLineBreakByTruncatingTail;
+    CGFloat fontSize = (title.length == 1) ? 18 : (title.length <= 3) ? 16 : 12;
+    UIFont *font = [UIFont systemFontOfSize:fontSize weight:UIFontWeightMedium];
     config.titleTextAttributesTransformer = ^NSDictionary<NSAttributedStringKey, id> *(NSDictionary<NSAttributedStringKey, id> *incoming) {
         NSMutableDictionary<NSAttributedStringKey, id> *attrs = [incoming mutableCopy];
         attrs[NSFontAttributeName] = font;
         return attrs;
     };
     b.configuration = config;
-    // The titles shrink to fit instead of clipping: with equal
-    // widths the widest four-letter label ("more", ~36 pt at
-    // 16 pt sans-serif) is wider than its key, so the title scales
-    // down rather than truncating. A 0.5 floor keeps it fitting
-    // even on a 320 pt screen.
-    b.titleLabel.adjustsFontSizeToFitWidth = YES;
-    b.titleLabel.minimumScaleFactor = 0.5;
     // VoiceOver: a glyph or abbreviation alone reads as nothing.
     b.accessibilityLabel = TXKeyAccessibilityLabel(title);
     b.accessibilityHint = @"Sends this key to the terminal.";
@@ -944,21 +981,20 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 
 #pragma mark - Sessions (top bar / sidebar)
 
-- (UIButton *)circleButtonWithSymbol:(NSString *)symbol action:(SEL)action {
+- (UIButton *)plainIconButtonWithSymbol:(NSString *)symbol action:(SEL)action {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     b.translatesAutoresizingMaskIntoConstraints = NO;
-    // System glass button (iOS 26): the configuration is the glass.
-    // The system draws the SF Symbol over its own glass, so the
-    // icon is never covered the way a hand-added blur view covered
-    // it (the empty dark circles). No manual background, border,
-    // shadow, or press scale: the glass button has its own press
-    // response. 44 pt, capsule corner style, so it is a circle.
-    UIButtonConfiguration *config = [UIButtonConfiguration glassButtonConfiguration];
-    config.image = [UIImage systemImageNamed:symbol withConfiguration:
-        [UIImageSymbolConfiguration configurationWithPointSize:20 weight:UIImageSymbolWeightMedium]];
-    config.baseForegroundColor = [UIColor whiteColor];
-    config.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-    b.configuration = config;
+    // A plain icon on the glass surface behind it — never a glass
+    // button of its own. The pill and the sidebar panel are each
+    // one glass surface; a glass button inside one adds a second
+    // glass edge, the double ring the user saw on the + and panel
+    // buttons. A system button dims its image on highlight, so
+    // the press still reads, and the haptic is in the action.
+    // 44 pt, the same size as the old circle buttons.
+    [b setImage:[UIImage systemImageNamed:symbol withConfiguration:
+        [UIImageSymbolConfiguration configurationWithPointSize:20 weight:UIImageSymbolWeightMedium]]
+       forState:UIControlStateNormal];
+    b.tintColor = [UIColor whiteColor];
     [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     [NSLayoutConstraint activateConstraints:@[
         [b.widthAnchor constraintEqualToConstant:44],
@@ -1209,7 +1245,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 // changed — update the top bar title and rebuild the sidebar.
 - (void)sessionManagerDidUpdateSessions:(id)manager {
     (void)manager;
-    _topBarTitleLabel.text = _sessionManager.currentSession.displayName;
+    _pillTitleLabel.text = _sessionManager.currentSession.displayName;
     [self rebuildSidebarSessions];
 }
 
@@ -1220,6 +1256,16 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
+}
+
+// The terminal theme changed live (TXGhosttyView reloadConfig
+// posts this after pushing the new config): repaint the root
+// view in the new theme's background color, so the key row and
+// the strip behind the top pill follow the terminal color at
+// once instead of staying black until a restart.
+- (void)terminalThemeDidChange:(NSNotification *)note {
+    (void)note;
+    self.view.backgroundColor = TXTerminalThemeBackgroundColor();
 }
 
 #pragma mark - Actions
@@ -1576,6 +1622,7 @@ static NSString *TXKeyAccessibilityLabel(NSString *title) {
 }
 
 - (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
     // Observable in engine.log: with the timer cycles fixed, this
     // line proves the VC is actually freed when the terminal is
     // dismissed. Its absence after a dismiss means a retain cycle

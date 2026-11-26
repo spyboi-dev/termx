@@ -31,9 +31,25 @@ void TXTerminalThemeSetSelectedIndex(NSInteger index) {
     [[NSUserDefaults standardUserDefaults] setInteger:index forKey:kTXTerminalThemeDefaultsKey];
 }
 
+NSString *const TXTerminalThemeDidChangeNotification = @"TXTerminalThemeDidChangeNotification";
+
 NSString *TXTerminalThemeConfigPath(void) {
     NSString *configDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     return [configDir stringByAppendingPathComponent:@"ghostty-config.conf"];
+}
+
+// The selected theme's background hex ("#rrggbb") as a color.
+// Malformed input falls back to black, the default theme.
+UIColor *TXTerminalThemeBackgroundColor(void) {
+    TXTerminalTheme theme = TXTerminalThemes[TXTerminalThemeSelectedIndex()];
+    const char *hex = theme.background;
+    if (!hex || hex[0] != '#' || strlen(hex) != 7) return [UIColor blackColor];
+    unsigned int rgb = 0;
+    if (sscanf(hex + 1, "%06x", &rgb) != 1) return [UIColor blackColor];
+    return [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0
+                           green:((rgb >> 8) & 0xFF) / 255.0
+                            blue:(rgb & 0xFF) / 255.0
+                           alpha:1.0];
 }
 
 // The config keys this theme owns. A line is owned if it starts

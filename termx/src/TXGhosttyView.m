@@ -762,21 +762,47 @@ static uint32_t TXUnshiftedCodepointForGhosttyKey(ghostty_input_key_e key) {
 }
 
 // Reload the Ghostty config on the live surface, so a color theme
-// picked in Settings applies without relaunching: one
-// reload_config binding action, the same action the keyboard
-// shortcut triggers. If it fails (or there is no surface yet),
-// the config file is already rewritten, so the next surface
-// creation picks the theme up anyway.
+// picked in Settings applies at once, without relaunching. Build a
+// fresh config from the live config file and push it into the
+// running app with ghostty_app_update_config: the app hands it to
+// every surface, which rebuilds its derived config and sends the
+// color change to the renderer and termio. This is the reference
+// wrapper's mechanism (libghostty-spm TerminalController+Config:
+// prepareConfig, then ghostty_app_update_config, then free the old
+// config). The reload_config binding action cannot do this: it
+// re-reads Ghostty's default config paths, not this app's
+// Documents file, so it reapplies the default theme (One Dark —
+// the slate the user saw after picking a theme) and the picked
+// theme only appears after a restart, when the app is created
+// from the file. If there is no surface yet, the config file is
+// already rewritten, so the next surface creation picks the theme
+// up anyway.
 - (void)reloadConfig {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ [self reloadConfig]; });
         return;
     }
-    if (!_surface) return;
-    const char *action = "reload_config";
-    if (!ghostty_surface_binding_action(_surface, action, strlen(action))) {
-        TXLogEngine(@"Ghostty: reload_config failed; theme applies on next launch");
-    }
+    if (!_surface || !_app) return;
+    NSString *configPath = TXTerminalThemeConfigPath();
+    ghostty_config_t newConfig = ghostty_config_new();
+    if (!newConfig) return;
+    ghostty_config_load_file(newConfig, [configPath UTF8String]);
+    ghostty_config_finalize(newConfig);
+    ghostty_config_t oldConfig = _config;
+    _config = newConfig;
+    ghostty_app_update_config(_app, newConfig);
+    if (oldConfig) ghostty_config_free(oldConfig);
+    // A config reload resets the font size to the config file's
+    // font-size unless it was manually adjusted (pinch/stepper);
+    // the file has no font-size line, so re-apply the persisted
+    // size or the first theme pick shrinks the text.
+    [self setFontSize:TXTermFontSize()];
+    _needsFrame = YES;
+    // The key row and the strip behind the top pill are the
+    // theme's background color, not black: tell the controller to
+    // repaint them with the new theme.
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:TXTerminalThemeDidChangeNotification object:nil];
 }
 
 - (void)pasteText:(NSString *)text {
