@@ -100,8 +100,7 @@ static const CGFloat TXThemeChecklistRowHeightPt = 68.0;
 // The terminal font size, persisted across launches. Default 14 pt.
 // Pinch to zoom changes it (see TerminalViewController); the font is
 // built from this size everywhere, so one change re-renders the whole
-// terminal. Clamped to 10–24 pt: smaller and the text is unreadable,
-// larger and a single line no longer fits the screen.
+// terminal. Clamped to Termux's range, 4-256 pt.
 static inline CGFloat TXTermFontSize(void) {
     CGFloat size = [[NSUserDefaults standardUserDefaults] doubleForKey:@"termx.fontSize"];
     if (size < TXConfigTermFontSizeMin || size > TXConfigTermFontSizeMax) return TXConfigTermFontSizeDefault;

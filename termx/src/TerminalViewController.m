@@ -456,8 +456,14 @@ static const size_t kFnLens[12] = {3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5};
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
-            static const uint8_t ed2[] = { 0x1B, '[', '2', 'J' };
-            [strongSelf->_output feedGuestOutput:[NSData dataWithBytes:ed2 length:sizeof(ed2)]];
+            // Home + erase: ESC[2J alone erases but leaves the
+            // cursor where the replay left it — on the bottom row
+            // after a full boot log — so the fresh prompt lands on
+            // the bottom row, with the whole screen empty above it.
+            // ESC[H first puts the cursor at the top-left, so the
+            // prompt opens at the top, the way Termux opens.
+            static const uint8_t clearSeq[] = { 0x1B, '[', 'H', 0x1B, '[', '2', 'J' };
+            [strongSelf->_output feedGuestOutput:[NSData dataWithBytes:clearSeq length:sizeof(clearSeq)]];
             // The shell prompt is only ever printed by the shell
             // itself, never by the boot log, so "@iphone:" in the
             // buffer means the guest reached the shell and is idle

@@ -182,9 +182,9 @@ static void TXGhosttyWriteClipboard(
     _pinchLastScale = 1.0;
     _pinchFontSize = TXTermFontSize();
     [self tx_createApp];
-    // Pinch to zoom the font, like the reference wrapper: a plain
-    // two-finger pinch, one font-size step per 0.1 of scale. The
-    // exit pan is one finger only, so it never sees the pinch.
+    // Pinch to zoom the font, Termux's way: a plain two-finger
+    // pinch, 2 pt per 0.9/1.1 threshold crossing. The exit pan is
+    // one finger only, so it never sees the pinch.
     UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc]
         initWithTarget:self action:@selector(tx_handlePinch:)];
     [self addGestureRecognizer:pinch];
@@ -201,6 +201,20 @@ static void TXGhosttyWriteClipboard(
     if (!_config) {
         TXLogEngine(@"Ghostty: config creation failed");
         return;
+    }
+    // Pure black background: Ghostty's default theme is One Dark
+    // (#282C34), and the view's own black is hidden behind the
+    // Metal layer Ghostty renders into, so the view colour alone
+    // never shows. The C API has no config setter; the reference
+    // wrapper writes a config file and loads it, so this does the
+    // same: one line, loaded before finalize.
+    NSString *configDir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *configPath = [configDir stringByAppendingPathComponent:@"ghostty-config.conf"];
+    NSError *writeError = nil;
+    if (![@"background = #000000\n" writeToFile:configPath atomically:YES encoding:NSUTF8StringEncoding error:&writeError]) {
+        TXLogEngine(@"Ghostty: background config write failed: %@", writeError);
+    } else {
+        ghostty_config_load_file(_config, [configPath UTF8String]);
     }
     ghostty_config_finalize(_config);
     ghostty_runtime_config_s rt;
@@ -680,15 +694,16 @@ static uint32_t TXUnshiftedCodepointForGhosttyKey(ghostty_input_key_e key) {
     ghostty_surface_key(_surface, k);
 }
 
-// Pinch to zoom the font size, the way the reference wrapper does
-// it (TerminalPinchFontZoom): one font-size step per 0.1 of scale,
-// accumulated across the gesture, so a slow pinch still moves and
-// the leftover fraction carries to the next move. Each step goes
-// through Ghostty's increase/decrease_font_size binding action,
-// which is display size only — the guest keeps its 48-column
-// layout. The size is tracked on this side (the C API cannot
-// report it) and persisted, so a new surface starts at the zoomed
-// size. Clamped to the app's font-size range.
+// Pinch to zoom the font size, Termux's way (TerminalView.onScale):
+// the recognizer's scale is accumulated, and past a 0.9/1.1
+// threshold the font steps 2 pt, so a slow pinch still moves and a
+// fast one steps more than once. Each step goes through Ghostty's
+// increase/decrease_font_size binding action; Ghostty re-lays out
+// the grid and reflows the displayed content to the new width, so
+// it stays inside the edges instead of running past them. The size
+// is tracked on this side (the C API cannot report it) and
+// persisted, so a new surface starts at the zoomed size. Clamped
+// to Termux's range.
 - (void)tx_handlePinch:(UIPinchGestureRecognizer *)gesture {
     if (!_surface) return;
     switch (gesture.state) {
@@ -697,18 +712,21 @@ static uint32_t TXUnshiftedCodepointForGhosttyKey(ghostty_input_key_e key) {
             _pinchFontSize = TXTermFontSize();
             break;
         case UIGestureRecognizerStateChanged: {
-            CGFloat delta = gesture.scale - _pinchLastScale;
-            NSInteger steps = (NSInteger)(delta / 0.1);
-            if (steps == 0) return;
-            _pinchLastScale += (CGFloat)steps * 0.1;
-            for (NSInteger i = 0; i < labs(steps); i++) {
-                BOOL growing = steps > 0;
-                CGFloat next = _pinchFontSize + (growing ? 1.0 : -1.0);
+            // One threshold crossing per step; a fast pinch can
+            // cross several in one move, so loop until the ratio
+            // is back inside the band.
+            while (YES) {
+                CGFloat ratio = gesture.scale / _pinchLastScale;
+                BOOL growing = ratio >= TXConfigPinchZoomInThreshold;
+                BOOL shrinking = ratio <= TXConfigPinchZoomOutThreshold;
+                if (!growing && !shrinking) break;
+                CGFloat next = _pinchFontSize + (growing ? TXConfigPinchZoomStepPt : -TXConfigPinchZoomStepPt);
                 if (next < TXConfigTermFontSizeMin || next > TXConfigTermFontSizeMax) break;
-                const char *action = growing ? "increase_font_size:1" : "decrease_font_size:1";
+                const char *action = growing ? "increase_font_size:2" : "decrease_font_size:2";
                 if (!ghostty_surface_binding_action(_surface, action, strlen(action))) break;
                 _pinchFontSize = next;
                 TXSetTermFontSize(_pinchFontSize);
+                _pinchLastScale *= growing ? TXConfigPinchZoomInThreshold : TXConfigPinchZoomOutThreshold;
             }
             break;
         }

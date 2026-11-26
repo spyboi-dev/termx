@@ -22,10 +22,10 @@
 #define TERMX_TXCONFIG_H
 
 // Terminal font size (TXTheme.h): the pinch-zoom clamp and the
-// default. Smaller and the text is unreadable; larger and a single
-// line no longer fits the screen.
-#define TXConfigTermFontSizeMin 10.0
-#define TXConfigTermFontSizeMax 24.0
+// default. The clamp is Termux's (changeFontSize, 4-256 sp): the
+// zoom, not the app, decides how far the font goes.
+#define TXConfigTermFontSizeMin 4.0
+#define TXConfigTermFontSizeMax 256.0
 #define TXConfigTermFontSizeDefault 14.0
 
 // Line spacing at the default font size: the paragraph style scales
@@ -51,9 +51,14 @@
 #define TXConfigPasteChunkBytes 1024
 #define TXConfigReplayChunkBytes 1024
 
-// Pinch to zoom: changes smaller than this are ignored, so
-// recognizer jitter does not resize the font under a steady finger.
-#define TXConfigPinchDeadZonePt 0.1
+// Pinch to zoom, Termux's values (TerminalView.onScale): the
+// recognizer's scale is accumulated, and past a 0.9/1.1 threshold
+// the font steps 2 pt, so a slow pinch still moves and a fast one
+// steps more than once. The threshold, not a dead zone, absorbs
+// recognizer jitter.
+#define TXConfigPinchZoomInThreshold 1.1
+#define TXConfigPinchZoomOutThreshold 0.9
+#define TXConfigPinchZoomStepPt 2.0
 
 // Key rows: every row (Fn, secondary, primary) is this tall.
 // 42 pt matches the iOS keyboard's own key height, so the
