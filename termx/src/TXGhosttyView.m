@@ -8,6 +8,7 @@
 // surface is sized.
 #import "TXGhosttyView.h"
 
+#import <QuartzCore/QuartzCore.h>
 #import <string.h>
 
 #import "TXLog.h"
@@ -16,6 +17,7 @@
 @interface TXGhosttyView ()
 - (void)tx_tick;
 - (void)tx_requestFrame;
+- (void)tx_updateSublayerFrames;
 - (void)tx_setViewportColumns:(uint16_t)cols rows:(uint16_t)rows widthPx:(uint32_t)w heightPx:(uint32_t)h;
 - (void)tx_completeClipboardRead:(void *)request;
 - (void)tx_ringBell;
@@ -267,6 +269,30 @@ static void TXGhosttyWriteClipboard(
     if (size.width <= 0 || size.height <= 0) return;
     if (!_surface) [self tx_createSurface];
     [self tx_updateSize];
+    [self tx_updateSublayerFrames];
+}
+
+// Ghostty renders into a Metal layer it adds as a sublayer of this
+// view, but it never sizes that layer: it is born 0x0, so the render
+// size (read from the layer's bounds) is 0x0 and every draw renders
+// into nothing — the blank terminal, even with refresh/draw called.
+// The host must size the engine layer to the view's bounds, like
+// libghostty-spm's updateSublayerFrames does. Sublayers owned by
+// UIKit (a subview's layer, whose delegate is the UIView) are left
+// alone.
+- (void)tx_updateSublayerFrames {
+    CGFloat scale = [UIScreen mainScreen].scale;
+    self.layer.contentsScale = scale;
+    self.layer.masksToBounds = YES;
+    CGRect frame = self.bounds;
+    for (CALayer *sublayer in self.layer.sublayers) {
+        if ([sublayer.delegate isKindOfClass:[UIView class]]) continue;
+        sublayer.frame = frame;
+        sublayer.contentsScale = scale;
+    }
+    // The layer was 0x0 until now, so the surface size Ghostty
+    // derived from it was 0x0: a frame is owed.
+    _needsFrame = YES;
 }
 
 - (void)didMoveToWindow {
@@ -278,6 +304,7 @@ static void TXGhosttyWriteClipboard(
         ghostty_surface_set_occlusion(_surface, inWindow);
     }
     if (inWindow) {
+        [self tx_updateSublayerFrames];
         _needsFrame = YES;
         [self tx_tick];
     }
