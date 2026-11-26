@@ -15,6 +15,7 @@
 
 @interface TXGhosttyView ()
 - (void)tx_tick;
+- (void)tx_requestFrame;
 - (void)tx_setViewportColumns:(uint16_t)cols rows:(uint16_t)rows widthPx:(uint32_t)w heightPx:(uint32_t)h;
 - (void)tx_completeClipboardRead:(void *)request;
 - (void)tx_ringBell;
@@ -63,11 +64,13 @@ static void TXGhosttyReceiveResize(void *userdata, uint16_t columns, uint16_t ro
 }
 
 // Ghostty has work (an event in its mailbox): tick the app on the
-// main thread so it is drained.
+// main thread so it is drained. A wakeup can also mean a new frame
+// is owed (output parsed, cursor blink), so the tick draws.
 static void TXGhosttyWakeup(void *userdata) {
     TXGhosttyView *view = (__bridge TXGhosttyView *)userdata;
     if (!view) return;
     dispatch_async(dispatch_get_main_queue(), ^{
+        [view tx_requestFrame];
         [view tx_tick];
     });
 }
@@ -154,6 +157,7 @@ static void TXGhosttyWriteClipboard(
     NSMutableData *_pendingOutput;
     BOOL _surfaceReady;
     BOOL _focused;
+    BOOL _needsFrame; // a frame is owed (wakeup, output, resize, focus)
     CGSize _lastSizePx;
 }
 
@@ -227,6 +231,11 @@ static void TXGhosttyWriteClipboard(
     _surface = ghostty_surface_new(_app, &cfg);
     if (_surface) {
         ghostty_surface_set_focus(_surface, _focused);
+        // A surface is born occluded and skips every draw until it
+        // hears otherwise: stamp visibility now, so the first frame
+        // draws. (didMoveToWindow re-stamps it on window changes.)
+        ghostty_surface_set_occlusion(_surface, self.window != nil);
+        _needsFrame = YES;
     } else {
         TXLogEngine(@"Ghostty: surface creation failed");
     }
@@ -245,6 +254,7 @@ static void TXGhosttyWriteClipboard(
     _lastSizePx = CGSizeMake(wPx, hPx);
     ghostty_surface_set_content_scale(_surface, (double)scale, (double)scale);
     ghostty_surface_set_size(_surface, wPx, hPx);
+    _needsFrame = YES;
     if (!_surfaceReady) {
         _surfaceReady = YES;
         [self tx_flushPendingOutput];
@@ -263,11 +273,33 @@ static void TXGhosttyWriteClipboard(
     [super didMoveToWindow];
     BOOL inWindow = (self.window != nil);
     _tickLink.paused = !inWindow;
-    if (_surface) ghostty_surface_set_focus(_surface, inWindow && _focused);
+    if (_surface) {
+        ghostty_surface_set_focus(_surface, inWindow && _focused);
+        ghostty_surface_set_occlusion(_surface, inWindow);
+    }
+    if (inWindow) {
+        _needsFrame = YES;
+        [self tx_tick];
+    }
+}
+
+- (void)tx_requestFrame {
+    _needsFrame = YES;
 }
 
 - (void)tx_tick {
-    if (_app) ghostty_app_tick(_app);
+    if (!_app) return;
+    ghostty_app_tick(_app);
+    // The app tick only drains the mailbox: it never presents a
+    // frame. The host must ask the surface to render, or the grid
+    // updates in memory and the view stays black — the blank
+    // terminal bug. Draw only when a frame is owed (wakeup, output,
+    // resize, focus), so an idle terminal costs no draws.
+    if (_surface && _needsFrame) {
+        _needsFrame = NO;
+        ghostty_surface_refresh(_surface);
+        ghostty_surface_draw(_surface);
+    }
 }
 
 - (void)tx_setViewportColumns:(uint16_t)cols rows:(uint16_t)rows
@@ -284,6 +316,7 @@ static void TXGhosttyWriteClipboard(
     NSData *data = [_pendingOutput copy];
     [_pendingOutput setLength:0];
     ghostty_surface_write_buffer(_surface, (const uint8_t *)data.bytes, (uintptr_t)data.length);
+    _needsFrame = YES;
 }
 
 - (void)tx_completeClipboardRead:(void *)request {
@@ -331,6 +364,7 @@ static void TXGhosttyWriteClipboard(
         return;
     }
     ghostty_surface_write_buffer(_surface, (const uint8_t *)data.bytes, (uintptr_t)data.length);
+    _needsFrame = YES;
 }
 
 - (void)sendText:(NSString *)text {
@@ -378,6 +412,7 @@ static void TXGhosttyWriteClipboard(
 - (void)setFocused:(BOOL)focused {
     _focused = focused;
     if (_surface) ghostty_surface_set_focus(_surface, focused);
+    _needsFrame = YES;
 }
 
 - (NSString *)visibleScreenText {
