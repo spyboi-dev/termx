@@ -7,9 +7,10 @@
 #import "TXJITManager.h"
 #import "TXLocalhostProxy.h"
 #import "TXLog.h"
+#import "TXStikJITCoordinator.h"
 #import "TXTheme.h"
 
-@interface TXAboutViewController ()
+@interface TXAboutViewController () <UIDocumentPickerDelegate>
 // The ports list inside the Localhost card, rebuilt when the user
 // adds or removes a port. The add field stays fixed below it.
 @property (nonatomic, strong) UIStackView *localhostPortsStack;
@@ -24,6 +25,23 @@
 @property (nonatomic, strong) UISwitch *jitSwitch;
 @property (nonatomic, strong) UILabel *jitStatusLabel;
 @property (nonatomic, strong) UIButton *jitTokenButton;
+// JIT method picker: one checkmark label per method row, indexed
+// by TXStikJITMethod, plus the per-method sections shown only
+// when that method is selected.
+@property (nonatomic, strong) NSArray<UILabel *> *jitMethodCheckLabels;
+@property (nonatomic, strong) NSArray<UIButton *> *jitMethodButtons;
+@property (nonatomic, strong) UILabel *jitLiveContainerNoteLabel;
+@property (nonatomic, strong) UIStackView *jitBuiltInStack;
+@property (nonatomic, strong) UIStackView *jitStikDebugStack;
+@property (nonatomic, strong) UIStackView *jitWaitStack;
+@property (nonatomic, strong) UILabel *jitPairingFileLabel;
+@property (nonatomic, strong) UILabel *jitPrepareStatusLabel;
+@property (nonatomic, strong) UILabel *jitTXMStatusLabel;
+@property (nonatomic, strong) UISwitch *jitForceScriptSwitch;
+@property (nonatomic, strong) UILabel *jitStikDebugAppLabel;
+@property (nonatomic, strong) UILabel *jitStikDebugStatusLabel;
+// Guards re-entry on the async Built-in prepare/enable actions.
+@property (nonatomic, assign) BOOL jitBuiltInBusy;
 // Refreshes the Localhost card's port list while the view is on
 // screen, so auto-detected ports appear and leave as guest
 // services start and stop.
@@ -36,6 +54,7 @@
     [super viewWillAppear:animated];
     [self refreshLocalhostPorts];
     self.backgroundSwitch.on = [[TXBackgroundKeepAlive shared] isEnabled];
+    [[TXStikJITCoordinator shared] applyLiveContainerDefaultIfNeeded];
     [self syncJITCard];
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(syncJITCard)
@@ -495,14 +514,16 @@
     [[TXBackgroundKeepAlive shared] setEnabled:sender.isOn];
 }
 
-// JIT card: one switch row plus a live status line, styled like the
-// Background card. The switch is the JIT control (TXJITManager):
-// on, TermX looks for the Swipt helper app on this phone and asks
-// it to enable native JIT, so JIT compilers inside the guest
-// (Node.js V8, JVM, ...) run at full speed instead of JITless.
-// Without the separate Swipt app installed and running, the status
-// stays Not Found. The token row only appears when the discovered
-// server asks for a token.
+// JIT card: a method picker plus one section per method, styled
+// like the Background card. The three methods are mutually
+// exclusive and persist in NSUserDefaults ("termx.jitMethod"):
+// Built-in StikJIT (TXStikJITCoordinator + helper extension,
+// recommended when available), StikDebug URL (opens StikDebug
+// for this process), and Wait for Debugger (the existing Swipt
+// client, TXJITManager). In LiveContainer the Built-in row is
+// disabled and the stored method defaults to Wait for Debugger.
+// The Swipt switch, status, and token row live in the Wait for
+// Debugger section only.
 - (UIView *)jitCard {
     UIView *card = [[UIView alloc] init];
     card.backgroundColor = TXThemeCardBackground();
@@ -516,6 +537,226 @@
     titleLabel.text = [@"JIT" uppercaseString];
     titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
+    UILabel *detailLabel = [[UILabel alloc] init];
+    detailLabel.font = [UIFont systemFontOfSize:13];
+    detailLabel.textColor = TXThemeSecondaryTextColor();
+    detailLabel.text = @"Enables native JIT for the guest (faster Node.js and other JIT compilers).";
+    detailLabel.numberOfLines = 0;
+    detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+    // Method picker: three tappable rows, one checkmark on the
+    // selected row. Built-in is disabled in LiveContainer.
+    NSArray<NSString *> *methodTitles = @[
+        @"Built-in StikJIT", @"StikDebug", @"Wait for Debugger"];
+    NSMutableArray<UILabel *> *checks = [NSMutableArray array];
+    NSMutableArray<UIButton *> *buttons = [NSMutableArray array];
+    UIStackView *pickerStack = [[UIStackView alloc] init];
+    pickerStack.axis = UILayoutConstraintAxisVertical;
+    pickerStack.spacing = 0;
+    pickerStack.translatesAutoresizingMaskIntoConstraints = NO;
+    for (NSInteger method = 0; method < 3; method++) {
+        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+        button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+        button.titleLabel.font = [UIFont systemFontOfSize:15];
+        [button setTitle:methodTitles[method] forState:UIControlStateNormal];
+        [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        [button setTitleColor:TXThemeSecondaryTextColor() forState:UIControlStateDisabled];
+        button.tag = method;
+        [button addTarget:self action:@selector(jitMethodTapped:) forControlEvents:UIControlEventTouchUpInside];
+        button.translatesAutoresizingMaskIntoConstraints = NO;
+        [button.heightAnchor constraintEqualToConstant:44].active = YES;
+
+        UILabel *checkLabel = [[UILabel alloc] init];
+        checkLabel.font = [UIFont systemFontOfSize:15];
+        checkLabel.textColor = TXThemeAccentColor();
+        checkLabel.text = @"✓";
+        checkLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        [checkLabel setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+
+        UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[button, checkLabel]];
+        row.axis = UILayoutConstraintAxisHorizontal;
+        row.spacing = 12;
+        row.alignment = UIStackViewAlignmentCenter;
+        row.translatesAutoresizingMaskIntoConstraints = NO;
+        [pickerStack addArrangedSubview:row];
+        if (method > 0) {
+            UIView *sep = [[UIView alloc] init];
+            sep.backgroundColor = TXThemeSeparatorColor();
+            sep.translatesAutoresizingMaskIntoConstraints = NO;
+            [pickerStack insertArrangedSubview:sep atIndex:pickerStack.arrangedSubviews.count - 1];
+            [sep.heightAnchor constraintEqualToConstant:1].active = YES;
+        }
+        [checks addObject:checkLabel];
+        [buttons addObject:button];
+    }
+    self.jitMethodCheckLabels = checks;
+    self.jitMethodButtons = buttons;
+
+    UILabel *liveContainerNote = [[UILabel alloc] init];
+    liveContainerNote.font = [UIFont systemFontOfSize:13];
+    liveContainerNote.textColor = TXThemeSecondaryTextColor();
+    liveContainerNote.numberOfLines = 0;
+    liveContainerNote.text = @"Built-in StikJIT unavailable in LiveContainer.";
+    liveContainerNote.translatesAutoresizingMaskIntoConstraints = NO;
+    self.jitLiveContainerNoteLabel = liveContainerNote;
+
+    // Per-method sections, built once and hidden/shown by
+    // syncJITCard.
+    self.jitBuiltInStack = [self jitBuiltInSection];
+    self.jitStikDebugStack = [self jitStikDebugSection];
+    self.jitWaitStack = [self jitWaitSection];
+    [self syncJITCard];
+
+    UIStackView *cardStack = [[UIStackView alloc] initWithArrangedSubviews:@[
+        titleLabel, detailLabel, pickerStack, liveContainerNote,
+        self.jitBuiltInStack, self.jitStikDebugStack, self.jitWaitStack]];
+    cardStack.axis = UILayoutConstraintAxisVertical;
+    cardStack.spacing = 12;
+    cardStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:cardStack];
+    [NSLayoutConstraint activateConstraints:@[
+        [cardStack.topAnchor constraintEqualToAnchor:card.topAnchor constant:18],
+        [cardStack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
+        [cardStack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-20],
+        [cardStack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-18],
+    ]];
+    return card;
+}
+
+// One left-aligned text button, like the token row below.
+- (UIButton *)jitActionButtonWithTitle:(NSString *)title action:(SEL)action {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    button.titleLabel.font = [UIFont systemFontOfSize:15];
+    [button setTitle:title forState:UIControlStateNormal];
+    [button setTitleColor:TXThemeAccentColor() forState:UIControlStateNormal];
+    [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    return button;
+}
+
+// Built-in StikJIT section: pairing file import + status,
+// Prepare/Enable JIT + readiness status, TXM/SPTM status, Force
+// JIT Script toggle, Reset Developer Disk Image.
+- (UIStackView *)jitBuiltInSection {
+    UILabel *pairingLabel = [[UILabel alloc] init];
+    pairingLabel.font = [UIFont systemFontOfSize:15];
+    pairingLabel.textColor = [UIColor whiteColor];
+    pairingLabel.textAlignment = NSTextAlignmentRight;
+    pairingLabel.numberOfLines = 0;
+    pairingLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.jitPairingFileLabel = pairingLabel;
+    UIStackView *pairingRow = [[UIStackView alloc] initWithArrangedSubviews:@[
+        [self jitSectionKeyLabel:@"Pairing file"], pairingLabel]];
+    pairingRow.axis = UILayoutConstraintAxisHorizontal;
+    pairingRow.spacing = 12;
+    pairingRow.alignment = UIStackViewAlignmentTop;
+    pairingRow.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIButton *importButton = [self jitActionButtonWithTitle:@"Import Pairing File"
+                                                     action:@selector(jitImportPairingFileTapped:)];
+    UIButton *prepareButton = [self jitActionButtonWithTitle:@"Prepare JIT"
+                                                      action:@selector(jitPrepareTapped:)];
+    UIButton *enableButton = [self jitActionButtonWithTitle:@"Enable JIT"
+                                                     action:@selector(jitBuiltInEnableTapped:)];
+
+    UILabel *prepareStatus = [[UILabel alloc] init];
+    prepareStatus.font = [UIFont systemFontOfSize:13];
+    prepareStatus.textColor = TXThemeSecondaryTextColor();
+    prepareStatus.numberOfLines = 0;
+    prepareStatus.translatesAutoresizingMaskIntoConstraints = NO;
+    self.jitPrepareStatusLabel = prepareStatus;
+
+    UILabel *txmLabel = [[UILabel alloc] init];
+    txmLabel.font = [UIFont systemFontOfSize:15];
+    txmLabel.textColor = [UIColor whiteColor];
+    txmLabel.textAlignment = NSTextAlignmentRight;
+    txmLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.jitTXMStatusLabel = txmLabel;
+    UIStackView *txmRow = [[UIStackView alloc] initWithArrangedSubviews:@[
+        [self jitSectionKeyLabel:@"TXM/SPTM"], txmLabel]];
+    txmRow.axis = UILayoutConstraintAxisHorizontal;
+    txmRow.spacing = 12;
+    txmRow.alignment = UIStackViewAlignmentTop;
+    txmRow.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *forceLabel = [[UILabel alloc] init];
+    forceLabel.font = [UIFont systemFontOfSize:15];
+    forceLabel.textColor = TXThemeSecondaryTextColor();
+    forceLabel.text = @"Force JIT Script";
+    forceLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    UISwitch *forceSwitch = [[UISwitch alloc] init];
+    forceSwitch.onTintColor = TXThemeAccentColor();
+    forceSwitch.accessibilityLabel = @"Force JIT Script";
+    [forceSwitch addTarget:self action:@selector(jitForceScriptChanged:) forControlEvents:UIControlEventValueChanged];
+    forceSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    self.jitForceScriptSwitch = forceSwitch;
+    UIStackView *forceRow = [[UIStackView alloc] initWithArrangedSubviews:@[forceLabel, forceSwitch]];
+    forceRow.axis = UILayoutConstraintAxisHorizontal;
+    forceRow.spacing = 12;
+    forceRow.alignment = UIStackViewAlignmentCenter;
+    forceRow.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIButton *resetButton = [self jitActionButtonWithTitle:@"Reset Developer Disk Image"
+                                                    action:@selector(jitResetDDITapped:)];
+
+    UIStackView *section = [[UIStackView alloc] initWithArrangedSubviews:@[
+        pairingRow, importButton, prepareButton, enableButton,
+        prepareStatus, txmRow, forceRow, resetButton]];
+    section.axis = UILayoutConstraintAxisVertical;
+    section.spacing = 12;
+    section.translatesAutoresizingMaskIntoConstraints = NO;
+    return section;
+}
+
+// StikDebug section: installed status, Enable JIT (opens the
+// StikDebug URL), request status. Opening the URL only confirms
+// iOS accepted the request.
+- (UIStackView *)jitStikDebugSection {
+    UILabel *appLabel = [[UILabel alloc] init];
+    appLabel.font = [UIFont systemFontOfSize:15];
+    appLabel.textColor = [UIColor whiteColor];
+    appLabel.textAlignment = NSTextAlignmentRight;
+    appLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.jitStikDebugAppLabel = appLabel;
+    UIStackView *appRow = [[UIStackView alloc] initWithArrangedSubviews:@[
+        [self jitSectionKeyLabel:@"StikDebug"], appLabel]];
+    appRow.axis = UILayoutConstraintAxisHorizontal;
+    appRow.spacing = 12;
+    appRow.alignment = UIStackViewAlignmentTop;
+    appRow.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIButton *enableButton = [self jitActionButtonWithTitle:@"Enable JIT"
+                                                     action:@selector(jitStikDebugEnableTapped:)];
+
+    UILabel *statusLabel = [[UILabel alloc] init];
+    statusLabel.font = [UIFont systemFontOfSize:13];
+    statusLabel.textColor = TXThemeSecondaryTextColor();
+    statusLabel.numberOfLines = 0;
+    statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.jitStikDebugStatusLabel = statusLabel;
+
+    UILabel *lcNote = [[UILabel alloc] init];
+    lcNote.font = [UIFont systemFontOfSize:13];
+    lcNote.textColor = TXThemeSecondaryTextColor();
+    lcNote.numberOfLines = 0;
+    lcNote.text = @"Enable Use LiveContainer's Bundle ID in LiveContainer settings.";
+    lcNote.translatesAutoresizingMaskIntoConstraints = NO;
+    lcNote.hidden = ![TXStikJITCoordinator isRunningInLiveContainer];
+
+    UIStackView *section = [[UIStackView alloc] initWithArrangedSubviews:@[
+        appRow, enableButton, statusLabel, lcNote]];
+    section.axis = UILayoutConstraintAxisVertical;
+    section.spacing = 12;
+    section.translatesAutoresizingMaskIntoConstraints = NO;
+    return section;
+}
+
+// Wait for Debugger section: the existing Swipt client
+// (TXJITManager) switch, live status, and token row. The Swipt
+// app must be installed and running on this phone; without it
+// the status stays Not Found.
+- (UIStackView *)jitWaitSection {
     UILabel *keyLabel = [[UILabel alloc] init];
     keyLabel.font = [UIFont systemFontOfSize:15];
     keyLabel.textColor = TXThemeSecondaryTextColor();
@@ -525,7 +766,7 @@
     UILabel *detailLabel = [[UILabel alloc] init];
     detailLabel.font = [UIFont systemFontOfSize:13];
     detailLabel.textColor = TXThemeSecondaryTextColor();
-    detailLabel.text = @"Enables native JIT for the guest (faster Node.js and other JIT compilers) via the Swipt helper app. Swipt must be installed and running on this phone.";
+    detailLabel.text = @"Waits for the Swipt helper app on this phone to enable JIT. Swipt must be installed and running.";
     detailLabel.numberOfLines = 0;
     detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
@@ -563,20 +804,23 @@
     [tokenButton addTarget:self action:@selector(jitTokenButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     tokenButton.translatesAutoresizingMaskIntoConstraints = NO;
     self.jitTokenButton = tokenButton;
-    [self syncJITCard];
 
-    UIStackView *cardStack = [[UIStackView alloc] initWithArrangedSubviews:@[titleLabel, row, statusLabel, tokenButton]];
-    cardStack.axis = UILayoutConstraintAxisVertical;
-    cardStack.spacing = 12;
-    cardStack.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:cardStack];
-    [NSLayoutConstraint activateConstraints:@[
-        [cardStack.topAnchor constraintEqualToAnchor:card.topAnchor constant:18],
-        [cardStack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
-        [cardStack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-20],
-        [cardStack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-18],
-    ]];
-    return card;
+    UIStackView *section = [[UIStackView alloc] initWithArrangedSubviews:@[row, statusLabel, tokenButton]];
+    section.axis = UILayoutConstraintAxisVertical;
+    section.spacing = 12;
+    section.translatesAutoresizingMaskIntoConstraints = NO;
+    return section;
+}
+
+- (UILabel *)jitSectionKeyLabel:(NSString *)text {
+    UILabel *label = [[UILabel alloc] init];
+    label.font = [UIFont systemFontOfSize:15];
+    label.textColor = TXThemeSecondaryTextColor();
+    label.text = text;
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    [label setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [label setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    return label;
 }
 
 - (void)jitSwitchChanged:(UISwitch *)sender {
@@ -584,6 +828,53 @@
 }
 
 - (void)syncJITCard {
+    TXStikJITCoordinator *coordinator = [TXStikJITCoordinator shared];
+    TXStikJITMethod method = [coordinator selectedMethod];
+    BOOL inLiveContainer = [TXStikJITCoordinator isRunningInLiveContainer];
+    // Picker: checkmark on the selected row; Built-in disabled
+    // in LiveContainer.
+    for (NSInteger i = 0; i < 3; i++) {
+        if (i < self.jitMethodCheckLabels.count) {
+            self.jitMethodCheckLabels[i].hidden = (i != method);
+        }
+        if (i < self.jitMethodButtons.count) {
+            UIButton *button = self.jitMethodButtons[i];
+            BOOL disabled = inLiveContainer && i == TXStikJITMethodBuiltInStikJIT;
+            button.enabled = !disabled;
+            button.alpha = disabled ? 0.4 : 1.0;
+        }
+    }
+    if (self.jitLiveContainerNoteLabel) {
+        self.jitLiveContainerNoteLabel.hidden = !inLiveContainer;
+    }
+    // One section visible: the selected method's.
+    if (self.jitBuiltInStack) {
+        self.jitBuiltInStack.hidden = (method != TXStikJITMethodBuiltInStikJIT);
+    }
+    if (self.jitStikDebugStack) {
+        self.jitStikDebugStack.hidden = (method != TXStikJITMethodStikDebug);
+    }
+    if (self.jitWaitStack) {
+        self.jitWaitStack.hidden = (method != TXStikJITMethodWaitForDebugger);
+    }
+    // Built-in section state.
+    if (self.jitPairingFileLabel) {
+        self.jitPairingFileLabel.text = [coordinator pairingFileStatusText];
+    }
+    if (self.jitPrepareStatusLabel) {
+        self.jitPrepareStatusLabel.text = coordinator.lastPrepareStatusText ?: @"";
+    }
+    if (self.jitTXMStatusLabel) {
+        self.jitTXMStatusLabel.text = [coordinator txmSPTMStatusText];
+    }
+    if (self.jitForceScriptSwitch) {
+        self.jitForceScriptSwitch.on = [coordinator forceScript];
+    }
+    // StikDebug section state.
+    if (self.jitStikDebugAppLabel) {
+        self.jitStikDebugAppLabel.text = [coordinator canOpenStikDebug] ? @"Installed" : @"Not installed";
+    }
+    // Wait for Debugger section state (the Swipt client).
     TXJITManager *jit = [TXJITManager shared];
     if (self.jitSwitch) self.jitSwitch.on = jit.jitEnabled;
     if (self.jitStatusLabel) {
@@ -596,6 +887,130 @@
         [self.jitTokenButton setTitle:[NSString stringWithFormat:@"Swipt Token: %@", value]
                              forState:UIControlStateNormal];
     }
+}
+
+- (void)jitMethodTapped:(UIButton *)sender {
+    TXStikJITMethod method = (TXStikJITMethod)sender.tag;
+    [[TXStikJITCoordinator shared] setSelectedMethod:method];
+    if (method == TXStikJITMethodWaitForDebugger) {
+        [[TXJITManager shared] refresh];
+    }
+    [self syncJITCard];
+}
+
+- (void)jitForceScriptChanged:(UISwitch *)sender {
+    [[TXStikJITCoordinator shared] setForceScript:sender.isOn];
+}
+
+- (void)jitImportPairingFileTapped:(UIButton *)sender {
+    (void)sender;
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
+        initWithDocumentTypes:@[@"public.property-list"]
+                       inMode:UIDocumentPickerModeImport];
+    picker.delegate = self;
+    picker.modalPresentationStyle = UIModalPresentationFormSheet;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller
+    didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    (void)controller;
+    NSURL *picked = urls.firstObject;
+    if (!picked) return;
+    __weak TXAboutViewController *weakSelf = self;
+    [[TXStikJITCoordinator shared] importPairingFileFromURL:picked
+                                                  completion:^(BOOL success, NSString *statusText) {
+        (void)success;
+        TXAboutViewController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.jitPrepareStatusLabel.text = statusText;
+        [strongSelf syncJITCard];
+    }];
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+    (void)controller;
+}
+
+- (void)jitPrepareTapped:(UIButton *)sender {
+    (void)sender;
+    if (self.jitBuiltInBusy) return;
+    self.jitBuiltInBusy = YES;
+    self.jitPrepareStatusLabel.text = @"Preparing…";
+    __weak TXAboutViewController *weakSelf = self;
+    [[TXStikJITCoordinator shared] prepareJITWithCompletion:
+        ^(TXStikJITReadiness readiness, NSString *reason) {
+        TXAboutViewController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.jitBuiltInBusy = NO;
+        NSString *prefix = (readiness == TXStikJITReadinessReady) ? @"Ready" : @"Not ready";
+        strongSelf.jitPrepareStatusLabel.text =
+            [NSString stringWithFormat:@"%@: %@", prefix, reason];
+        [strongSelf syncJITCard];
+        strongSelf.jitPrepareStatusLabel.text =
+            [NSString stringWithFormat:@"%@: %@", prefix, reason];
+    }];
+}
+
+- (void)jitBuiltInEnableTapped:(UIButton *)sender {
+    (void)sender;
+    if (self.jitBuiltInBusy) return;
+    self.jitBuiltInBusy = YES;
+    self.jitPrepareStatusLabel.text = @"Enabling…";
+    __weak TXAboutViewController *weakSelf = self;
+    [[TXStikJITCoordinator shared] enableJITWithCompletion:
+        ^(BOOL success, NSString *statusText) {
+        TXAboutViewController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.jitBuiltInBusy = NO;
+        strongSelf.jitPrepareStatusLabel.text = statusText;
+        [strongSelf syncJITCard];
+        // syncJITCard rewrites the label from the coordinator's
+        // last status; keep the enable result visible instead.
+        strongSelf.jitPrepareStatusLabel.text = statusText;
+        (void)success;
+    }];
+}
+
+- (void)jitResetDDITapped:(UIButton *)sender {
+    (void)sender;
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Reset Developer Disk Image"
+                         message:@"Deletes the cached Developer Disk Image. The next preparation downloads it again."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    __weak TXAboutViewController *weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Reset"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *action) {
+        (void)action;
+        [[TXStikJITCoordinator shared] resetCachedDDIWithCompletion:
+            ^(BOOL success, NSString *statusText) {
+            (void)success;
+            TXAboutViewController *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            strongSelf.jitPrepareStatusLabel.text = statusText;
+            [strongSelf syncJITCard];
+            strongSelf.jitPrepareStatusLabel.text = statusText;
+        }];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)jitStikDebugEnableTapped:(UIButton *)sender {
+    (void)sender;
+    __weak TXAboutViewController *weakSelf = self;
+    [[TXStikJITCoordinator shared] openStikDebugWithCompletion:^(BOOL accepted) {
+        TXAboutViewController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        // Opening the URL only means iOS accepted the request;
+        // it is not JIT success.
+        strongSelf.jitStikDebugStatusLabel.text = accepted
+            ? @"Request sent to StikDebug."
+            : @"Could not open StikDebug.";
+    }];
 }
 
 - (void)jitTokenButtonTapped:(UIButton *)sender {

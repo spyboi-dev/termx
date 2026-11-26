@@ -1,0 +1,85 @@
+# TermXJITHelper - XcodeGen project for the Built-in StikJIT helper only.
+#
+# Generates TermXJITHelper.xcodeproj (target TermXJITHelper, an
+# app-extension) from this file; the host app is NOT built here, it is
+# built on Linux by termx/build.sh. Build it on the Mac runner with the
+# build-jithelper workflow, which fetches StikJIT first:
+#
+#     xcodegen
+#     xcodebuild -project TermXJITHelper.xcodeproj -scheme TermXJITHelper \
+#       -sdk iphoneos -configuration Release CODE_SIGNING_ALLOWED=NO build
+#
+# The helper is built unsigned on the runner; signing happens later when
+# the .appex is packaged into the app (sign-ipa.sh on a Mac, like the
+# other embedded frameworks). StikJIT has no Simulator slice, so it is
+# linked and embedded in device builds only, and the helper compiles
+# without it on the simulator via #if canImport(StikJIT).
+name: TermXJITHelper
+options:
+  bundleIdPrefix: app.termx.ios
+  deploymentTarget:
+    iOS: "17.4"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: false
+
+targets:
+  # Built-in StikJIT: the second process that attaches a debugger to TermX
+  # (see TermXJITHelper.swift). StikJIT has no Simulator slice, so it's
+  # linked and embedded in device builds only, and the helper compiles
+  # without it there.
+  TermXJITHelper:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: TermXJITHelper.swift
+    info:
+      path: TermXJITHelper-Info.plist
+      properties:
+        CFBundleDisplayName: TermX JIT helper
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          # Apple's AR viewer point, with a rule nothing matches: no app or
+          # share sheet ever offers it, and TermX starts it by bundle ID.
+          NSExtensionPointIdentifier: com.apple.ar.viewer
+          NSExtensionPrincipalClass: TermXJITHelper
+          NSExtensionAttributes:
+            NSExtensionActivationRule: FALSEPREDICATE
+        # An app-type process per request, not a plain XPC service.
+        XPCService:
+          ServiceType: Application
+          _MultipleInstances: true
+          _ProcessType: App
+    postBuildScripts:
+      - name: Embed StikJIT
+        basedOnDependencyAnalysis: false
+        script: |
+          [ "$PLATFORM_NAME" = iphoneos ] || exit 0
+          SRC="$PROJECT_DIR/Frameworks/StikJIT.xcframework/ios-arm64/StikJIT.framework"
+          [ -d "$SRC" ] || { echo "error: no StikJIT: run Scripts/fetch-stikjit.sh"; exit 1; }
+          DEST="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"
+          mkdir -p "$DEST"
+          rsync -a --delete "$SRC" "$DEST/"
+          # Unsigned on the runner: sign-ipa.sh signs it when packaging.
+          [ -z "$EXPANDED_CODE_SIGN_IDENTITY" ] ||
+            codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --timestamp=none "$DEST/StikJIT.framework"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.termx.ios.jithelper
+        CODE_SIGN_STYLE: Manual
+        # Built unsigned on the runner; the packager signs the .appex later.
+        CODE_SIGNING_ALLOWED: NO
+        # Same version as the host app (termx/src/Info.plist).
+        MARKETING_VERSION: "0.3.0"
+        CURRENT_PROJECT_VERSION: "3"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        APPLICATION_EXTENSION_API_ONLY: YES
+        # The embed script reads Frameworks/, outside the sandbox's inputs.
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        FRAMEWORK_SEARCH_PATHS[sdk=iphoneos*]: $(PROJECT_DIR)/Frameworks/StikJIT.xcframework/ios-arm64
+        OTHER_LDFLAGS[sdk=iphoneos*]: -framework StikJIT
+        CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]: NO
+        CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]: NO
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64

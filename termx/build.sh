@@ -79,7 +79,7 @@ FWSHA=$(sha256sum Frameworks/KRuntime_6_18_4K.framework/KRuntime_6_18_4K | cut -
 CFLAGS="-target arm64-apple-ios$MIN -isysroot $SDK -miphoneos-version-min=$MIN -fobjc-arc -O2 -Wno-deprecated-declarations -DTERMX_BUILD_COMMIT=\"$COMMIT\" -DTERMX_FRAMEWORK_SHA256=\"$FWSHA\" -I$SRC -IFrameworks/Ghostty/include -F$SDK/System/Library/SubFrameworks -F$SDK/System/Library/PrivateFrameworks"
 
 echo "== compile"
-for f in main AppDelegate TerminalViewController KernEngine GuestInstall TXCrashLog TXLog TXLogViewController TXStartupViewController TXAboutViewController TXGuestFlow TXLocalhostProxy TXGhosttyView TXBackgroundKeepAlive TXJITManager; do
+for f in main AppDelegate TerminalViewController KernEngine GuestInstall TXCrashLog TXLog TXLogViewController TXStartupViewController TXAboutViewController TXGuestFlow TXLocalhostProxy TXGhosttyView TXBackgroundKeepAlive TXJITManager TXStikJITCoordinator TXStikJITTransport; do
   echo "   $f.m"
   $CLANG $CFLAGS -c "$SRC/$f.m" -o "$OUT/$f.o"
 done
@@ -100,11 +100,13 @@ ld64.lld-18 -arch arm64 -platform_version ios $MIN 26.5 \
   "$OUT"/TXLog.o "$OUT"/TXLogViewController.o "$OUT"/TXStartupViewController.o \
   "$OUT"/TXAboutViewController.o "$OUT"/TXGuestFlow.o "$OUT"/TXLocalhostProxy.o \
   "$OUT"/TXGhosttyView.o "$OUT"/TXBackgroundKeepAlive.o "$OUT"/TXJITManager.o \
+  "$OUT"/TXStikJITCoordinator.o "$OUT"/TXStikJITTransport.o \
   "$OUT"/vt.o \
   Frameworks/Ghostty/libghostty.a \
   -framework UIKit -framework Foundation -framework CoreGraphics \
   -framework QuartzCore -framework Metal -framework MetalKit \
   -framework CoreText -framework CoreLocation -framework IOSurface \
+  -framework Security \
   -lz -lobjc -lSystem -lc++ \
   -o "$APP/TermX"
 
@@ -118,6 +120,21 @@ cp -r Frameworks/MesaEGL.framework "$APP/Frameworks/"
 cp -r Frameworks/MesaGallium.framework "$APP/Frameworks/"
 # Drop any prebuilt code signature: the installer re-signs everything anyway.
 find "$APP/Frameworks" -name _CodeSignature -type d -exec rm -rf {} + 2>/dev/null || true
+# Built-in StikJIT helper: the .appex is built unsigned on the Mac
+# runner (.github/workflows/build-jithelper.yml) and dropped here as
+# helper-artifact/TermXJITHelper.appex. If it is present, embed it
+# under PlugIns/; the installer (SideStore) signs the whole bundle,
+# including the helper and its nested StikJIT.framework, at install
+# time. If it is absent, the build is host-only and the About JIT
+# card reports the helper unavailable (the Swipt client still works).
+if [ -d "helper-artifact/TermXJITHelper.appex" ]; then
+  mkdir -p "$APP/PlugIns"
+  cp -r helper-artifact/TermXJITHelper.appex "$APP/PlugIns/"
+  find "$APP/PlugIns/TermXJITHelper.appex" -name _CodeSignature -type d -exec rm -rf {} + 2>/dev/null || true
+  echo "   embedded PlugIns/TermXJITHelper.appex"
+else
+  echo "   no helper-artifact/TermXJITHelper.appex; host-only build (no Built-in StikJIT)"
+fi
 
 cd "$OUT"
 rm -f TermX.ipa
@@ -139,6 +156,21 @@ esac
 if [ ! -d "$APP/Frameworks/KRuntime_6_18_4K.framework" ]; then
   echo "ERROR: KRuntime_6_18_4K.framework was not embedded in the app." >&2
   exit 1
+fi
+if [ -d "$APP/PlugIns/TermXJITHelper.appex" ]; then
+  HELPER_BIN="$APP/PlugIns/TermXJITHelper.appex/TermXJITHelper"
+  HELPER_ARCH=$(file -b "$HELPER_BIN" 2>/dev/null || echo missing)
+  case "$HELPER_ARCH" in
+    *arm64*) ;;
+    *) echo "ERROR: helper binary is not arm64: $HELPER_ARCH" >&2; exit 1 ;;
+  esac
+  if [ ! -d "$APP/PlugIns/TermXJITHelper.appex/Frameworks/StikJIT.framework" ]; then
+    echo "ERROR: StikJIT.framework was not embedded in the helper." >&2
+    exit 1
+  fi
+  echo "   helper PlugIns/TermXJITHelper.appex ($HELPER_ARCH)"
+else
+  echo "   no helper embedded (host-only build)"
 fi
 if [ "$COMMIT" = "nogit" ]; then
   echo "ERROR: no git commit — the build marker would be 'nogit' and the IPA unidentifiable." >&2

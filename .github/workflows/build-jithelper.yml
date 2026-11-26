@@ -1,0 +1,124 @@
+# Build the Built-in StikJIT helper extension (TermXJITHelper.appex) for
+# TermX and upload it as an artifact. The host app is NOT built here; it
+# is built on a Linux VM by termx/build.sh, which cannot compile Swift.
+# The .appex from this job is copied into Payload/TermX.app/PlugIns/ by
+# the packaging step (not this workflow) and signed there.
+#
+# Pipeline:
+#   1. Select Xcode 27.2 stable (same pattern as build-framework.yml).
+#   2. Fetch StikJIT 2.0.1 and verify its SHA-256
+#      (termx/helper/Scripts/fetch-stikjit.sh, mirrored from the
+#      CrateTerm fork's Scripts/fetch-stikjit.sh).
+#   3. Run xcodegen in termx/helper, then xcodebuild the
+#      TermXJITHelper app-extension target unsigned
+#      (CODE_SIGNING_ALLOWED=NO) for iphoneos.
+#   4. Verify the .appex (arm64 binary, embedded StikJIT.framework,
+#      extension point and principal class) and upload it.
+#
+# Triggered manually, or on pushes to main that touch this workflow or
+# the helper sources.
+name: Build TermX JIT helper
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-jithelper.yml'
+      - 'termx/helper/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # xcode-27, not macos-26: the standard macos-26 image carries only
+    # Xcode 26.0-26.6, and the helper needs the iOS 27 SDK-era toolchain
+    # the xcode-27 image ships. The xcode-27 preview image is
+    # GitHub-hosted and free for this public repo.
+    runs-on: xcode-27
+    steps:
+      - name: Check out app
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 27
+        run: |
+          # Pick the newest stable Xcode 27, and fail loudly listing what
+          # is installed if none is present. Prefer stable: the image's
+          # newest 27 bundle is a beta (27.3_beta), which ships without
+          # the Metal Toolchain, so build-framework.yml run 44719664275
+          # died in the GPU prefix compiling Metal shaders. The stable
+          # 27.2 built the whole runtime tree in run 44708904462. On the
+          # xcode-27 image the default Xcode.app is itself 27, so fall
+          # back to it and verify the version if no versioned 27 bundle
+          # exists.
+          XCODE="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | grep -vi beta | grep -vi rc | sort -V | tail -1)"
+          if [ -z "$XCODE" ]; then
+            if [ -d /Applications/Xcode.app ]; then
+              XCODE=/Applications/Xcode.app
+              case "$(xcodebuild -version 2>/dev/null | head -1)" in
+                "Xcode 27"*) ;;
+                *) echo "default Xcode is not 27:"; xcodebuild -version; ls /Applications | grep -i xcode || true; exit 1 ;;
+              esac
+            else
+              echo "no Xcode 27 found:"; ls /Applications | grep -i xcode || true; exit 1
+            fi
+          fi
+          # Resolve the real path: Xcode's versioned bundles come in
+          # pairs that are the same install, one a symlink to the other.
+          # python3 realpath because BSD readlink has no -f.
+          XCODE="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$XCODE")"
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install xcodegen
+        run: |
+          if command -v xcodegen >/dev/null 2>&1; then
+            echo "have xcodegen: $(xcodegen --version)"
+          else
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+            xcodegen --version
+          fi
+
+      - name: Fetch StikJIT
+        run: |
+          cd termx/helper
+          ./Scripts/fetch-stikjit.sh
+          test -d Frameworks/StikJIT.xcframework/ios-arm64/StikJIT.framework
+
+      - name: Build TermXJITHelper.appex
+        run: |
+          cd termx/helper
+          xcodegen
+          test -f TermXJITHelper.xcodeproj/project.pbxproj
+          xcodebuild -project TermXJITHelper.xcodeproj \
+            -scheme TermXJITHelper \
+            -sdk iphoneos -configuration Release \
+            -derivedDataPath "$PWD/.build" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Verify the helper
+        run: |
+          APPEX=termx/helper/.build/Build/Products/Release-iphoneos/TermXJITHelper.appex
+          test -d "$APPEX" || { echo "no .appex at $APPEX"; exit 1; }
+          ls -lh "$APPEX"
+          # arm64 device binary, not a simulator slice.
+          lipo -info "$APPEX/TermXJITHelper" | grep -q arm64 \
+            || { echo "helper binary is not arm64"; exit 1; }
+          # StikJIT is embedded in the helper, not the host app.
+          test -d "$APPEX/Frameworks/StikJIT.framework" \
+            || { echo "StikJIT.framework missing from helper Frameworks/"; exit 1; }
+          # Extension identity: the point TermX launches by bundle ID,
+          # and the principal class the host's request is delivered to.
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APPEX/Info.plist")" = app.termx.ios.jithelper
+          test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' "$APPEX/Info.plist")" = com.apple.ar.viewer
+          test "$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPrincipalClass' "$APPEX/Info.plist")" = TermXJITHelper
+          echo "TermXJITHelper.appex verified"
+
+      - name: Upload JIT helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: TermXJITHelper-appex
+          path: termx/helper/.build/Build/Products/Release-iphoneos/TermXJITHelper.appex
