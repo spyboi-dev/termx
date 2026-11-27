@@ -82,6 +82,21 @@ static UIImage *TXFadeImage(UIColor *color, const CGFloat *locations, const CGFl
         // default theme background.
         r = g = b = 0;
     }
+    // A pure-black gradient never shows on device, while the same
+    // path with red shows and fades correctly (8d47ad4 screenshot:
+    // red at the top fading down, correct orientation, alpha
+    // honoured). The failure is specific to black: black's
+    // premultiplied RGB is 0 everywhere, so the image data is all
+    // zeros and the alpha is dropped at display, even though the
+    // sampled alphas in the image are correct. Keep a tiny nonzero
+    // RGB so the image data is never all zeros. 4/255 is visually
+    // identical to black and keeps the stored premultiplied value
+    // nonzero down to alpha ~0.125, covering the visible fade;
+    // 1/255 would round to zero below alpha 0.5 and the fade would
+    // drop out halfway down the strip.
+    r = MAX(r, 4.0 / 255.0);
+    g = MAX(g, 4.0 / 255.0);
+    b = MAX(b, 4.0 / 255.0);
     CGSize size = CGSizeMake(1, 256);
     UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size];
     return [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
@@ -865,32 +880,12 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
 // theme live. Regenerating is cheap (a 1x256 image) and it is
 // the only state the fades have — there is no layer, no blur
 // and no mask to keep in sync.
-// DIAGNOSTIC (revert once the log answers it): the top strip is a
-// red gradient, opaque at the top fading to transparent at the
-// bottom, through the same TXFadeImage path as the real black
-// gradient, only the color differs. The 6455860 solid red band
-// proved the view composites; the 6519b33 black gradient, with
-// correct alpha data in the image, never showed. This settles
-// whether the alpha in the image is honoured when displayed:
-// red fading down means the alpha path works and the black
-// gradient's failure is specific to black; red at the bottom
-// fading up means the image displays flipped; solid red means
-// the alpha is ignored; nothing means the alpha is zeroed. The
-// bottom strip stays the real black gradient as a control.
-static const BOOL kTXEdgeFadeRedGradientTest = YES;
-
 - (void)tx_updateEdgeFadeColors {
     UIColor *bg = TXTerminalThemeBackgroundColor();
     if (_topEdgeFadeView) {
-        if (kTXEdgeFadeRedGradientTest) {
-            const CGFloat locations[] = { 0, 1 };
-            const CGFloat alphas[] = { 1, 0 };
-            _topEdgeFadeView.image = TXFadeImage([UIColor redColor], locations, alphas, 2);
-        } else {
-            const CGFloat locations[] = { 0, 1 };
-            const CGFloat alphas[] = { 1, 0 };
-            _topEdgeFadeView.image = TXFadeImage(bg, locations, alphas, 2);
-        }
+        const CGFloat locations[] = { 0, 1 };
+        const CGFloat alphas[] = { 1, 0 };
+        _topEdgeFadeView.image = TXFadeImage(bg, locations, alphas, 2);
     }
     if (_bottomEdgeFadeView) {
         const CGFloat locations[] = { 0, 0.75, 1 };
@@ -978,7 +973,6 @@ static const BOOL kTXEdgeFadeRedGradientTest = YES;
     TXLogEngine(@"EdgeFades: bottom image alpha top=%.2f bottom=%.2f", TXFadeImageAlphaAt(_bottomEdgeFadeView.image, CGPointMake(0, 0)), TXFadeImageAlphaAt(_bottomEdgeFadeView.image, CGPointMake(0, 255)));
     TXLogEngine(@"EdgeFades: top image %@", TXFadeImageAlphaInfo(_topEdgeFadeView.image));
     TXLogEngine(@"EdgeFades: bottom image %@", TXFadeImageAlphaInfo(_bottomEdgeFadeView.image));
-    if (kTXEdgeFadeRedGradientTest) TXLogEngine(@"EdgeFades: RED GRADIENT TEST top strip is red fading to transparent (diagnostic, not the fade)");
     [self tx_logEdgeFadeState:@"appear"];
     // Re-log a second later: a layout pass, surface creation or
     // theme change that removes or reorders a strip after appear
