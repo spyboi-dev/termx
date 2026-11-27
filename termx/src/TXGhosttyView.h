@@ -83,20 +83,22 @@
 // persisted, like the pinch zoom.
 - (void)setFontSize:(CGFloat)size;
 
-// The strip at the bottom of the view the grid must not occupy,
-// in points. The view is full-screen (its Metal layer covers the
-// whole screen, so text can scroll behind the floating top
-// buttons and the key row), but the grid ends above the key row:
-// the prompt is the grid's last row, and it has to stay readable
-// above the key row. Ghostty's viewport cannot show empty space
-// below the last row — the smooth-scroll position is clamped to
-// the grid and the fraction is forced to zero at the bottom
-// (Patches/ghostty/0022) — so no scroll offset can lift the
-// prompt above the key row; the grid itself must end there. The
-// strip below the grid is the theme background (the root view
-// behind the layer). Set by the controller whenever the key row
-// moves (keyboard show/hide); 0 means the grid fills the view.
-@property (nonatomic) CGFloat surfaceBottomInset;
+// The grid fills the view to the bottom edge, so text can scroll
+// behind the key row and show through its glass. There used to be
+// a surfaceBottomInset that cut the grid off above the key row so
+// the prompt stayed readable; it is gone, because with the grid
+// cut off no text could ever go behind the key row (the user's
+// screenshot: text ended sharp at the key row's top edge). The
+// trade-off, stated plainly: Ghostty's viewport cannot show empty
+// space below the last row — the smooth-scroll position is clamped
+// to the grid and the fraction is forced to zero at the bottom
+// (Patches/ghostty/0022) — so no scroll offset can hold the prompt
+// above the key row at rest. With the grid full-height the prompt
+// sits on the grid's last row, behind the key row, and is visible
+// through the glass there (dimmed), not above it. Holding the
+// prompt above the key row while text goes behind it would need a
+// viewport bottom inset in Ghostty itself (a libghostty change),
+// not an app-side offset.
 
 // Whether the viewport is at the bottom of the scrollback (the
 // prompt is on screen). YES when there is no scrollback to

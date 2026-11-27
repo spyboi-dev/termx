@@ -194,7 +194,6 @@ static void TXGhosttyWriteClipboard(
 
 @synthesize viewportColumns = _viewportColumns;
 @synthesize viewportRows = _viewportRows;
-@synthesize surfaceBottomInset = _surfaceBottomInset;
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
@@ -319,17 +318,17 @@ static void TXGhosttyWriteClipboard(
 
 // Push the view size (in physical pixels) into the surface. The
 // resize callback reports the grid Ghostty computed from it. The
-// grid is shorter than the view by surfaceBottomInset: the view
-// is full-screen, but the grid ends above the key row, so the
-// prompt (the grid's last row) stays readable. The Metal layer
-// is still sized to the full view bounds (tx_updateSublayerFrames),
-// so the strip below the grid is the theme background, not text.
+// grid fills the view to the bottom edge, so text can scroll
+// behind the key row and show through its glass; the Metal layer
+// is sized to the full view bounds (tx_updateSublayerFrames), so
+// the grid and the layer agree and there is no theme-background
+// strip below the grid.
 - (void)tx_updateSize {
     if (!_surface) return;
     CGFloat scale = [UIScreen mainScreen].scale;
     CGSize size = self.bounds.size;
     uint32_t wPx = (uint32_t)lround(size.width * scale);
-    CGFloat hPt = size.height - _surfaceBottomInset;
+    CGFloat hPt = size.height;
     if (hPt < 20) hPt = 20; // never a zero or negative grid
     uint32_t hPx = (uint32_t)lround(hPt * scale);
     if (wPx == 0 || hPx == 0) return;
@@ -342,15 +341,6 @@ static void TXGhosttyWriteClipboard(
         _surfaceReady = YES;
         [self tx_flushPendingOutput];
     }
-}
-
-// The controller sets the bottom inset whenever the key row
-// moves; a size update follows at once (layoutSubviews also
-// calls tx_updateSize, which no-ops when the size is unchanged).
-- (void)setSurfaceBottomInset:(CGFloat)surfaceBottomInset {
-    if (surfaceBottomInset == _surfaceBottomInset) return;
-    _surfaceBottomInset = MAX(0, surfaceBottomInset);
-    [self tx_updateSize];
 }
 
 - (void)layoutSubviews {

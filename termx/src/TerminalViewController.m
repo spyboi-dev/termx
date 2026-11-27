@@ -206,7 +206,7 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     UIStackView *_secondaryRow;
     UIScrollView *_fnRow;
     NSLayoutConstraint *_toolbarBottom;
-    UIView *_toolbar; // the key-row bar; the grid ends at its top
+    UIView *_toolbar; // the key-row bar; the grid runs behind it
     BOOL _didClearScreenOnBoot; // clear-on-boot already done for this terminal instance
     CGPoint _exitPanStart; // where the top-edge exit drag began
     BOOL _exitPanBeganAtBottom; // the terminal was at the bottom when the exit drag began
@@ -373,20 +373,19 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     // The keyboard toolbar, NewTerm's model: the key rows riding
     // above the software keyboard. A floating bar, 8 pt in from
     // the screen edges, so it floats over the terminal instead of
-    // being a solid black bar attached to the bottom. No solid
-    // black anywhere: the bar itself is clear, the keys on it are
-    // glass circles, and the theme's background color shows
-    // through — the root view behind the bar is the theme color,
-    // so the key area follows the terminal color when the theme
-    // changes. The Ghostty view is full-screen now (it goes
-    // behind the top buttons and this bar), but the grid still
-    // ends at the bar's top — the surface height is the bar's
-    // top, set via surfaceBottomInset — so the prompt stays
-    // above the bar and the glass blurs the theme color, not
-    // terminal text, behind the keys. The scrollback is what
-    // goes behind the bar; the active prompt stays readable.
-    // It is a container, not an element: VoiceOver reads the key
-    // buttons inside it, not the bar.
+    // being a solid black bar attached to the bottom. The bar's
+    // background is the same Liquid Glass as the sidebar, so the
+    // terminal text shows through it (dimmed by the glass) and the
+    // bottom fade eases the text into it; the keys on it are the
+    // circular glass buttons. The Ghostty view is full-screen and
+    // the grid fills it to the bottom edge, so the text scrolls
+    // behind the bar — the scrollback goes behind the keys, and
+    // the prompt, on the grid's last row, sits behind the bar at
+    // rest, visible through the glass (dimmed). The viewport
+    // cannot hold it above the bar (clamped at the bottom, see
+    // TXGhosttyView.h); that would need a viewport bottom inset
+    // in Ghostty itself. It is a container, not an element:
+    // VoiceOver reads the key buttons inside it, not the bar.
     UIView *toolbar = [[UIView alloc] init];
     _toolbar = toolbar;
     toolbar.backgroundColor = [UIColor clearColor];
@@ -395,6 +394,26 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     toolbar.clipsToBounds = YES;
     toolbar.isAccessibilityElement = NO;
     [self.view addSubview:toolbar];
+
+    // The bar's background is Liquid Glass (the same helper as
+    // the sidebar), so the terminal text shows through the key
+    // row instead of the bar reading as a solid dark strip: the
+    // grid fills the view to the bottom edge and the text scrolls
+    // behind the bar, dimmed by the glass and eased by the bottom
+    // fade. It takes no touches (the keys on top of it do), and
+    // it is pinned to the bar's edges, so it grows with the bar
+    // when the Fn or secondary row opens. The bar stays a row of
+    // separate circular glass keys over this surface — not a solid
+    // bar and not a pill — and the keys keep their own glass.
+    UIVisualEffectView *toolbarGlass = TXLiquidGlassEffectView();
+    toolbarGlass.userInteractionEnabled = NO;
+    [toolbar addSubview:toolbarGlass];
+    [NSLayoutConstraint activateConstraints:@[
+        [toolbarGlass.topAnchor constraintEqualToAnchor:toolbar.topAnchor],
+        [toolbarGlass.leadingAnchor constraintEqualToAnchor:toolbar.leadingAnchor],
+        [toolbarGlass.trailingAnchor constraintEqualToAnchor:toolbar.trailingAnchor],
+        [toolbarGlass.bottomAnchor constraintEqualToAnchor:toolbar.bottomAnchor],
+    ]];
 
     UIStackView *rows = [[UIStackView alloc] init];
     rows.translatesAutoresizingMaskIntoConstraints = NO;
@@ -535,11 +554,11 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
         // the key row and the keyboard), so the text can scroll
         // up behind the top buttons to the top edge and down
         // behind the key row. The top buttons and the key row
-        // float over it; they do not shrink it. The grid itself
-        // ends above the key row (surfaceBottomInset, updated in
-        // viewDidLayoutSubviews), so the prompt stays readable
-        // above the key row while the scrollback goes behind
-        // the chrome.
+        // float over it; they do not shrink it. The grid fills
+        // the view to the bottom edge, so the scrollback goes
+        // behind the key row and shows through its glass; the
+        // prompt, on the grid's last row, sits behind the key
+        // row at rest, visible through the glass (dimmed).
         [_output.topAnchor constraintEqualToAnchor:self.view.topAnchor],
         [_output.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [_output.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
@@ -753,23 +772,6 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     [self termXEngineDidChangeState:_engine.state status:_engine.statusText];
 }
 
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    // The grid ends at the key row: the surface's bottom inset is
-    // the distance from the view's bottom to the toolbar's top.
-    // The view itself is full-screen (its layer covers the whole
-    // screen), so only the grid is shortened. Updated on every
-    // layout, so the grid tracks the toolbar while the keyboard
-    // animates (the toolbar moves, the inset follows, the surface
-    // resizes with it — the same reflow the old resizing view
-    // did). The setter no-ops when the size is unchanged.
-    if (_toolbar) {
-        CGFloat toolbarTop = CGRectGetMinY(_toolbar.frame);
-        CGFloat inset = MAX(0, self.view.bounds.size.height - toolbarTop);
-        _output.surfaceBottomInset = inset;
-    }
-}
-
 // The edge fades (the scroll edge effect): one fade strip at
 // the top and one at the bottom of the terminal, so scrolling
 // text disappears into the fade instead of being cut sharply
@@ -813,9 +815,10 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     [self.view addSubview:_topEdgeFade];
     // Bottom strip: transparent at its top, fading to opaque at
     // the very bottom (the key row). The fade starts late (the
-    // top three quarters stay clear) so the prompt — the grid's
-    // last row, just above the key row — stays readable at rest,
-    // and scrolling text fades out as it reaches the key row.
+    // top three quarters stay clear) so scrolling text stays
+    // readable as it approaches the key row and fades out as it
+    // reaches it; the text behind the key row itself shows
+    // through the bar's glass, dimmed, below the fade.
     _bottomEdgeFade = [[UIView alloc] init];
     _bottomEdgeFade.translatesAutoresizingMaskIntoConstraints = NO;
     _bottomEdgeFade.userInteractionEnabled = NO;
@@ -867,7 +870,7 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
 - (NSUInteger)tx_bootPromptRow {
     CGFloat safeTop = self.view.safeAreaInsets.top;
     CGFloat targetY = safeTop + 60;
-    CGFloat gridHeight = _output.bounds.size.height - _output.surfaceBottomInset;
+    CGFloat gridHeight = _output.bounds.size.height;
     uint16_t rows = _output.viewportRows;
     CGFloat rowHeight;
     if (rows > 0 && gridHeight > 0) {
@@ -1975,11 +1978,11 @@ static NSString *TXKeyGlyphForTitle(NSString *title) {
 
 - (void)keyboardWillChange:(NSNotification *)note {
     // The keyboard showing or hiding moves the toolbar; the
-    // terminal's grid resizes with it (the surface bottom inset
-    // follows the toolbar in viewDidLayoutSubviews) and Ghostty
-    // re-lays out. The view itself is full-screen and never
-    // moves — only the grid shortens, so the prompt stays above
-    // the key row.
+    // terminal's grid does not resize with it (the surface is
+    // the full view height now, so the grid is stable and the
+    // prompt stays where it is, behind the key row, visible
+    // through its glass). The view itself is full-screen and
+    // never moves — only the toolbar rides up and down.
     CGRect end = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
     CGRect inView = [self.view convertRect:end fromView:nil];
     // The toolbar is anchored to the safe-area bottom, but the
