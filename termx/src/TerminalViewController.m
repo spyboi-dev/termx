@@ -136,6 +136,24 @@ static CGFloat TXFadeImageAlphaAt(UIImage *image, CGPoint point) {
     return rgba[3] / 255.0;
 }
 
+// The image's alpha format, for the EdgeFades diagnostic: the
+// gradient image's sampled alphas are correct, yet the image
+// never shows, so log whether the CGImage actually carries an
+// alpha channel and how its bytes are laid out. alphaInfo: 0 None,
+// 1 PremultipliedLast, 2 PremultipliedFirst, 3 Last, 4 First,
+// 5 NoneSkipLast, 6 NoneSkipFirst, 7 Only. If the gradient image
+// reports None here, the alpha was lost at creation; if it reports
+// a premultiplied alpha like the red image yet still does not
+// show, the alpha is lost at display, not at creation.
+static NSString *TXFadeImageAlphaInfo(UIImage *image) {
+    CGImageRef cg = image.CGImage;
+    if (!cg) return @"nil";
+    return [NSString stringWithFormat:@"alphaInfo=%u bitmapInfo=0x%lx w=%zu h=%zu scale=%.1f",
+            (unsigned)CGImageGetAlphaInfo(cg),
+            (unsigned long)CGImageGetBitmapInfo(cg),
+            CGImageGetWidth(cg), CGImageGetHeight(cg), image.scale];
+}
+
 static const uint8_t kFnBytes[12][6] = {
     {0x1B, 'O', 'P'}, {0x1B, 'O', 'Q'}, {0x1B, 'O', 'R'}, {0x1B, 'O', 'S'},
     {0x1B, '[', '1', '5', '~'}, {0x1B, '[', '1', '7', '~'},
@@ -848,23 +866,25 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
 // the only state the fades have — there is no layer, no blur
 // and no mask to keep in sync.
 // DIAGNOSTIC (revert once the log answers it): the top strip is a
-// solid opaque red band, not a gradient. The 6519b33 log proved the
-// gradient image, the frames and the alphas are all correct, yet
-// nothing shows, so this settles the one remaining question: does
-// the fade view composite above the Ghostty Metal layer at all?
-// If a red band shows at the top, the view composites and the
-// gradient image itself is the problem. If no red band shows, the
-// view does not composite at all and the gradient is irrelevant.
-// Red, not the theme color, so it is unmistakable against the
-// black terminal. The bottom strip stays a gradient.
-static const BOOL kTXEdgeFadeSolidTest = YES;
+// red gradient, opaque at the top fading to transparent at the
+// bottom, through the same TXFadeImage path as the real black
+// gradient, only the color differs. The 6455860 solid red band
+// proved the view composites; the 6519b33 black gradient, with
+// correct alpha data in the image, never showed. This settles
+// whether the alpha in the image is honoured when displayed:
+// red fading down means the alpha path works and the black
+// gradient's failure is specific to black; red at the bottom
+// fading up means the image displays flipped; solid red means
+// the alpha is ignored; nothing means the alpha is zeroed. The
+// bottom strip stays the real black gradient as a control.
+static const BOOL kTXEdgeFadeRedGradientTest = YES;
 
 - (void)tx_updateEdgeFadeColors {
     UIColor *bg = TXTerminalThemeBackgroundColor();
     if (_topEdgeFadeView) {
-        if (kTXEdgeFadeSolidTest) {
+        if (kTXEdgeFadeRedGradientTest) {
             const CGFloat locations[] = { 0, 1 };
-            const CGFloat alphas[] = { 1, 1 };
+            const CGFloat alphas[] = { 1, 0 };
             _topEdgeFadeView.image = TXFadeImage([UIColor redColor], locations, alphas, 2);
         } else {
             const CGFloat locations[] = { 0, 1 };
@@ -956,7 +976,9 @@ static const BOOL kTXEdgeFadeSolidTest = YES;
     TXLogEngine(@"EdgeFades: bottom container %@ image %@ image %@", NSStringFromCGRect(_bottomEdgeFade.frame), NSStringFromCGRect(_bottomEdgeFadeView.frame), _bottomEdgeFadeView.image ? @"set" : @"nil");
     TXLogEngine(@"EdgeFades: top image alpha top=%.2f bottom=%.2f", TXFadeImageAlphaAt(_topEdgeFadeView.image, CGPointMake(0, 0)), TXFadeImageAlphaAt(_topEdgeFadeView.image, CGPointMake(0, 255)));
     TXLogEngine(@"EdgeFades: bottom image alpha top=%.2f bottom=%.2f", TXFadeImageAlphaAt(_bottomEdgeFadeView.image, CGPointMake(0, 0)), TXFadeImageAlphaAt(_bottomEdgeFadeView.image, CGPointMake(0, 255)));
-    if (kTXEdgeFadeSolidTest) TXLogEngine(@"EdgeFades: SOLID TEST top strip is opaque red (diagnostic, not the fade)");
+    TXLogEngine(@"EdgeFades: top image %@", TXFadeImageAlphaInfo(_topEdgeFadeView.image));
+    TXLogEngine(@"EdgeFades: bottom image %@", TXFadeImageAlphaInfo(_bottomEdgeFadeView.image));
+    if (kTXEdgeFadeRedGradientTest) TXLogEngine(@"EdgeFades: RED GRADIENT TEST top strip is red fading to transparent (diagnostic, not the fade)");
     [self tx_logEdgeFadeState:@"appear"];
     // Re-log a second later: a layout pass, surface creation or
     // theme change that removes or reorders a strip after appear
