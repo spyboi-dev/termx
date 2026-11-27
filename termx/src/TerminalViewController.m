@@ -42,132 +42,90 @@
 - (void)chromeSelectionHaptic;
 // Edge fades (the scroll edge effect): build the top/bottom
 // fade strips and recolor them when the theme changes. Each
-// strip is a plain image view showing a vertical gradient
-// (see TXFadeImage); there is no blur, no gradient layer and
-// no mask, because none of those ever painted on device.
+// strip is a TXEdgeFadeView drawing a vertical gradient in
+// drawRect; there is no blur, no gradient layer, no mask and
+// no image, because none of those ever painted on device.
 - (void)tx_buildEdgeFades;
 - (void)tx_updateEdgeFadeColors;
 - (void)tx_logEdgeFadeState:(NSString *)label;
 @end
 
-// A vertical gradient image: the theme background fading to
-// transparent, drawn with Core Graphics and shown in a plain
-// UIImageView. This is the fade now: no blur, no CAGradientLayer,
-// no mask. The two previous fade implementations both used a
-// CAGradientLayer (first as a sublayer with manual frame syncing,
-// then as a view's backing layer via layerClass) and neither ever
-// painted on device; a UIImageView is the most basic UIKit
-// rendering there is, and it composites above the Ghostty Metal
-// layer exactly like the top buttons do. The image is 1 pt wide
-// and 256 pt tall and stretched to fill the strip, so it is
-// resolution-independent; the gradient is vertical, so stretching
-// it stays smooth. Regenerated on a theme change, so the fade
-// follows the picked theme. `locations` and `alphas` have `count`
-// stops each; the color is the theme background.
-//
-// The gradient is drawn row by row (one 1-pt-tall rect per row,
-// alpha interpolated between the stops) with
-// CGContextSetRGBFillColor, NOT with CGGradient: the CGGradient
-// version never painted on device, and a row-by-row fill uses
-// only the most basic Core Graphics calls, with the color broken
-// into raw RGBA floats, so there is no gradient object and no
-// color space that can silently fail and leave the image fully
-// transparent. If the image still does not show, the EdgeFades
-// log in viewDidAppear samples the pixel alphas and says so.
-static UIImage *TXFadeImage(UIColor *color, const CGFloat *locations, const CGFloat *alphas, NSUInteger count) {
+// The scroll edge fade, drawn directly in drawRect: with the
+// exact theme background color and varying alpha. No UIImage:
+// the d4d737e image clamped the gradient RGB to 4/255 so the
+// image data was never all zeros, and on the iPhone OLED the
+// strip's opaque part (RGB 4,4,4, pixels on) read lighter than
+// the terminal background (pure black, pixels off), so the strip
+// showed as a visible band even with no text behind it. Drawing
+// in drawRect uses the exact background color, so the strip's
+// opaque part is exactly the terminal background and the strip
+// is invisible with no text behind it, like ChatGPT's fade.
+// The alpha lives in the layer's own pixels and is applied by
+// Core Animation at compositing time, so there is no image
+// alpha to drop for black. `locations` and `alphas` have the
+// same count; the gradient runs top to bottom.
+@interface TXEdgeFadeView : UIView
+@property (nonatomic, strong) UIColor *fadeColor;
+@property (nonatomic, copy) NSArray<NSNumber *> *locations;
+@property (nonatomic, copy) NSArray<NSNumber *> *alphas;
+@end
+
+@implementation TXEdgeFadeView
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        // Non-opaque with a clear background, so the alpha in
+        // drawRect is preserved in the layer and the view blends
+        // over the terminal instead of painting a solid rect.
+        // Redraw on bounds change (rotation, keyboard) so the
+        // gradient always spans the strip's current height.
+        self.opaque = NO;
+        self.backgroundColor = [UIColor clearColor];
+        self.contentMode = UIViewContentModeRedraw;
+        self.userInteractionEnabled = NO;
+    }
+    return self;
+}
+
+- (void)drawRect:(CGRect)rect {
+    (void)rect;
+    if (!self.fadeColor || self.locations.count < 2 || self.alphas.count != self.locations.count) return;
     CGFloat r = 0, g = 0, b = 0, a = 1;
-    if (![color getRed:&r green:&g blue:&b alpha:&a]) {
+    if (![self.fadeColor getRed:&r green:&g blue:&b alpha:&a]) {
         // getRed: fails for colors outside the RGB space (a
         // pattern or grayscale color); fall back to black, the
         // default theme background.
         r = g = b = 0;
     }
-    // A pure-black gradient never shows on device, while the same
-    // path with red shows and fades correctly (8d47ad4 screenshot:
-    // red at the top fading down, correct orientation, alpha
-    // honoured). The failure is specific to black: black's
-    // premultiplied RGB is 0 everywhere, so the image data is all
-    // zeros and the alpha is dropped at display, even though the
-    // sampled alphas in the image are correct. Keep a tiny nonzero
-    // RGB so the image data is never all zeros. 4/255 is visually
-    // identical to black and keeps the stored premultiplied value
-    // nonzero down to alpha ~0.125, covering the visible fade;
-    // 1/255 would round to zero below alpha 0.5 and the fade would
-    // drop out halfway down the strip.
-    r = MAX(r, 4.0 / 255.0);
-    g = MAX(g, 4.0 / 255.0);
-    b = MAX(b, 4.0 / 255.0);
-    CGSize size = CGSizeMake(1, 256);
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size];
-    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        CGContextRef cg = ctx.CGContext;
-        for (NSInteger y = 0; y < 256; y++) {
-            CGFloat t = (CGFloat)y / 255.0;
-            CGFloat alpha = alphas[count - 1];
-            for (NSUInteger i = 1; i < count; i++) {
-                if (t <= locations[i]) {
-                    CGFloat t0 = locations[i - 1], t1 = locations[i];
-                    CGFloat a0 = alphas[i - 1], a1 = alphas[i];
-                    alpha = (t1 > t0) ? a0 + (a1 - a0) * (t - t0) / (t1 - t0) : a1;
-                    break;
-                }
+    CGContextRef cg = UIGraphicsGetCurrentContext();
+    if (!cg) return;
+    CGFloat w = CGRectGetWidth(self.bounds);
+    CGFloat h = CGRectGetHeight(self.bounds);
+    if (w <= 0 || h <= 0) return;
+    // Row by row, 1 pt tall each, alpha interpolated between the
+    // stops. The same row-by-row fill the old image used, but
+    // drawn straight into the layer instead of baked into a
+    // UIImage, so the exact color is kept with no clamp.
+    for (CGFloat y = 0; y < h; y += 1) {
+        CGFloat t = y / h;
+        CGFloat alpha = [self.alphas.lastObject doubleValue];
+        for (NSUInteger i = 1; i < self.locations.count; i++) {
+            if (t <= [self.locations[i] doubleValue]) {
+                CGFloat t0 = [self.locations[i - 1] doubleValue];
+                CGFloat t1 = [self.locations[i] doubleValue];
+                CGFloat a0 = [self.alphas[i - 1] doubleValue];
+                CGFloat a1 = [self.alphas[i] doubleValue];
+                alpha = (t1 > t0) ? a0 + (a1 - a0) * (t - t0) / (t1 - t0) : a1;
+                break;
             }
-            CGContextSetRGBFillColor(cg, r, g, b, alpha);
-            CGContextFillRect(cg, CGRectMake(0, y, 1, 1));
         }
-    }];
+        CGContextSetRGBFillColor(cg, r, g, b, alpha);
+        CGContextFillRect(cg, CGRectMake(0, y, w, 1));
+    }
 }
 
-// Sample the alpha of one pixel of an image, for the EdgeFades
-// diagnostic: draws that pixel into a 1x1 bitmap context and
-// reads the alpha byte back. Returns -1 if the image is nil or
-// the pixel cannot be read. `point` is in the image's point
-// coordinates with a UIKit top-left origin (the image is 1x256
-// pt); it is scaled to pixels by the image's scale. A CGImage
-// drawn into a CGContext is flipped vertically (CGImage origin
-// is bottom-left in a context, UIKit's is top-left), so the
-// sampled row is py = h - 1 - y*scale: without the flip the
-// 6519b33 log read the top fade backwards (top=0.00 bottom=1.00
-// for an image that is opaque at the top). With the flip the
-// log reads unflipped.
-static CGFloat TXFadeImageAlphaAt(UIImage *image, CGPoint point) {
-    CGImageRef cg = image.CGImage;
-    if (!cg) return -1;
-    CGFloat scale = image.scale > 0 ? image.scale : 1;
-    size_t px = (size_t)lround(point.x * scale);
-    size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
-    if (h == 0) return -1;
-    NSInteger pySigned = (NSInteger)(h - 1) - (NSInteger)lround(point.y * scale);
-    if (pySigned < 0) return -1;
-    size_t py = (size_t)pySigned;
-    if (px >= w || py >= h) return -1;
-    unsigned char rgba[4] = {0, 0, 0, 0};
-    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(rgba, 1, 1, 8, 4, space, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
-    CGColorSpaceRelease(space);
-    if (!ctx) return -1;
-    CGContextDrawImage(ctx, CGRectMake(-(CGFloat)px, -(CGFloat)py, (CGFloat)w, (CGFloat)h), cg);
-    CGContextRelease(ctx);
-    return rgba[3] / 255.0;
-}
-
-// The image's alpha format, for the EdgeFades diagnostic: the
-// gradient image's sampled alphas are correct, yet the image
-// never shows, so log whether the CGImage actually carries an
-// alpha channel and how its bytes are laid out. alphaInfo: 0 None,
-// 1 PremultipliedLast, 2 PremultipliedFirst, 3 Last, 4 First,
-// 5 NoneSkipLast, 6 NoneSkipFirst, 7 Only. If the gradient image
-// reports None here, the alpha was lost at creation; if it reports
-// a premultiplied alpha like the red image yet still does not
-// show, the alpha is lost at display, not at creation.
-static NSString *TXFadeImageAlphaInfo(UIImage *image) {
-    CGImageRef cg = image.CGImage;
-    if (!cg) return @"nil";
-    return [NSString stringWithFormat:@"alphaInfo=%u bitmapInfo=0x%lx w=%zu h=%zu scale=%.1f",
-            (unsigned)CGImageGetAlphaInfo(cg),
-            (unsigned long)CGImageGetBitmapInfo(cg),
-            CGImageGetWidth(cg), CGImageGetHeight(cg), image.scale];
-}
+@end
 
 static const uint8_t kFnBytes[12][6] = {
     {0x1B, 'O', 'P'}, {0x1B, 'O', 'Q'}, {0x1B, 'O', 'R'}, {0x1B, 'O', 'S'},
@@ -255,20 +213,21 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     // Edge fades (the scroll edge effect): the fade strips at
     // the top and bottom of the terminal, where scrolling text
     // disappears into the fade instead of being cut sharply.
-    // Each is a plain image view showing a vertical gradient
-    // (theme background, opaque at the outer edge, fading to
-    // transparent). No blur: the UIVisualEffectView blur never
-    // painted on device — its maskView kept a zero frame (a
-    // mask view lives outside the view hierarchy and is not
-    // auto-sized by Auto Layout), so the blur was fully masked
-    // out, and a blur cannot reliably sample the Ghostty Metal
-    // layer's backdrop anyway. A gradient image in a plain
-    // UIImageView is the most basic UIKit rendering and
-    // composites above the Metal layer like the top buttons do.
+    // Each is a TXEdgeFadeView drawing a vertical gradient in
+    // drawRect (theme background, opaque at the outer edge,
+    // fading to transparent). No blur: the UIVisualEffectView
+    // blur never painted on device — its maskView kept a zero
+    // frame (a mask view lives outside the view hierarchy and
+    // is not auto-sized by Auto Layout), so the blur was fully
+    // masked out, and a blur cannot reliably sample the Ghostty
+    // Metal layer's backdrop anyway. No gradient image either:
+    // the image clamped the RGB to 4/255, and on the OLED that
+    // read lighter than the pure-black terminal background, so
+    // the strip showed as a visible band with no text behind it.
     UIView *_topEdgeFade; // the top strip's container
     UIView *_bottomEdgeFade; // the bottom strip's container
-    UIImageView *_topEdgeFadeView; // the fade gradient image
-    UIImageView *_bottomEdgeFadeView;
+    TXEdgeFadeView *_topEdgeFadeView; // the fade gradient view
+    TXEdgeFadeView *_bottomEdgeFadeView;
     NSTimer *_repeatTimer; // arrow key repeat (NewTerm 2.4: hold to repeat)
     ghostty_input_key_e _repeatKey; // the arrow key being repeated
     UIImpactFeedbackGenerator *_keyHaptic;  // light tap on key presses
@@ -817,30 +776,33 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
 // at the floating buttons and the key row. Each strip is a
 // container over the terminal and under the chrome (added
 // before the buttons and the key row, so they stay sharp and
-// legible), and takes no touches. Inside it is a single image
-// view showing a vertical gradient (theme background, opaque
-// at the outer edge, fading to transparent). No solid bar, no
-// pill: the fade lives at the edges themselves. No blur: the
-// UIVisualEffectView blur never painted on device, and a blur
-// cannot reliably sample the Ghostty Metal layer's backdrop.
-// No gradient layer either: both CAGradientLayer attempts
-// (sublayer with manual frame syncing, then a backing layer
-// via layerClass) never painted on device. A gradient image
-// in a plain UIImageView is the most basic UIKit rendering
-// there is, and it composites above the Metal layer exactly
-// like the top buttons do.
+// legible), and takes no touches. Inside it is a single
+// TXEdgeFadeView drawing a vertical gradient in drawRect
+// (theme background, opaque at the outer edge, fading to
+// transparent). No solid bar, no pill: the fade lives at the
+// edges themselves. No blur: the UIVisualEffectView blur never
+// painted on device, and a blur cannot reliably sample the
+// Ghostty Metal layer's backdrop. No gradient layer either:
+// both CAGradientLayer attempts (sublayer with manual frame
+// syncing, then a backing layer via layerClass) never painted
+// on device. No gradient image either: the image clamped the
+// gradient RGB to 4/255 so the data was never all zeros, and
+// on the iPhone OLED that read lighter than the pure-black
+// terminal background, so the strip showed as a visible band
+// even with no text behind it. The drawRect view uses the
+// exact theme color, so the strip is invisible with no text
+// behind it, like ChatGPT's fade.
 - (void)tx_buildEdgeFades {
     // Top strip: opaque at the very top, fading to transparent
     // at its bottom (just below the floating top buttons).
     _topEdgeFade = [[UIView alloc] init];
     _topEdgeFade.translatesAutoresizingMaskIntoConstraints = NO;
     _topEdgeFade.userInteractionEnabled = NO;
-    _topEdgeFadeView = [[UIImageView alloc] init];
+    _topEdgeFadeView = [[TXEdgeFadeView alloc] init];
     _topEdgeFadeView.translatesAutoresizingMaskIntoConstraints = NO;
-    _topEdgeFadeView.userInteractionEnabled = NO;
-    // The 1x256 gradient image must stretch to fill the strip;
-    // set the mode explicitly instead of relying on the default.
-    _topEdgeFadeView.contentMode = UIViewContentModeScaleToFill;
+    // The stops never change; only the color follows the theme.
+    _topEdgeFadeView.locations = @[@0, @1];
+    _topEdgeFadeView.alphas = @[@1, @0];
     [_topEdgeFade addSubview:_topEdgeFadeView];
     [NSLayoutConstraint activateConstraints:@[
         [_topEdgeFadeView.topAnchor constraintEqualToAnchor:_topEdgeFade.topAnchor],
@@ -857,10 +819,11 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     _bottomEdgeFade = [[UIView alloc] init];
     _bottomEdgeFade.translatesAutoresizingMaskIntoConstraints = NO;
     _bottomEdgeFade.userInteractionEnabled = NO;
-    _bottomEdgeFadeView = [[UIImageView alloc] init];
+    _bottomEdgeFadeView = [[TXEdgeFadeView alloc] init];
     _bottomEdgeFadeView.translatesAutoresizingMaskIntoConstraints = NO;
-    _bottomEdgeFadeView.userInteractionEnabled = NO;
-    _bottomEdgeFadeView.contentMode = UIViewContentModeScaleToFill;
+    // The fade starts late (the top three quarters stay clear).
+    _bottomEdgeFadeView.locations = @[@0, @0.75, @1];
+    _bottomEdgeFadeView.alphas = @[@0, @0, @1];
     [_bottomEdgeFade addSubview:_bottomEdgeFadeView];
     [NSLayoutConstraint activateConstraints:@[
         [_bottomEdgeFadeView.topAnchor constraintEqualToAnchor:_bottomEdgeFade.topAnchor],
@@ -873,24 +836,22 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
 }
 
 // Recolor the edge fades from the theme background: the top
-// image is opaque at the screen top and transparent at its
-// bottom; the bottom image is transparent until three quarters
-// down, then opaque at the key row. The images are regenerated
-// here (and at build time), so the fades follow the picked
-// theme live. Regenerating is cheap (a 1x256 image) and it is
-// the only state the fades have — there is no layer, no blur
-// and no mask to keep in sync.
+// view is opaque at the screen top and transparent at its
+// bottom; the bottom view is transparent until three quarters
+// down, then opaque at the key row. The color is set here (and
+// at build time) and the views redraw, so the fades follow the
+// picked theme live. The color is the only state the fades
+// have — there is no layer, no blur, no mask and no image to
+// keep in sync.
 - (void)tx_updateEdgeFadeColors {
     UIColor *bg = TXTerminalThemeBackgroundColor();
     if (_topEdgeFadeView) {
-        const CGFloat locations[] = { 0, 1 };
-        const CGFloat alphas[] = { 1, 0 };
-        _topEdgeFadeView.image = TXFadeImage(bg, locations, alphas, 2);
+        _topEdgeFadeView.fadeColor = bg;
+        [_topEdgeFadeView setNeedsDisplay];
     }
     if (_bottomEdgeFadeView) {
-        const CGFloat locations[] = { 0, 0.75, 1 };
-        const CGFloat alphas[] = { 0, 0, 1 };
-        _bottomEdgeFadeView.image = TXFadeImage(bg, locations, alphas, 3);
+        _bottomEdgeFadeView.fadeColor = bg;
+        [_bottomEdgeFadeView setNeedsDisplay];
     }
 }
 
@@ -925,14 +886,12 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     return n;
 }
 
-// Edge fade hierarchy/visibility diagnostic: the 6519b33 log proved
-// the frames, the images and the alphas are all correct, yet nothing
-// shows on screen, so the next question is whether the strips are
-// actually present, visible and above the Ghostty view at runtime.
+// Edge fade hierarchy/visibility diagnostic: the strips are
+// present, visible and above the Ghostty view at runtime.
 // Logs, for each strip, its superview, its index in the root view's
 // subviews (and the Ghostty view's index, so the z-order is
 // explicit), whether it has a window, hidden/alpha, whether the
-// image view's layer has contents, and the frame in window
+// fade view's layer has contents (drawn or not), and the frame in window
 // coordinates; and the root view's subview order as class names.
 // Called at viewDidAppear and again a second later, so a layout
 // pass or surface creation that removes or reorders a strip after
@@ -947,32 +906,22 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     TXLogEngine(@"EdgeFades: %@ order=%@ outputIdx=%lu topIdx=%lu bottomIdx=%lu", label, [order componentsJoinedByString:@","], (unsigned long)outputIdx, (unsigned long)topIdx, (unsigned long)bottomIdx);
     CGRect topWin = [_topEdgeFade convertRect:_topEdgeFade.bounds toView:nil];
     CGRect bottomWin = [_bottomEdgeFade convertRect:_bottomEdgeFade.bounds toView:nil];
-    TXLogEngine(@"EdgeFades: %@ top superview=%@ window=%@ hidden=%d alpha=%.2f imgHidden=%d imgAlpha=%.2f contents=%@ opacity=%.2f frameWin=%@", label, _topEdgeFade.superview == self.view ? @"self.view" : NSStringFromClass([_topEdgeFade.superview class]), _topEdgeFade.window ? @"yes" : @"nil", _topEdgeFade.hidden, _topEdgeFade.alpha, _topEdgeFadeView.hidden, _topEdgeFadeView.alpha, _topEdgeFadeView.layer.contents ? @"set" : @"nil", _topEdgeFadeView.layer.opacity, NSStringFromCGRect(topWin));
-    TXLogEngine(@"EdgeFades: %@ bottom superview=%@ window=%@ hidden=%d alpha=%.2f imgHidden=%d imgAlpha=%.2f contents=%@ opacity=%.2f frameWin=%@", label, _bottomEdgeFade.superview == self.view ? @"self.view" : NSStringFromClass([_bottomEdgeFade.superview class]), _bottomEdgeFade.window ? @"yes" : @"nil", _bottomEdgeFade.hidden, _bottomEdgeFade.alpha, _bottomEdgeFadeView.hidden, _bottomEdgeFadeView.alpha, _bottomEdgeFadeView.layer.contents ? @"set" : @"nil", _bottomEdgeFadeView.layer.opacity, NSStringFromCGRect(bottomWin));
+    TXLogEngine(@"EdgeFades: %@ top superview=%@ window=%@ hidden=%d alpha=%.2f fadeHidden=%d fadeAlpha=%.2f contents=%@ opacity=%.2f frameWin=%@", label, _topEdgeFade.superview == self.view ? @"self.view" : NSStringFromClass([_topEdgeFade.superview class]), _topEdgeFade.window ? @"yes" : @"nil", _topEdgeFade.hidden, _topEdgeFade.alpha, _topEdgeFadeView.hidden, _topEdgeFadeView.alpha, _topEdgeFadeView.layer.contents ? @"set" : @"nil", _topEdgeFadeView.layer.opacity, NSStringFromCGRect(topWin));
+    TXLogEngine(@"EdgeFades: %@ bottom superview=%@ window=%@ hidden=%d alpha=%.2f fadeHidden=%d fadeAlpha=%.2f contents=%@ opacity=%.2f frameWin=%@", label, _bottomEdgeFade.superview == self.view ? @"self.view" : NSStringFromClass([_bottomEdgeFade.superview class]), _bottomEdgeFade.window ? @"yes" : @"nil", _bottomEdgeFade.hidden, _bottomEdgeFade.alpha, _bottomEdgeFadeView.hidden, _bottomEdgeFadeView.alpha, _bottomEdgeFadeView.layer.contents ? @"set" : @"nil", _bottomEdgeFadeView.layer.opacity, NSStringFromCGRect(bottomWin));
 }
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     [_output setFocused:YES];
-    // Edge fade frames, for diagnosis: the fades failed to paint
-    // on device three times (a gradient sublayer, a gradient
-    // backing layer, a gradient image), so if they still do not
-    // show, the log says at once whether the strips have a real
-    // frame and an image, or whether the problem is rendering,
-    // not layout. The alpha sample is unflipped now (the sampler
-    // used to read the image upside down): top must read ~1.0
-    // at the top and ~0.0 at the bottom; bottom must read ~0.0
-    // at the top and ~1.0 at the bottom. All ~0.0 means the
-    // image is transparent; correct alphas with nothing on
-    // screen means a compositing problem. The hierarchy log
-    // below settles whether the strips are present, visible
-    // and above the Ghostty view at runtime.
-    TXLogEngine(@"EdgeFades: top container %@ image %@ image %@", NSStringFromCGRect(_topEdgeFade.frame), NSStringFromCGRect(_topEdgeFadeView.frame), _topEdgeFadeView.image ? @"set" : @"nil");
-    TXLogEngine(@"EdgeFades: bottom container %@ image %@ image %@", NSStringFromCGRect(_bottomEdgeFade.frame), NSStringFromCGRect(_bottomEdgeFadeView.frame), _bottomEdgeFadeView.image ? @"set" : @"nil");
-    TXLogEngine(@"EdgeFades: top image alpha top=%.2f bottom=%.2f", TXFadeImageAlphaAt(_topEdgeFadeView.image, CGPointMake(0, 0)), TXFadeImageAlphaAt(_topEdgeFadeView.image, CGPointMake(0, 255)));
-    TXLogEngine(@"EdgeFades: bottom image alpha top=%.2f bottom=%.2f", TXFadeImageAlphaAt(_bottomEdgeFadeView.image, CGPointMake(0, 0)), TXFadeImageAlphaAt(_bottomEdgeFadeView.image, CGPointMake(0, 255)));
-    TXLogEngine(@"EdgeFades: top image %@", TXFadeImageAlphaInfo(_topEdgeFadeView.image));
-    TXLogEngine(@"EdgeFades: bottom image %@", TXFadeImageAlphaInfo(_bottomEdgeFadeView.image));
+    // Edge fade frames, for diagnosis: the fades are drawn in
+    // drawRect now (the image versions failed four times in
+    // different ways), so if they still do not show, the log
+    // says at once whether the strips have a real frame, or
+    // whether the problem is rendering, not layout. The
+    // hierarchy log below settles whether the strips are
+    // present, visible and above the Ghostty view at runtime.
+    TXLogEngine(@"EdgeFades: top container %@ fade %@", NSStringFromCGRect(_topEdgeFade.frame), NSStringFromCGRect(_topEdgeFadeView.frame));
+    TXLogEngine(@"EdgeFades: bottom container %@ fade %@", NSStringFromCGRect(_bottomEdgeFade.frame), NSStringFromCGRect(_bottomEdgeFadeView.frame));
     [self tx_logEdgeFadeState:@"appear"];
     // Re-log a second later: a layout pass, surface creation or
     // theme change that removes or reorders a strip after appear
