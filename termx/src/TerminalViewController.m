@@ -63,20 +63,67 @@
 // it stays smooth. Regenerated on a theme change, so the fade
 // follows the picked theme. `locations` and `alphas` have `count`
 // stops each; the color is the theme background.
+//
+// The gradient is drawn row by row (one 1-pt-tall rect per row,
+// alpha interpolated between the stops) with
+// CGContextSetRGBFillColor, NOT with CGGradient: the CGGradient
+// version never painted on device, and a row-by-row fill uses
+// only the most basic Core Graphics calls, with the color broken
+// into raw RGBA floats, so there is no gradient object and no
+// color space that can silently fail and leave the image fully
+// transparent. If the image still does not show, the EdgeFades
+// log in viewDidAppear samples the pixel alphas and says so.
 static UIImage *TXFadeImage(UIColor *color, const CGFloat *locations, const CGFloat *alphas, NSUInteger count) {
+    CGFloat r = 0, g = 0, b = 0, a = 1;
+    if (![color getRed:&r green:&g blue:&b alpha:&a]) {
+        // getRed: fails for colors outside the RGB space (a
+        // pattern or grayscale color); fall back to black, the
+        // default theme background.
+        r = g = b = 0;
+    }
     CGSize size = CGSizeMake(1, 256);
     UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size];
     return [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        NSMutableArray *cgColors = [NSMutableArray arrayWithCapacity:count];
-        for (NSUInteger i = 0; i < count; i++) {
-            [cgColors addObject:(id)[color colorWithAlphaComponent:alphas[i]].CGColor];
+        CGContextRef cg = ctx.CGContext;
+        for (NSInteger y = 0; y < 256; y++) {
+            CGFloat t = (CGFloat)y / 255.0;
+            CGFloat alpha = alphas[count - 1];
+            for (NSUInteger i = 1; i < count; i++) {
+                if (t <= locations[i]) {
+                    CGFloat t0 = locations[i - 1], t1 = locations[i];
+                    CGFloat a0 = alphas[i - 1], a1 = alphas[i];
+                    alpha = (t1 > t0) ? a0 + (a1 - a0) * (t - t0) / (t1 - t0) : a1;
+                    break;
+                }
+            }
+            CGContextSetRGBFillColor(cg, r, g, b, alpha);
+            CGContextFillRect(cg, CGRectMake(0, y, 1, 1));
         }
-        CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
-        CGGradientRef gradient = CGGradientCreateWithColors(space, (__bridge CFArrayRef)cgColors, locations);
-        CGContextDrawLinearGradient(ctx.CGContext, gradient, CGPointMake(0, 0), CGPointMake(0, size.height), 0);
-        CGGradientRelease(gradient);
-        CGColorSpaceRelease(space);
     }];
+}
+
+// Sample the alpha of one pixel of an image, for the EdgeFades
+// diagnostic: draws that pixel into a 1x1 bitmap context and
+// reads the alpha byte back. Returns -1 if the image is nil or
+// the pixel cannot be read. `point` is in the image's point
+// coordinates (the image is 1x256 pt); it is scaled to pixels
+// by the image's scale.
+static CGFloat TXFadeImageAlphaAt(UIImage *image, CGPoint point) {
+    CGImageRef cg = image.CGImage;
+    if (!cg) return -1;
+    CGFloat scale = image.scale > 0 ? image.scale : 1;
+    size_t px = (size_t)lround(point.x * scale);
+    size_t py = (size_t)lround(point.y * scale);
+    size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
+    if (px >= w || py >= h) return -1;
+    unsigned char rgba[4] = {0, 0, 0, 0};
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(rgba, 1, 1, 8, 4, space, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(space);
+    if (!ctx) return -1;
+    CGContextDrawImage(ctx, CGRectMake(-(CGFloat)px, -(CGFloat)py, (CGFloat)w, (CGFloat)h), cg);
+    CGContextRelease(ctx);
+    return rgba[3] / 255.0;
 }
 
 static const uint8_t kFnBytes[12][6] = {
@@ -748,6 +795,9 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     _topEdgeFadeView = [[UIImageView alloc] init];
     _topEdgeFadeView.translatesAutoresizingMaskIntoConstraints = NO;
     _topEdgeFadeView.userInteractionEnabled = NO;
+    // The 1x256 gradient image must stretch to fill the strip;
+    // set the mode explicitly instead of relying on the default.
+    _topEdgeFadeView.contentMode = UIViewContentModeScaleToFill;
     [_topEdgeFade addSubview:_topEdgeFadeView];
     [NSLayoutConstraint activateConstraints:@[
         [_topEdgeFadeView.topAnchor constraintEqualToAnchor:_topEdgeFade.topAnchor],
@@ -767,6 +817,7 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     _bottomEdgeFadeView = [[UIImageView alloc] init];
     _bottomEdgeFadeView.translatesAutoresizingMaskIntoConstraints = NO;
     _bottomEdgeFadeView.userInteractionEnabled = NO;
+    _bottomEdgeFadeView.contentMode = UIViewContentModeScaleToFill;
     [_bottomEdgeFade addSubview:_bottomEdgeFadeView];
     [NSLayoutConstraint activateConstraints:@[
         [_bottomEdgeFadeView.topAnchor constraintEqualToAnchor:_bottomEdgeFade.topAnchor],
@@ -839,8 +890,18 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     // backing layer), so if they still do not show, the log
     // says at once whether the strips have a real frame and an
     // image, or whether the problem is rendering, not layout.
+    // The alpha sample is the decisive bit: the 8303830 image
+    // had a correct frame and a non-nil image yet never painted,
+    // which means either the image was fully transparent or the
+    // view does not composite above the Metal layer. Top must
+    // read ~1.0 at the top and ~0.0 at the bottom; bottom must
+    // read ~0.0 at the top and ~1.0 at the bottom. All ~0.0
+    // means the image is transparent; correct alphas with
+    // nothing on screen means a compositing problem.
     TXLogEngine(@"EdgeFades: top container %@ image %@ image %@", NSStringFromCGRect(_topEdgeFade.frame), NSStringFromCGRect(_topEdgeFadeView.frame), _topEdgeFadeView.image ? @"set" : @"nil");
     TXLogEngine(@"EdgeFades: bottom container %@ image %@ image %@", NSStringFromCGRect(_bottomEdgeFade.frame), NSStringFromCGRect(_bottomEdgeFadeView.frame), _bottomEdgeFadeView.image ? @"set" : @"nil");
+    TXLogEngine(@"EdgeFades: top image alpha top=%.2f bottom=%.2f", TXFadeImageAlphaAt(_topEdgeFadeView.image, CGPointMake(0, 0)), TXFadeImageAlphaAt(_topEdgeFadeView.image, CGPointMake(0, 255)));
+    TXLogEngine(@"EdgeFades: bottom image alpha top=%.2f bottom=%.2f", TXFadeImageAlphaAt(_bottomEdgeFadeView.image, CGPointMake(0, 0)), TXFadeImageAlphaAt(_bottomEdgeFadeView.image, CGPointMake(0, 255)));
     // Clear on boot, once: if the startup screen asked for it, wipe
     // the boot log from the display and ask the guest for a fresh
     // prompt, so the user opens on a clean prompt instead of the
