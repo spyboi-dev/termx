@@ -41,11 +41,28 @@
 - (void)chromeMediumHaptic;
 - (void)chromeSelectionHaptic;
 // Edge fades (the scroll edge effect): build the top/bottom
-// blur-and-fade strips, recolor them when the theme changes,
-// and size their gradient layers after layout.
+// blur-and-fade strips and recolor them when the theme changes.
+// The gradients are self-sizing (see TXEdgeFadeGradientView), so
+// there is no manual layer sizing after layout.
 - (void)tx_buildEdgeFades;
 - (void)tx_updateEdgeFadeColors;
-- (void)tx_layoutEdgeFades;
+@end
+
+// A view whose backing layer is a CAGradientLayer, so the gradient
+// resizes with Auto Layout and never needs manual frame syncing.
+// The old edge fades used a plain UIView plus a CAGradientLayer
+// sublayer whose frame was synced by hand in viewDidLayoutSubviews;
+// that sync is the fragile part (a zero frame, or a missed layout,
+// leaves the gradient invisible and the text sharp to the edge,
+// which is what the user saw: no blur and no fade at either edge).
+// With layerClass the gradient IS the view's layer, so it is always
+// exactly the view's size.
+@interface TXEdgeFadeGradientView : UIView
+@end
+@implementation TXEdgeFadeGradientView
++ (Class)layerClass {
+    return [CAGradientLayer class];
+}
 @end
 
 static const uint8_t kFnBytes[12][6] = {
@@ -134,19 +151,19 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     // Edge fades (the scroll edge effect): the blur-and-fade
     // strips at the top and bottom of the terminal, where
     // scrolling text disappears into the blur instead of being
-    // cut sharply. Each is a blur view (masked by a gradient so
-    // the blur itself fades out) under a theme-color gradient
-    // that fades the text into the background.
+    // cut sharply. Each is a blur view (its maskView fades the
+    // blur out) under a theme-color gradient that fades the text
+    // into the background. The gradients are TXEdgeFadeGradientView
+    // (layerClass CAGradientLayer), so they resize with Auto
+    // Layout and need no manual layer sizing.
     UIView *_topEdgeFade; // the top strip's container
     UIView *_bottomEdgeFade; // the bottom strip's container
-    UIView *_topEdgeFadeView; // the fade gradient's host view
-    UIView *_bottomEdgeFadeView;
-    CAGradientLayer *_topEdgeFadeLayer; // theme background, opaque at the edge
-    CAGradientLayer *_bottomEdgeFadeLayer;
+    TXEdgeFadeGradientView *_topEdgeFadeView; // the fade gradient (its layer IS the gradient)
+    TXEdgeFadeGradientView *_bottomEdgeFadeView;
     UIVisualEffectView *_topEdgeBlur; // the blur, masked to fade out
     UIVisualEffectView *_bottomEdgeBlur;
-    CAGradientLayer *_topEdgeBlurMask; // white to clear, the blur's fade
-    CAGradientLayer *_bottomEdgeBlurMask;
+    TXEdgeFadeGradientView *_topEdgeBlurMaskView; // white to clear, the blur's fade mask
+    TXEdgeFadeGradientView *_bottomEdgeBlurMaskView;
     NSTimer *_repeatTimer; // arrow key repeat (NewTerm 2.4: hold to repeat)
     ghostty_input_key_e _repeatKey; // the arrow key being repeated
     UIImpactFeedbackGenerator *_keyHaptic;  // light tap on key presses
@@ -687,7 +704,6 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
         CGFloat inset = MAX(0, self.view.bounds.size.height - toolbarTop);
         _output.surfaceBottomInset = inset;
     }
-    [self tx_layoutEdgeFades];
 }
 
 // The edge fades (the scroll edge effect): one blur-and-fade
@@ -696,11 +712,16 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
 // sharply at the floating buttons and the key row. Each strip
 // is a container over the terminal and under the chrome (added
 // before the buttons and the key row, so they stay sharp and
-// legible), and takes no touches. Inside it: a blur view, masked
-// by a gradient so the blur itself fades out at the inner edge,
-// and a theme-color gradient over it that fades the text into
-// the background. No solid bar, no pill: the blur and the fade
-// live at the edges themselves.
+// legible), and takes no touches. Inside it: a blur view, whose
+// maskView fades the blur out at the inner edge, and a
+// theme-color gradient over it that fades the text into the
+// background. No solid bar, no pill: the blur and the fade live
+// at the edges themselves. Both gradients are
+// TXEdgeFadeGradientView, so they resize with Auto Layout —
+// there is no manual layer sizing, which is what failed before
+// (the old plain-view-plus-sublayer gradients and the
+// layer.mask on the effect view never got a real frame, so
+// neither the blur nor the fade ever painted).
 - (void)tx_buildEdgeFades {
     // The blur style follows the theme's brightness: a dark blur
     // over a light theme would read as a smudge, and a light blur
@@ -722,20 +743,32 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     _topEdgeBlur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:blurStyle]];
     _topEdgeBlur.translatesAutoresizingMaskIntoConstraints = NO;
     _topEdgeBlur.userInteractionEnabled = NO;
-    _topEdgeBlurMask = [CAGradientLayer layer];
-    _topEdgeBlurMask.colors = @[(id)[UIColor colorWithWhite:1 alpha:1].CGColor,
-                                (id)[UIColor colorWithWhite:1 alpha:0].CGColor];
-    _topEdgeBlurMask.locations = @[@0, @1];
-    _topEdgeBlurMask.startPoint = CGPointMake(0.5, 0);
-    _topEdgeBlurMask.endPoint = CGPointMake(0.5, 1);
-    _topEdgeBlur.layer.mask = _topEdgeBlurMask;
-    _topEdgeFadeView = [[UIView alloc] init];
+    // The blur's fade: a maskView, not a layer.mask. Masking an
+    // effect view's layer directly is fragile (the backdrop does
+    // not reliably respect it) and the mask then needs manual
+    // sizing; a maskView is a view, so UIKit sizes it to the
+    // blur view's bounds automatically, and its gradient layer
+    // (layerClass) sizes with it. White = blur visible, clear =
+    // blur gone.
+    _topEdgeBlurMaskView = [[TXEdgeFadeGradientView alloc] init];
+    _topEdgeBlurMaskView.userInteractionEnabled = NO;
+    CAGradientLayer *topMaskLayer = (CAGradientLayer *)_topEdgeBlurMaskView.layer;
+    topMaskLayer.colors = @[(id)[UIColor colorWithWhite:1 alpha:1].CGColor,
+                            (id)[UIColor colorWithWhite:1 alpha:0].CGColor];
+    topMaskLayer.locations = @[@0, @1];
+    topMaskLayer.startPoint = CGPointMake(0.5, 0);
+    topMaskLayer.endPoint = CGPointMake(0.5, 1);
+    _topEdgeBlur.maskView = _topEdgeBlurMaskView;
+    // The fade gradient over the blur: theme background, opaque
+    // at the screen top, transparent at the strip's bottom. Its
+    // layer IS the view's layer (layerClass), so Auto Layout
+    // sizes it; no manual frame sync.
+    _topEdgeFadeView = [[TXEdgeFadeGradientView alloc] init];
     _topEdgeFadeView.translatesAutoresizingMaskIntoConstraints = NO;
     _topEdgeFadeView.userInteractionEnabled = NO;
-    _topEdgeFadeLayer = [CAGradientLayer layer];
-    _topEdgeFadeLayer.startPoint = CGPointMake(0.5, 0);
-    _topEdgeFadeLayer.endPoint = CGPointMake(0.5, 1);
-    [_topEdgeFadeView.layer addSublayer:_topEdgeFadeLayer];
+    CAGradientLayer *topFadeLayer = (CAGradientLayer *)_topEdgeFadeView.layer;
+    topFadeLayer.startPoint = CGPointMake(0.5, 0);
+    topFadeLayer.endPoint = CGPointMake(0.5, 1);
     [_topEdgeFade addSubview:_topEdgeBlur];
     [_topEdgeFade addSubview:_topEdgeFadeView];
     [NSLayoutConstraint activateConstraints:@[
@@ -761,22 +794,23 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     _bottomEdgeBlur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:blurStyle]];
     _bottomEdgeBlur.translatesAutoresizingMaskIntoConstraints = NO;
     _bottomEdgeBlur.userInteractionEnabled = NO;
-    _bottomEdgeBlurMask = [CAGradientLayer layer];
-    _bottomEdgeBlurMask.colors = @[(id)[UIColor colorWithWhite:1 alpha:0].CGColor,
-                                   (id)[UIColor colorWithWhite:1 alpha:0].CGColor,
-                                   (id)[UIColor colorWithWhite:1 alpha:1].CGColor];
-    _bottomEdgeBlurMask.locations = @[@0, @0.75, @1];
-    _bottomEdgeBlurMask.startPoint = CGPointMake(0.5, 0);
-    _bottomEdgeBlurMask.endPoint = CGPointMake(0.5, 1);
-    _bottomEdgeBlur.layer.mask = _bottomEdgeBlurMask;
-    _bottomEdgeFadeView = [[UIView alloc] init];
+    _bottomEdgeBlurMaskView = [[TXEdgeFadeGradientView alloc] init];
+    _bottomEdgeBlurMaskView.userInteractionEnabled = NO;
+    CAGradientLayer *bottomMaskLayer = (CAGradientLayer *)_bottomEdgeBlurMaskView.layer;
+    bottomMaskLayer.colors = @[(id)[UIColor colorWithWhite:1 alpha:0].CGColor,
+                               (id)[UIColor colorWithWhite:1 alpha:0].CGColor,
+                               (id)[UIColor colorWithWhite:1 alpha:1].CGColor];
+    bottomMaskLayer.locations = @[@0, @0.75, @1];
+    bottomMaskLayer.startPoint = CGPointMake(0.5, 0);
+    bottomMaskLayer.endPoint = CGPointMake(0.5, 1);
+    _bottomEdgeBlur.maskView = _bottomEdgeBlurMaskView;
+    _bottomEdgeFadeView = [[TXEdgeFadeGradientView alloc] init];
     _bottomEdgeFadeView.translatesAutoresizingMaskIntoConstraints = NO;
     _bottomEdgeFadeView.userInteractionEnabled = NO;
-    _bottomEdgeFadeLayer = [CAGradientLayer layer];
-    _bottomEdgeFadeLayer.startPoint = CGPointMake(0.5, 0);
-    _bottomEdgeFadeLayer.endPoint = CGPointMake(0.5, 1);
-    _bottomEdgeFadeLayer.locations = @[@0, @0.75, @1];
-    [_bottomEdgeFadeView.layer addSublayer:_bottomEdgeFadeLayer];
+    CAGradientLayer *bottomFadeLayer = (CAGradientLayer *)_bottomEdgeFadeView.layer;
+    bottomFadeLayer.startPoint = CGPointMake(0.5, 0);
+    bottomFadeLayer.endPoint = CGPointMake(0.5, 1);
+    bottomFadeLayer.locations = @[@0, @0.75, @1];
     [_bottomEdgeFade addSubview:_bottomEdgeBlur];
     [_bottomEdgeFade addSubview:_bottomEdgeFadeView];
     [NSLayoutConstraint activateConstraints:@[
@@ -799,17 +833,22 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
 // quarters down, then opaque at the key row. Rebuilt when the
 // theme changes (and at build time), so the fades follow the
 // picked theme. The blur style follows the brightness too.
+// The gradients are the fade views' own layers (layerClass), so
+// setting colors here is all that is needed — no frame sync.
 - (void)tx_updateEdgeFadeColors {
     UIColor *bg = TXTerminalThemeBackgroundColor();
-    if (_topEdgeFadeLayer) {
-        _topEdgeFadeLayer.colors = @[(id)[bg colorWithAlphaComponent:1].CGColor,
-                                     (id)[bg colorWithAlphaComponent:0].CGColor];
-        _topEdgeFadeLayer.locations = @[@0, @1];
+    CAGradientLayer *topLayer = (CAGradientLayer *)_topEdgeFadeView.layer;
+    if (topLayer) {
+        topLayer.colors = @[(id)[bg colorWithAlphaComponent:1].CGColor,
+                            (id)[bg colorWithAlphaComponent:0].CGColor];
+        topLayer.locations = @[@0, @1];
     }
-    if (_bottomEdgeFadeLayer) {
-        _bottomEdgeFadeLayer.colors = @[(id)[bg colorWithAlphaComponent:0].CGColor,
-                                        (id)[bg colorWithAlphaComponent:0].CGColor,
-                                        (id)[bg colorWithAlphaComponent:1].CGColor];
+    CAGradientLayer *bottomLayer = (CAGradientLayer *)_bottomEdgeFadeView.layer;
+    if (bottomLayer) {
+        bottomLayer.colors = @[(id)[bg colorWithAlphaComponent:0].CGColor,
+                               (id)[bg colorWithAlphaComponent:0].CGColor,
+                               (id)[bg colorWithAlphaComponent:1].CGColor];
+        bottomLayer.locations = @[@0, @0.75, @1];
     }
     CGFloat r = 0, g = 0, b = 0, a = 0;
     UIBlurEffectStyle blurStyle = UIBlurEffectStyleDark;
@@ -820,16 +859,6 @@ static UIVisualEffectView *TXLiquidGlassEffectView(void) {
     UIBlurEffect *effect = [UIBlurEffect effectWithStyle:blurStyle];
     if (_topEdgeBlur) _topEdgeBlur.effect = effect;
     if (_bottomEdgeBlur) _bottomEdgeBlur.effect = effect;
-}
-
-// The gradient layers and blur masks are layers, not views, so
-// Auto Layout never resizes them: size them to their views
-// after every layout.
-- (void)tx_layoutEdgeFades {
-    if (_topEdgeFadeLayer) _topEdgeFadeLayer.frame = _topEdgeFadeView.bounds;
-    if (_bottomEdgeFadeLayer) _bottomEdgeFadeLayer.frame = _bottomEdgeFadeView.bounds;
-    if (_topEdgeBlurMask) _topEdgeBlurMask.frame = _topEdgeBlur.bounds;
-    if (_bottomEdgeBlurMask) _bottomEdgeBlurMask.frame = _bottomEdgeBlur.bounds;
 }
 
 // The row the prompt opens on after a boot clear: the first row
